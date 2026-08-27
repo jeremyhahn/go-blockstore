@@ -15,6 +15,12 @@
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
+# `make test` / `make coverage` output, and the scanner reports CI writes
+coverage/
+gosec.sarif
+gosec-results.json
+trivy-results.sarif
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
 

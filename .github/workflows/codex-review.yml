@@ -1,0 +1,46 @@
+# codex-review-template: v2 — automated Codex peer review for pull requests.
+# Source of truth: software/templates/github-actions/codex-review.yml in the
+# automatethethings repo. Copied into each repo. Gitea-ONLY by design: GitHub
+# remains the owner-gated manual channel (version-control.md §3), so the job
+# guards itself off github.com.
+#
+# The `codex` runs-on label routes this job to the dedicated review runners
+# (gpu-host-codex / omega-codex), whose job image bakes the codex CLI and the
+# review assets, and whose config mounts the host's logged-in ~/.codex OAuth
+# session. ONLY this workflow may declare `runs-on: codex` — that label
+# carries the credential mount (conventions/sdlc.md).
+
+name: Codex Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    name: Codex Review
+    runs-on: codex
+    if: github.server_url != 'https://github.com'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # The review image bakes the codex CLI but NO Go toolchain, so without
+      # this step the reviewer is static-only: it reviews Go code it cannot
+      # build or test (measured on go-quicbaas PR #61 and go-qrdb PR #45 —
+      # every review reported "tests could not be executed"). Installing in
+      # the job keeps the reviewer correct whatever the runner image was
+      # built with, and survives a future image rebuild that omits Go again.
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.7'  # track ci.yml GO_VERSION
+
+      - name: Run Codex peer review
+        env:
+          REPO: ${{ github.event.repository.name }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          GITEA_URL: ${{ github.server_url }}
+          GITEA_CODEX_TOKEN: ${{ secrets.CODEX_BOT_TOKEN }}
+        run: /opt/codex-review/pr-review.sh

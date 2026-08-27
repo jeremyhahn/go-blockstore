@@ -1,0 +1,87 @@
+# golangci-lint v2 configuration for go-blockstore.
+# The single source of lint truth for the repo (project-scaffold.md §5) — the
+# `lint` Makefile target and the CI lint job both run golangci-lint over it.
+#
+# THE TIME BUDGET IS NOT DECLARED HERE. `run.timeout` in this file is silently
+# overridden by a `--timeout` flag, and both `make golangci-lint` and the CI
+# lint job pass one (go-qrdb#60 is the worked example of that trap). The budget
+# lives in those two call sites, kept identical to each other; adding it here
+# would create a second declaration that never takes effect.
+version: "2"
+
+run:
+  # Test files are linted. This repo's tests ARE the contract for pkg/common —
+  # a compile-time interface assertion and the registry's concurrency
+  # behaviour — so excluding them would leave the most load-bearing files
+  # unchecked.
+  tests: true
+
+  # Tag-gated providers are invisible to the linter unless their tags are
+  # listed here: golangci-lint reads only the files the build constraints
+  # select. `local` carries no tag and is always compiled; add `drbd` with the
+  # drbd provider (#3) and `cephrbd` with its own, in the same commit that adds
+  # the tagged files — and keep the Makefile's TAGS default in step.
+  build-tags: []
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/jeremyhahn/go-blockstore
+
+linters:
+  # devops.md §8 makes six of these mandatory — errcheck, staticcheck, unused,
+  # ineffassign, misspell and gocritic. Running the umbrella with any of them
+  # switched off does not satisfy that section, so none may move to `disable`.
+  # The rest are the fleet's usual additions for a library that hands out
+  # errors and resources across a provider boundary.
+  enable:
+    - errcheck
+    - staticcheck
+    - unused
+    - ineffassign
+    - misspell
+    - gocritic
+    - govet
+    - gosec
+    - errname
+    - errorlint
+    - copyloopvar
+    - unconvert
+    - whitespace
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+    govet:
+      enable:
+        - shadow
+    misspell:
+      locale: US
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    # Deliberately short. Every rule below is a class of finding that is wrong
+    # in a test file specifically, not a finding this repo has decided to stop
+    # looking at. A NEW exclusion needs a written reason next to it — an
+    # unexplained entry is indistinguishable from a silenced bug.
+    rules:
+      # Tests construct fixtures whose errors are the assertion itself, and
+      # deliberately ignore returns while exercising a failure path.
+      - linters:
+          - errcheck
+          - gosec
+        path: _test\.go$

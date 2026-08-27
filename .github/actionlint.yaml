@@ -1,0 +1,18 @@
+# actionlint-template: v1 — fleet self-hosted runner labels for actionlint.
+# Source of truth: software/templates/github-actions/actionlint.yaml in the
+# automatethethings repo.
+#
+# Without this file actionlint reports every self-hosted label as an unknown
+# runner (runner-label), which trains readers to ignore its output — the
+# signal-integrity failure mode. With it, a MISSPELLED label is still caught.
+#
+# Labels must match the live Gitea runner fleet. `codex` and `claude` are
+# restricted labels (review workflows only — they carry credential mounts,
+# conventions/sdlc.md); listing them here affects linting only, not policy.
+self-hosted-runner:
+  labels:
+    - ubuntu-latest
+    - ubuntu-22.04
+    - codex
+    - codex-task
+    - claude

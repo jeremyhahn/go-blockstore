@@ -1,0 +1,14 @@
+# trivyignore-template: v1 — ships WITH .github/workflows/nightly.yml, whose
+# trivy job passes `--ignorefile .trivyignore`. Trivy treats a MISSING ignore
+# file as a FATAL flag error, not an empty list, so a repo that copies the
+# workflow without this file has a Trivy job that has NEVER SCANNED ANYTHING —
+# red on a flag error, with its real findings hidden behind it (measured:
+# go-enclave 2026-08-26, ten HIGH x/crypto CVEs sat behind the FATAL for the
+# workflow's whole life; go-enclave PR #5).
+#
+# Source of truth: software/templates/github-actions/.trivyignore in the
+# automatethethings repo. Keep this EMPTY except for CVE IDs with a dated
+# reason:
+#
+#   # 2026-01-01 <who>: <why this finding does not apply here>
+#   CVE-XXXX-NNNNN
