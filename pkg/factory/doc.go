@@ -25,8 +25,7 @@
 // carry a build tag named for the backend. The local provider carries NO build
 // tag — like go-objstore's local storage it is the fundamental backend, always
 // compiled — while backends pulling in kernel tooling or network libraries are
-// gated behind one. The provider files themselves land in follow-up work
-// (issues #2–#4) and will take this shape:
+// gated behind one. The provider files take this shape:
 //
 //	factory_local.go   — no build tag; always compiled, registers "local"
 //	factory_drbd.go    — //go:build drbd; registers "drbd"
@@ -39,10 +38,16 @@
 //
 // factory_local.go has landed: importing this package registers "local", backed
 // by github.com/jeremyhahn/go-blockstore/pkg/local, in every build.
-// factory_drbd.go registers "drbd" whenever the drbd tag is set. The remaining
-// backend is still to come (issue #4), so NewProvider returns
+// factory_drbd.go registers "drbd" whenever the drbd tag is set. The cephrbd
+// backend is still to come, so NewProvider returns
 // common.ErrProviderNotRegistered for "cephrbd", and for "drbd" in a build
 // without the tag.
+//
+// The HA controller in pkg/ha is deliberately NOT reachable through this
+// registry. Providers are mechanical and need no Coordinator; the controller is
+// the library's only Coordinator consumer and takes both dependencies
+// explicitly, so a Coordinator seam here would put a lease behind a name lookup
+// and hand every backend a dependency exactly one caller uses.
 //
 // # Settings keys
 //

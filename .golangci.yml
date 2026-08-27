@@ -80,9 +80,17 @@ linters:
           # spec by pointer would buy nothing and hand every provider a nil to
           # check and a caller's struct it could mutate.
           #
-          # 128 still catches a genuinely oversized parameter. Raise it again
+          # Raised again to 256 for the second type a contract forces: pkg/ha's
+          # Status, at 192 bytes, is what `ha.Observer func(Status)` hands an
+          # orchestrator on every transition. It is passed BY VALUE deliberately
+          # — it is a snapshot, and a pointer would hand observers a view of
+          # state the controller owns and may still be writing, which is a
+          # correctness problem traded for a copy that is not a performance one.
+          # The callback fires on phase and role changes, not per I/O.
+          #
+          # 256 still catches a genuinely oversized parameter. Raise it again
           # only for another type the contract forces, and say which here.
-          sizeThreshold: 128
+          sizeThreshold: 256
     govet:
       enable:
         - shadow

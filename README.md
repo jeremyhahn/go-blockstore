@@ -24,7 +24,7 @@ The library is built from three pieces:
   provider is created on demand with `NewProvider(name, settings)`. By
   convention the `local` provider carries no build tag and is always compiled,
   while networked/kernel-backed providers (`drbd`, `cephrbd`) are gated behind
-  matching build tags. `drbd` (#3) and `ha` (#4) are still to come.
+  matching build tags. `cephrbd` is still to come.
 - **Local provider** (`pkg/local`) — the always-compiled backend, over LVM and
   optional LUKS2 on a single host. A volume is a logical volume in one volume
   group; `Attach` activates it and unlocks its LUKS container when it has one,
@@ -51,6 +51,13 @@ The library is built from three pieces:
   coordinator implementation; dependency inversion keeps the coordination
   substrate a deployment choice while still enabling leader election, metadata
   storage and change notification for HA volumes.
+- **HA controller** (`pkg/ha`) — the only consumer of the injected
+  `Coordinator`. It campaigns for a per-volume primary lease, promotes the local
+  copy while it holds one, and stops acting the moment it loses one. It is
+  constructed with the provider and the Coordinator passed explicitly, because
+  providers are mechanical and need no Coordinator; putting the lease behind the
+  factory's name lookup would give every backend a dependency exactly one caller
+  uses.
 
 ## Layout
 
@@ -59,7 +66,71 @@ pkg/
   common/    interfaces, value types, sentinel errors, injected Coordinator
   factory/   name-keyed provider registry (thread-safe), build-tag convention
   local/     always-compiled LVM + LUKS2 provider (no build tag)
+  drbd/      DRBD 9 replicated provider (build tag: drbd)
+  ha/        lease-based HA controller — promote/demote/fence, no build tag
 ```
+
+## High availability
+
+`pkg/ha` runs one controller per node. Each managed volume gets its own lease
+key and its own goroutine; the holder promotes the local copy and renews at a
+third of the TTL, and a lost lease fences that volume immediately — including
+cancelling a promotion already in flight.
+
+Two things about it are worth reading before deploying it, and both are spelled
+out in full in the package documentation:
+
+- **The lease is a control-plane fence, not a data-plane fence.** Losing it
+  makes the controller stop acting. It does not make the kernel stop accepting
+  writes to a device that is already Primary and already mounted, so a node that
+  is partitioned rather than dead keeps writing while its peer takes over.
+  Closing that gap needs DRBD's own `fencing resource-and-stonith` with a fence
+  agent, or quorum. A lease is coordination; a fence is a power switch.
+- **Only an `uptodate` local copy is promoted.** Every other replication state
+  is refused with a reason, `sync-source` included — that bucket says the peer
+  is behind, not that the local disk is current. The controller never forces a
+  promotion: DRBD's refusal of a stale one is a feature it surfaces.
+
+The controller drives `Promote` and `Demote` and nothing else. Mounting is the
+workload orchestrator's step, taken after `Config.Observer` reports that this
+node became primary; unmounting is what makes the demote on the way back out
+possible.
+
+### The Coordinator must be able to lease
+
+In every deployment, clustered or not. The `Coordinator` contract lets an
+implementation without consensus reject `AcquireLease` and `Watch` as "not
+supported" while still serving the key/value family, and go-qrdb is such an
+implementation — its lease and watch families are raft-only. `pkg/ha` does not
+carry a second, CAS-based arbitration path for that case, because the promotion
+path has exactly one gatekeeper and a second mechanism selected by
+configuration is a second thing to get wrong on the path where wrong means two
+nodes writing to one device.
+
+So the deployment supplies a Coordinator that leases:
+
+- **Clustered** — go-qrdb in raft mode. The lease means cross-node ownership
+  arbitrated by a quorum. This is the only configuration in which a replicated
+  pair managed from *both* of its nodes is safe.
+- **Single-node** — an in-process Coordinator serving the whole contract without
+  raft (go-trusted-platform's `pkg/storage/coordination.Local`). It arbitrates
+  among the goroutines of one process and its guarantees stop at the process
+  boundary. It does **not** protect a replicated pair whose two nodes each run
+  their own control plane: two processes sharing neither map nor leases would
+  both acquire "the" lease and both promote.
+
+A Coordinator that cannot lease is not specially detected — "not supported" is
+implementation-defined — so it surfaces as an ordinary operational failure and
+the controller promotes nothing. A volume that never leaves `campaigning` is the
+symptom.
+
+Deployment caveat: an **embedded** go-qrdb coordinator (go-qrdb #174) never
+reaps an expired lease's key, so it fences but never re-elects. Run a
+coordinator backend whose lease sweeper is running.
+
+Nothing in `pkg/ha` has been run against real DRBD or a real two-node pair; it
+is verified against the contracts its dependencies publish. Read it as
+contract-validated, not hardware-validated, failover.
 
 ## Testing
 
