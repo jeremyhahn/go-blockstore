@@ -131,6 +131,41 @@
 // zero-filling every deleted volume costs minutes per terabyte on rotating
 // disks, which is not a cost to impose on deployments that do not need it.
 //
+// # What WipeOnDelete does not cover
+//
+// It covers the volume's CURRENT contents. It does not cover the history a
+// snapshot holds.
+//
+// An LVM classic snapshot's exception store holds the ORIGINAL blocks that were
+// overwritten on the origin since the snapshot was taken — real data, not
+// bookkeeping. DeleteSnapshot removes that store with lvremove and nothing
+// else, so those extents go back to the free pool unwiped, and they do so
+// whether or not WipeOnDelete is set. A deployment that wipes every volume it
+// deletes can still leave a deleted volume's earlier contents readable in the
+// extents its snapshots occupied.
+//
+// This is not an oversight that a wipe in DeleteSnapshot would close. Both ways
+// of reaching the exception store were measured on a loopback LVM harness
+// (2026-08-27, LVM 2.03.16), against the only test that counts — read the
+// physical extents back after lvremove and look for the plaintext:
+//
+//   - blkdiscard --zeroout over the visible snapshot device fails with EIO and
+//     INVALIDATES the snapshot. The device is origin-sized while the exception
+//     store is not, so zeroing it pushes the origin's blocks into a CoW area
+//     far too small to hold them. Plaintext survives.
+//   - blkdiscard over /dev/mapper/<vg>-<snap>-cow cannot open the device at
+//     all: EBUSY while the snapshot exists.
+//   - dd of zeroes over that same -cow device EXITS 0, writes the whole device,
+//     and leaves the snapshot healthy — and the plaintext still survives.
+//     Shipping that would have been worse than shipping nothing, because it
+//     would have made the guarantee look kept.
+//
+// So the honest statement is the one above, and Options.Encrypted is the answer
+// here too — more so than for the volume itself. What a snapshot's exception
+// store holds on an encrypted volume is ciphertext, and its key went away with
+// the LUKS header. If the history has to be unreadable, encrypt; do not reach
+// for WipeOnDelete and assume it reached the snapshots.
+//
 // # Mount targets
 //
 // A mount target is resolved to a DESCRIPTOR before it is used, with openat2

@@ -12,16 +12,18 @@ version: "2"
 run:
   # Test files are linted. This repo's tests ARE the contract for pkg/common —
   # a compile-time interface assertion and the registry's concurrency
-  # behaviour — so excluding them would leave the most load-bearing files
+  # behavior — so excluding them would leave the most load-bearing files
   # unchecked.
   tests: true
 
   # Tag-gated providers are invisible to the linter unless their tags are
   # listed here: golangci-lint reads only the files the build constraints
-  # select. `local` carries no tag and is always compiled; add `drbd` with the
-  # drbd provider (#3) and `cephrbd` with its own, in the same commit that adds
-  # the tagged files — and keep the Makefile's TAGS default in step.
-  build-tags: []
+  # select. `local` carries no tag and is always compiled; `drbd` is listed
+  # since #3, and cephrbd adds itself the same way, in the same commit that
+  # adds the tagged files — and keeps the Makefile's TAGS default and
+  # BUILD_TAGS in .github/workflows/ci.yml in step.
+  build-tags:
+    - drbd
 
 formatters:
   enable:

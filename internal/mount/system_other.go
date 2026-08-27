@@ -13,7 +13,7 @@
 
 //go:build !linux
 
-package local
+package mount
 
 import (
 	"context"
@@ -43,7 +43,10 @@ const (
 // Linux-only in practice — it drives LVM and device-mapper. The package still
 // COMPILES elsewhere, and refusing here is what keeps that from quietly becoming
 // an unpinned mount somewhere it cannot be done safely.
-var errNoMounter = errors.New("go-blockstore/local: mounting requires Linux, where a target can be pinned against symlink substitution")
+var errNoMounter = errors.New("go-blockstore/mount: mounting requires Linux, where a target can be pinned against symlink substitution")
+
+// Check reports whether a target can be pinned. It cannot be, here.
+func Check(string) error { return errNoMounter }
 
 type systemMounter struct{}
 
@@ -52,3 +55,21 @@ func (systemMounter) Mount(context.Context, string, string, string, uintptr, str
 }
 
 func (systemMounter) Unmount(context.Context, string) error { return errNoMounter }
+
+// The MS_* bits, exported for callers that assert on what a mount was given.
+// The table above is written against the lowercase aliases; these are the same
+// values under the names a caller outside this package would look for.
+const (
+	ReadOnly    = msRDONLY
+	NoSUID      = msNOSUID
+	NoDev       = msNODEV
+	NoExec      = msNOEXEC
+	Synchronous = msSYNCHRONOUS
+	DirSync     = msDIRSYNC
+	NoATime     = msNOATIME
+	NoDirATime  = msNODIRATIME
+	RelATime    = msRELATIME
+	StrictATime = msSTRICTATIME
+	LazyTime    = msLAZYTIME
+	NoSymFollow = msNOSYMFOLLOW
+)

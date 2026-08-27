@@ -56,6 +56,10 @@ const (
 	// retains readable data after deletion unless it is set. Setting
 	// SettingEncrypted is the recommended answer to that and costs far less;
 	// see Options.WipeOnDelete for the whole picture.
+	//
+	// It covers the volume's current contents only. A snapshot's exception
+	// store holds the origin's overwritten history and is freed unwiped, by a
+	// measured impossibility rather than an omission — see the package doc.
 	SettingWipeOnDelete = "wipe_on_delete"
 
 	// SettingLockDir holds the per-volume lock files that serialize

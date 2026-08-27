@@ -20,8 +20,11 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
+
+	"github.com/jeremyhahn/go-blockstore/internal/mount"
 )
 
 // defaultSnapshotCoWPercent is the share of the origin's size given to a
@@ -51,6 +54,20 @@ type Provider struct {
 
 // Ensure the provider satisfies the contract at compile time.
 var _ common.VolumeProvider = (*Provider)(nil)
+
+// Mounter is the seam through which mounting and unmounting happen.
+//
+// It is an alias for internal/mount's type, not a copy of it: the
+// implementation is shared with every other provider that mounts, because the
+// reason it exists — a target has to be pinned to a descriptor before a
+// privileged mount addresses it — is the same for all of them.
+//
+// The alias is what keeps that sharing from reaching the API. Options.Mounter
+// is settable from outside this module either way, since Go satisfies an
+// interface structurally, but without a name here a caller could not DECLARE
+// one: no "var m local.Mounter", no function returning one. The type was
+// exported at v0.1.0-alpha and stays nameable.
+type Mounter = mount.Mounter
 
 // Options configures a Provider.
 type Options struct {
@@ -201,7 +218,7 @@ func New(opts Options) (*Provider, error) {
 
 	mounter := opts.Mounter
 	if mounter == nil {
-		mounter = systemMounter{}
+		mounter = mount.System()
 	}
 
 	node := opts.NodeID
@@ -823,7 +840,7 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 		return fmt.Errorf("%w: volume %q carries no filesystem to mount", common.ErrInvalidArgument, volID)
 	}
 
-	flags, data := mountArguments(opts)
+	flags, data := mount.Arguments(opts.ReadOnly, opts.Flags)
 	return p.mounter.Mount(ctx, device, target, fsType, flags, data)
 }
 
@@ -1222,11 +1239,25 @@ func (p *Provider) DeleteSnapshot(ctx context.Context, snapID common.SnapshotID)
 // fails stops the delete: a filesystem still in use is a better outcome than a
 // removed volume underneath it.
 //
-// lvremove takes the volume's snapshots with it. They are copy-on-write areas
-// over an origin that is going away and cannot outlive it.
+// It REFUSES a volume that still has snapshots, with common.ErrHasSnapshots
+// naming them. lvremove would take them with it — they are copy-on-write areas
+// over an origin that cannot outlive it — and destroying a restore point as a
+// side effect of destroying something else is not a default worth having in a
+// stack whose volumes are the ones people restore from. A caller that means it
+// deletes the snapshots first, which is one more call and an explicit one.
+//
+// The refusal also removes a hazard that used to need careful ordering here.
+// Zeroing an origin that still has a snapshot is copy-on-write's worst case:
+// every block written pushes the block it replaced into the snapshot's CoW
+// area, so the wipe duplicates the very data it is destroying into extents
+// lvremove then frees. Measured on LVM 2.03.16, wiping a 64 MiB origin under
+// one snapshot drove CoW occupancy from 0% to 100% and overflowed the snapshot
+// into an unreadable state. With snapshots refused outright, a wipe can no
+// longer run under one.
 //
 // With Options.WipeOnDelete the volume is zero-filled first, so its contents do
-// not linger in the free extents LVM hands to the next volume.
+// not linger in the free extents LVM hands to the next volume. See the package
+// doc for exactly what that covers and what it does not.
 func (p *Provider) Delete(ctx context.Context, volID string) error {
 	if err := validateName("volume", volID); err != nil {
 		return err
@@ -1244,6 +1275,21 @@ func (p *Provider) Delete(ctx context.Context, volID string) error {
 	lv, exists := lookupLV(lvs, volID)
 	if !exists {
 		return fmt.Errorf("%w: volume %q", common.ErrNotFound, volID)
+	}
+
+	// Checked before any teardown: refusing after unmounting and closing the
+	// volume would leave the caller worse off than when it asked, for an
+	// operation that was never going to complete.
+	var snapshots []string
+	for i := range lvs {
+		if lvs[i].Origin == volID {
+			snapshots = append(snapshots, lvs[i].Name)
+		}
+	}
+	if len(snapshots) > 0 {
+		sort.Strings(snapshots)
+		return fmt.Errorf("volume %q: delete %s first: %w",
+			volID, strings.Join(snapshots, ", "), common.ErrHasSnapshots)
 	}
 
 	if lv.active() {
@@ -1268,21 +1314,9 @@ func (p *Provider) Delete(ctx context.Context, volID string) error {
 	wasActive := lv.active()
 
 	if p.wipeOnDelete {
-		// Snapshots go first, and the order is not a preference. Zeroing an
-		// origin that still has a snapshot is copy-on-write's worst case: every
-		// block written pushes the block it replaced into the snapshot's CoW
-		// area, so the wipe duplicates the very data it is destroying into
-		// extents lvremove then frees. Measured on LVM 2.03.16, wiping a 64 MiB
-		// origin under one snapshot drove CoW occupancy from 0% to 100% and
-		// overflowed the snapshot into an unreadable state.
-		for _, snap := range lvs {
-			if snap.Origin != volID {
-				continue
-			}
-			if err := p.removeLV(ctx, snap.Name); err != nil {
-				return err
-			}
-		}
+		// No snapshot can exist here — Delete refused above — so the
+		// copy-on-write ordering this used to need is gone with the hazard that
+		// motivated it. See the godoc.
 		if err := p.wipe(ctx, volID, wasActive); err != nil {
 			return err
 		}

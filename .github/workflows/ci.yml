@@ -46,14 +46,19 @@ env:
   # value is always a single shell word — a space-separated list splits at the
   # wrong moment in half these steps, and gosec takes commas regardless.
   #
-  # EMPTY today: the scaffold and the `local` provider are untagged, so a bare
-  # build covers the whole tree. This exists so the tag-gated providers can be
-  # turned on by editing ONE line instead of six steps — the drbd provider (#3)
-  # sets this to `drbd`, and cephrbd adds itself the same way. Two other places
-  # must follow when a tag is added: `run.build-tags` in .golangci.yml, which
+  # `drbd` since #3: pkg/drbd is gated behind that tag, so without it here the
+  # whole provider is invisible to every step below — built, vetted, linted and
+  # tested as zero lines. cephrbd adds itself to the same list. Two other
+  # places follow when a tag is added: `run.build-tags` in .golangci.yml, which
   # is what the lint job actually reads, and the Makefile's TAGS default, which
   # is how a developer reproduces this run locally.
-  BUILD_TAGS: ''
+  #
+  # Setting this does mean every step below runs WITH the tags, so the untagged
+  # build stops being covered by them. That build is not incidental — the whole
+  # point of the convention is that a binary built without -tags drbd compiles,
+  # links no DRBD tooling and lists no "drbd" provider — so the build job
+  # checks it explicitly rather than losing it here.
+  BUILD_TAGS: 'drbd'
 
 jobs:
   # STAGE 1 — the fast tier. No `needs`; everything expensive stages behind it.
@@ -140,6 +145,16 @@ jobs:
 
       - name: Build all packages
         run: go build -tags="${BUILD_TAGS}" ./...
+
+      # The tag convention's core claim: a binary built WITHOUT the provider
+      # tags still compiles, and a package whose files are all excluded is an
+      # empty package rather than a build error. Every other step in this
+      # workflow runs with BUILD_TAGS set, so this is the only place that
+      # claim is tested.
+      - name: Build with no build tags
+        run: |
+          go build ./...
+          go vet ./...
 
       # CUSTOMIZE: no nested modules in this repo. A provider that grows its
       # own module builds here too.

@@ -29,7 +29,10 @@
 # Two other places must follow a new tag: `run.build-tags` in .golangci.yml —
 # a tag the linter does not know about is a package the linter does not read —
 # and BUILD_TAGS in .github/workflows/ci.yml.
-TAGS ?=
+#
+# `drbd` since #3, matching what CI runs. Override with TAGS= to reproduce the
+# untagged build, which is the one the tag convention promises still compiles.
+TAGS ?= drbd
 
 comma := ,
 TAG_FLAGS := $(if $(strip $(TAGS)),-tags=$(strip $(TAGS)),)
@@ -142,13 +145,35 @@ race:
 
 .PHONY: integration-test
 ## integration-test: Run the integration suite (build tag: integration)
-# No integration suite exists yet — the providers that need one ship in #2/#3/#4.
-# The target exists so the contract in devops.md §4 is real from the start and
-# the first suite is added by writing tests, not by inventing a target.
+# The drbd provider's real-cluster suite is NOT in here, and that is deliberate.
+# It carries `drbd_integration` as a second tag because it creates and destroys
+# logical volumes and DRBD resources on the host it runs on: under `integration`
+# it would run from `make ci`, on every machine, either doing that or hard
+# failing on its own destructive-operation guard.
+#
+# The cost of that separation is that a green run of THIS target says nothing
+# about the drbd provider, so the banner says so rather than letting a developer
+# assume otherwise. Running it needs a configured two-node pair and root:
+#
+#     make integration-test-drbd
+#
 integration-test:
 	@echo "$(CYAN)$(BOLD)→ Running integration tests...$(RESET)"
 	$(GO) test -tags=integration$(if $(strip $(TAGS)),$(comma)$(strip $(TAGS)),) -count=1 -timeout=$(TEST_TIMEOUT) ./...
+	@echo "$(YELLOW)  note: the drbd real-cluster suite is not included; see integration-test-drbd$(RESET)"
 	@echo "$(GREEN)✓ Integration tests complete$(RESET)"
+
+.PHONY: integration-test-drbd
+## integration-test-drbd: Run the drbd real-cluster suite (DESTRUCTIVE, needs root + a configured pair)
+# Separate from `integration-test` on purpose: this creates and destroys logical
+# volumes and DRBD resources on the host. It refuses to run without
+# GO_BLOCKSTORE_DRBD_ALLOW_DESTRUCTIVE=1 and the GO_BLOCKSTORE_DRBD_* settings
+# naming the pair, so an accidental invocation stops rather than starting.
+integration-test-drbd:
+	@echo "$(CYAN)$(BOLD)→ Running the drbd real-cluster suite...$(RESET)"
+	@echo "$(YELLOW)  DESTRUCTIVE: creates and destroys LVs and DRBD resources on this host$(RESET)"
+	$(GO) test -tags=drbd,drbd_integration -count=1 -timeout=$(TEST_TIMEOUT) -run Integration ./pkg/drbd/
+	@echo "$(GREEN)✓ drbd real-cluster suite complete$(RESET)"
 
 .PHONY: coverage
 ## coverage: Enforce the coverage threshold and write an HTML report

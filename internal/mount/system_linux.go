@@ -13,7 +13,7 @@
 
 //go:build linux
 
-package local
+package mount
 
 import (
 	"context"
@@ -76,14 +76,36 @@ func pinDirectory(path string) (int, error) {
 		// No fallback. The racy path is the vulnerability this exists to close,
 		// so a kernel that cannot pin gets a refusal rather than a mount that
 		// looks checked and is not.
-		return -1, fmt.Errorf("go-blockstore/local: resolving %q needs openat2, which this kernel does not provide; "+
+		return -1, fmt.Errorf("go-blockstore/mount: resolving %q needs openat2, which this kernel does not provide; "+
 			"Linux 5.6 or newer is required to mount safely: %w", path, err)
 	case errors.Is(err, unix.ELOOP):
-		return -1, fmt.Errorf("go-blockstore/local: %q, or a directory above it, is a symbolic link; "+
+		return -1, fmt.Errorf("go-blockstore/mount: %q, or a directory above it, is a symbolic link; "+
 			"a mount target must be a real directory: %w", path, err)
 	default:
-		return -1, fmt.Errorf("go-blockstore/local: resolving %q: %w", path, err)
+		return -1, fmt.Errorf("go-blockstore/mount: resolving %q: %w", path, err)
 	}
+}
+
+// Check reports whether a target can be pinned, using exactly the resolution a
+// Mount would — the same openat2 call, the same refusals — and then lets it go.
+//
+// It exists so a caller can find out that a target is unusable BEFORE doing
+// something it cannot take back. A provider that formats a raw volume on its
+// first mount needs to fail a doomed request before the mkfs, and a check that
+// merely resembled the real one would pass for a path the mount then refuses:
+// an Lstat, for instance, says nothing about a symlink at a PARENT, which the
+// pin rejects. Sharing the call is what keeps the two from ever disagreeing.
+//
+// A target that passes here can still fail at Mount — the path may be swapped
+// in between, which is the race the pin exists to survive. That is not a
+// weakness of this function: Mount resolves again, from scratch, and mounts
+// against what IT pinned.
+func Check(target string) error {
+	fd, err := pinDirectory(target)
+	if err != nil {
+		return err
+	}
+	return unix.Close(fd)
 }
 
 // Mount attaches source at the pinned target.
@@ -99,7 +121,7 @@ func (systemMounter) Mount(_ context.Context, source, target, fsType string, fla
 	// the opposite operation — this one names a directory already pinned, and
 	// is how a descriptor is handed to a syscall that takes a path.
 	if err := unix.Mount(source, fdPath(fd), fsType, flags, data); err != nil {
-		return fmt.Errorf("go-blockstore/local: mounting %s at %s: %w", source, target, err)
+		return fmt.Errorf("go-blockstore/mount: mounting %s at %s: %w", source, target, err)
 	}
 	return nil
 }
@@ -123,7 +145,7 @@ func (systemMounter) Unmount(_ context.Context, target string) error {
 	defer func() { _ = unix.Close(fd) }()
 
 	if err := unix.Unmount(filepath.Join(fdPath(fd), name), unix.UMOUNT_NOFOLLOW); err != nil {
-		return fmt.Errorf("go-blockstore/local: unmounting %s: %w", target, err)
+		return fmt.Errorf("go-blockstore/mount: unmounting %s: %w", target, err)
 	}
 	return nil
 }
@@ -132,3 +154,21 @@ func (systemMounter) Unmount(_ context.Context, target string) error {
 func fdPath(fd int) string {
 	return fmt.Sprintf("/proc/self/fd/%d", fd)
 }
+
+// The MS_* bits, exported for callers that assert on what a mount was given.
+// The table above is written against the lowercase aliases; these are the same
+// values under the names a caller outside this package would look for.
+const (
+	ReadOnly    = msRDONLY
+	NoSUID      = msNOSUID
+	NoDev       = msNODEV
+	NoExec      = msNOEXEC
+	Synchronous = msSYNCHRONOUS
+	DirSync     = msDIRSYNC
+	NoATime     = msNOATIME
+	NoDirATime  = msNODIRATIME
+	RelATime    = msRELATIME
+	StrictATime = msSTRICTATIME
+	LazyTime    = msLAZYTIME
+	NoSymFollow = msNOSYMFOLLOW
+)

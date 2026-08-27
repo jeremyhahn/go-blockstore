@@ -23,6 +23,7 @@ import (
 
 	"github.com/jeremyhahn/go-enclave"
 
+	"github.com/jeremyhahn/go-blockstore/internal/mount"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
@@ -81,7 +82,7 @@ func assertNoLine(t *testing.T, runner *fakeRunner, unwanted string) {
 // input: anything in argv is world-readable from /proc/<pid>/cmdline while the
 // command runs.
 // assertMounted checks that exactly the expected mount was performed.
-func assertMounted(t *testing.T, runner *fakeRunner, want fakeMount) {
+func assertMounted(t *testing.T, runner *fakeRunner, want mount.Call) {
 	t.Helper()
 	got := runner.mountCalls()
 	if len(got) != 1 {
@@ -913,7 +914,7 @@ func TestMountProbesFilesystemType(t *testing.T) {
 	if err := p.Mount(context.Background(), "data", "/mnt/data", common.MountOptions{}); err != nil {
 		t.Fatalf("Mount: %v", err)
 	}
-	assertMounted(t, runner, fakeMount{
+	assertMounted(t, runner, mount.Call{
 		Source: "/dev/vg0/data", Target: "/mnt/data", FSType: "ext4",
 	})
 }
@@ -935,9 +936,9 @@ func TestMountAssemblesOptions(t *testing.T) {
 	// ReadOnly and the generic options become kernel flags; nothing here is a
 	// filesystem option, so the data string stays empty. Handing nosuid or
 	// nodev over as data would leave the kernel never applying them.
-	assertMounted(t, runner, fakeMount{
+	assertMounted(t, runner, mount.Call{
 		Source: "/dev/vg0/data", Target: "/mnt/data", FSType: "ext4",
-		Flags: msRDONLY | msNOATIME | msNODEV,
+		Flags: mount.ReadOnly | mount.NoATime | mount.NoDev,
 	})
 }
 
@@ -954,7 +955,7 @@ func TestMountEncryptedUsesThePlaintextMapping(t *testing.T) {
 	if err := p.Mount(context.Background(), "data", "/mnt/data", common.MountOptions{}); err != nil {
 		t.Fatalf("Mount: %v", err)
 	}
-	assertMounted(t, runner, fakeMount{
+	assertMounted(t, runner, mount.Call{
 		Source: "/dev/mapper/bs-vg0_data", Target: "/mnt/data", FSType: "xfs",
 	})
 }
@@ -1845,63 +1846,63 @@ func TestDeleteWipesTheContainerNotTheMapping(t *testing.T) {
 	assertNoLine(t, runner, "blkdiscard --zeroout /dev/mapper/bs-vg0_data")
 }
 
-// TestWipingDeleteRemovesSnapshotsBeforeWiping pins an order that is not a
-// preference. Zeroing an origin that still has a snapshot is copy-on-write's
-// worst case: each block written pushes the block it replaced into the CoW
-// area, so the wipe copies the data it is destroying into extents lvremove then
-// frees unwiped. Measured against real LVM, it took CoW occupancy from 0% to
-// 100% and left the snapshot unreadable.
-func TestWipingDeleteRemovesSnapshotsBeforeWiping(t *testing.T) {
+// TestDeleteRefusesAVolumeWithSnapshots is the contract: Delete does not
+// cascade. lvremove would take the snapshots with it — they are copy-on-write
+// areas over an origin that cannot outlive it — and losing a restore point as
+// a side effect of removing something else is the wrong default for a stack
+// whose volumes are the ones people restore from.
+func TestDeleteRefusesAVolumeWithSnapshots(t *testing.T) {
+	for _, wipe := range []bool{false, true} {
+		name := "without wipe"
+		if wipe {
+			name = "with wipe"
+		}
+		t.Run(name, func(t *testing.T) {
+			runner := newFakeRunner().withLVs(
+				lvFixture{Name: "data", SizeBytes: gib},
+				lvFixture{Name: "data" + snapSeparator + "nightly", SizeBytes: gib / 5, Origin: "data"},
+				lvFixture{Name: "data" + snapSeparator + "weekly", SizeBytes: gib / 5, Origin: "data"},
+			)
+			p := newTestProvider(t, runner, func(o *Options) { o.WipeOnDelete = wipe })
+
+			err := p.Delete(context.Background(), "data")
+			if !errors.Is(err, common.ErrHasSnapshots) {
+				t.Fatalf("Delete = %v, want ErrHasSnapshots", err)
+			}
+			// The caller has to know WHICH snapshots are in the way, or the
+			// error tells it to go looking.
+			for _, want := range []string{"data_snap_nightly", "data_snap_weekly"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not name %q", err, want)
+				}
+			}
+			// Nothing was destroyed, and nothing was torn down on the way to
+			// refusing: the volume is exactly as the caller left it.
+			runner.mustNotRun(t, "lvremove")
+			runner.mustNotRun(t, "blkdiscard")
+			runner.mustNotRun(t, "umount")
+			runner.mustNotRun(t, "cryptsetup")
+		})
+	}
+}
+
+// TestDeleteProceedsOnceSnapshotsAreGone checks the other half: the refusal is
+// about snapshots of THIS volume, and clearing them lets the delete through.
+func TestDeleteProceedsOnceSnapshotsAreGone(t *testing.T) {
 	runner := newFakeRunner().withLVs(
 		lvFixture{Name: "data", SizeBytes: gib},
-		lvFixture{Name: "data" + snapSeparator + "nightly", SizeBytes: gib / 5, Origin: "data"},
-		lvFixture{Name: "data" + snapSeparator + "weekly", SizeBytes: gib / 5, Origin: "data"},
+		// A snapshot of a different origin is not this volume's business.
+		lvFixture{Name: "other" + snapSeparator + "nightly", SizeBytes: gib / 5, Origin: "other"},
 	)
 	p := newTestProvider(t, runner, func(o *Options) { o.WipeOnDelete = true })
 
 	if err := p.Delete(context.Background(), "data"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-
-	lines := runner.lines()
-	at := func(want string) int {
-		for i, line := range lines {
-			if line == want {
-				return i
-			}
-		}
-		t.Fatalf("missing %q; got:\n  %s", want, strings.Join(lines, "\n  "))
-		return -1
-	}
-	nightly := at("lvremove --force vg0/data_snap_nightly")
-	weekly := at("lvremove --force vg0/data_snap_weekly")
-	wipe := at("blkdiscard --zeroout /dev/vg0/data")
-	origin := at("lvremove --force vg0/data")
-
-	if nightly > wipe || weekly > wipe {
-		t.Errorf("a snapshot survived into the wipe:\n  %s", strings.Join(lines, "\n  "))
-	}
-	if wipe > origin {
-		t.Errorf("the origin was removed before it was wiped:\n  %s", strings.Join(lines, "\n  "))
-	}
-}
-
-// TestDeleteWithoutWipeLeavesSnapshotsToLvremove records that the snapshot
-// sweep belongs to the wipe path only. Without it, lvremove takes the volume's
-// snapshots with it in one step, which is the cheaper behavior and loses
-// nothing.
-func TestDeleteWithoutWipeLeavesSnapshotsToLvremove(t *testing.T) {
-	runner := newFakeRunner().withLVs(
-		lvFixture{Name: "data", SizeBytes: gib},
-		lvFixture{Name: "data" + snapSeparator + "nightly", SizeBytes: gib / 5, Origin: "data"},
-	)
-	p := newTestProvider(t, runner)
-
-	if err := p.Delete(context.Background(), "data"); err != nil {
-		t.Fatalf("Delete: %v", err)
-	}
-	assertNoLine(t, runner, "lvremove --force vg0/data_snap_nightly")
+	assertLine(t, runner, "blkdiscard --zeroout /dev/vg0/data")
 	assertLine(t, runner, "lvremove --force vg0/data")
+	// Another volume's snapshot is untouched.
+	assertNoLine(t, runner, "lvremove --force vg0/other_snap_nightly")
 }
 
 // TestDeleteStopsWhenAWipeFails keeps a volume whose contents could not be

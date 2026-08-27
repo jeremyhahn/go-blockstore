@@ -13,7 +13,7 @@
 
 //go:build linux
 
-package local
+package mount
 
 import (
 	"context"
@@ -22,8 +22,6 @@ import (
 	"testing"
 
 	"golang.org/x/sys/unix"
-
-	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
 // These exercise the resolution itself, which needs a real filesystem but no
@@ -213,10 +211,8 @@ func TestSystemMounterRefusesUnpinnableTargets(t *testing.T) {
 // makes load-bearing. A generic option handed over as data is not applied by the
 // kernel and not rejected either — nosuid would simply not take.
 func TestMountArgumentsSplitsFlagsFromData(t *testing.T) {
-	flags, data := mountArguments(common.MountOptions{
-		ReadOnly: true,
-		Flags:    []string{"nosuid", "nodev", "noexec", "noatime", "data=ordered", "errors=remount-ro"},
-	})
+	flags, data := Arguments(true,
+		[]string{"nosuid", "nodev", "noexec", "noatime", "data=ordered", "errors=remount-ro"})
 
 	for name, bit := range map[string]uintptr{
 		"MS_RDONLY":  msRDONLY,
@@ -237,13 +233,63 @@ func TestMountArgumentsSplitsFlagsFromData(t *testing.T) {
 // TestMountArgumentsTreatsDefaultsAsNoOps checks the options that name a kernel
 // default: they are accepted for clarity and set nothing.
 func TestMountArgumentsTreatsDefaultsAsNoOps(t *testing.T) {
-	flags, data := mountArguments(common.MountOptions{
-		Flags: []string{"rw", "suid", "dev", "exec", "async", "atime", "diratime"},
-	})
+	flags, data := Arguments(false,
+		[]string{"rw", "suid", "dev", "exec", "async", "atime", "diratime"})
 	if flags != 0 {
 		t.Errorf("flags = %#x, want none set", flags)
 	}
 	if data != "" {
 		t.Errorf("data = %q, want empty", data)
+	}
+}
+
+// TestCheckAgreesWithMount is the property the pre-format guard in a provider
+// depends on: Check must accept exactly what a Mount would pin and refuse
+// exactly what it would refuse. A cheaper lookalike — an Lstat, say — passes a
+// path whose PARENT is a symlink, and a provider that formatted a volume on the
+// strength of it would have destroyed something for a mount that then failed.
+func TestCheckAgreesWithMount(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	if err := os.MkdirAll(filepath.Join(real, "sub"), 0o755); err != nil {
+		t.Fatalf("creating directories: %v", err)
+	}
+	if err := os.Symlink(real, filepath.Join(base, "link")); err != nil {
+		t.Fatalf("creating symlink: %v", err)
+	}
+	file := filepath.Join(base, "file")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatalf("creating file: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		target string
+		want   bool
+	}{
+		{"a real directory", real, true},
+		{"a directory below a real directory", filepath.Join(real, "sub"), true},
+		{"the symlink itself", filepath.Join(base, "link"), false},
+		{"a real directory below a SYMLINKED parent", filepath.Join(base, "link", "sub"), false},
+		{"a regular file", file, false},
+		{"a path that does not exist", filepath.Join(base, "absent"), false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := Check(tc.target)
+			if (err == nil) != tc.want {
+				t.Fatalf("Check(%q) = %v, want accepted=%v", tc.target, err, tc.want)
+			}
+			// And the pin itself reaches the same verdict, since Check is how a
+			// caller asks the question the pin will answer later.
+			fd, pinErr := pinDirectory(tc.target)
+			if pinErr == nil {
+				_ = unix.Close(fd)
+			}
+			if (pinErr == nil) != (err == nil) {
+				t.Errorf("Check and pinDirectory disagree on %q: %v vs %v", tc.target, err, pinErr)
+			}
+		})
 	}
 }

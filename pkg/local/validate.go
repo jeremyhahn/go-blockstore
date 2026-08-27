@@ -19,6 +19,8 @@ import (
 	"strings"
 
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
+
+	"github.com/jeremyhahn/go-blockstore/internal/mount"
 )
 
 // maxNameLen bounds a caller-supplied volume or snapshot name.
@@ -104,109 +106,6 @@ func sortedFSTypes() []string {
 	return []string{"ext2", "ext3", "ext4", "xfs"}
 }
 
-// mountOption says how one allowed mount option reaches the kernel.
-//
-// mount(2) takes the generic options as bits in its flags argument and the
-// filesystem-specific ones as a comma-separated data string, and getting the
-// split wrong is silent: a security option like nosuid handed over as data is
-// simply not applied. Classifying every option here rather than at the call site
-// makes an unclassified one impossible — the allowlist and the classification
-// are the same table, so a token cannot be permitted without saying where it
-// goes.
-type mountOption struct {
-	// flag is the MS_* bit this option sets, or 0 for a data option and for the
-	// options that name a kernel default and therefore set nothing.
-	flag uintptr
-
-	// data marks an option the filesystem parses rather than the kernel.
-	data bool
-}
-
-// allowedMountFlags is the exact set of mount options this provider will apply.
-//
-// Matching is on the whole token, which is what makes the allowlist hold: the
-// data options are joined with commas into one string, so a token containing a
-// comma would smuggle in options nobody vetted. "noatime,exec" is not on this
-// list and is rejected rather than split, and so is anything beginning with a
-// hyphen.
-//
-// nofail is deliberately absent. It directs mount(8) and fstab, means nothing to
-// mount(2), and would reach a filesystem as an unrecognized data option — so it
-// is refused with the rest rather than accepted and quietly dropped.
-var allowedMountFlags = map[string]mountOption{
-	// Generic options the kernel applies.
-	"ro":          {flag: msRDONLY},
-	"nosuid":      {flag: msNOSUID},
-	"nodev":       {flag: msNODEV},
-	"noexec":      {flag: msNOEXEC},
-	"sync":        {flag: msSYNCHRONOUS},
-	"dirsync":     {flag: msDIRSYNC},
-	"noatime":     {flag: msNOATIME},
-	"nodiratime":  {flag: msNODIRATIME},
-	"relatime":    {flag: msRELATIME},
-	"strictatime": {flag: msSTRICTATIME},
-	"lazytime":    {flag: msLAZYTIME},
-	"nosymfollow": {flag: msNOSYMFOLLOW},
-
-	// The kernel defaults. Flags are built up from zero, so naming one sets
-	// nothing — they are accepted because a caller may state them for clarity.
-	"rw":         {},
-	"suid":       {},
-	"dev":        {},
-	"exec":       {},
-	"async":      {},
-	"atime":      {},
-	"diratime":   {},
-	"nolazytime": {},
-
-	// Filesystem-specific options, passed through as data.
-	"barrier":            {data: true},
-	"nobarrier":          {data: true},
-	"discard":            {data: true},
-	"nodiscard":          {data: true},
-	"data=journal":       {data: true},
-	"data=ordered":       {data: true},
-	"data=writeback":     {data: true},
-	"errors=continue":    {data: true},
-	"errors=panic":       {data: true},
-	"errors=remount-ro":  {data: true},
-	"nouuid":             {data: true},
-	"user_xattr":         {data: true},
-	"nouser_xattr":       {data: true},
-	"acl":                {data: true},
-	"noacl":              {data: true},
-	"journal_checksum":   {data: true},
-	"nojournal_checksum": {data: true},
-	"grpquota":           {data: true},
-	"usrquota":           {data: true},
-	"noquota":            {data: true},
-	"norecovery":         {data: true},
-	"inode64":            {data: true},
-	"largeio":            {data: true},
-	"swalloc":            {data: true},
-}
-
-// mountArguments turns validated options into the two things mount(2) takes.
-//
-// ReadOnly becomes MS_RDONLY here rather than a "ro" token, so it cannot be
-// lost among the data options; validateMountFlags has already refused an "rw"
-// alongside it.
-func mountArguments(opts common.MountOptions) (flags uintptr, data string) {
-	if opts.ReadOnly {
-		flags |= msRDONLY
-	}
-	var dataOpts []string
-	for _, f := range opts.Flags {
-		option := allowedMountFlags[f]
-		if option.data {
-			dataOpts = append(dataOpts, f)
-			continue
-		}
-		flags |= option.flag
-	}
-	return flags, strings.Join(dataOpts, ",")
-}
-
 // validateMountFlags checks every flag against the allowlist, and rejects a
 // flag that contradicts an explicit read-only request.
 //
@@ -217,7 +116,7 @@ func mountArguments(opts common.MountOptions) (flags uintptr, data string) {
 // is refused rather than silently resolved either way.
 func validateMountFlags(readOnly bool, flags []string) error {
 	for _, f := range flags {
-		if _, ok := allowedMountFlags[f]; !ok {
+		if _, ok := mount.Lookup(f); !ok {
 			return fmt.Errorf("%w: mount flag %q is not permitted", common.ErrInvalidArgument, f)
 		}
 		if readOnly && f == "rw" {

@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/jeremyhahn/go-blockstore/internal/mount"
 )
 
 // fakeCall records one command the provider issued.
@@ -50,71 +52,32 @@ type fakeRunner struct {
 	handlers map[string]responder
 
 	// The same fake serves as the Mounter, so a test holds one object and can
-	// assert on the exec'd commands and the mounts together.
-	mounts     []fakeMount
-	unmounts   []string
-	mountErr   error
-	unmountErr error
-}
-
-// fakeMount is one call to Mount, kept as the arguments the kernel would get
-// rather than as a command line — which is the point of the change it models.
-type fakeMount struct {
-	Source string
-	Target string
-	FSType string
-	Flags  uintptr
-	Data   string
-}
-
-// Mount records a mount instead of performing one.
-func (f *fakeRunner) Mount(_ context.Context, source, target, fsType string, flags uintptr, data string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.mounts = append(f.mounts, fakeMount{Source: source, Target: target, FSType: fsType, Flags: flags, Data: data})
-	return f.mountErr
-}
-
-// Unmount records an unmount instead of performing one.
-func (f *fakeRunner) Unmount(_ context.Context, target string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.unmounts = append(f.unmounts, target)
-	return f.unmountErr
+	// assert on the exec'd commands and the mounts together. That half is the
+	// shared recorder from internal/mount, embedded rather than reimplemented,
+	// so pkg/drbd's tests drive the same one and the two cannot drift.
+	*mount.Fake
 }
 
 // mountCalls returns the mounts recorded so far.
-func (f *fakeRunner) mountCalls() []fakeMount {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]fakeMount(nil), f.mounts...)
-}
+func (f *fakeRunner) mountCalls() []mount.Call { return f.MountCalls() }
 
 // unmountCalls returns the unmount targets recorded so far.
-func (f *fakeRunner) unmountCalls() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.unmounts...)
-}
+func (f *fakeRunner) unmountCalls() []string { return f.UnmountCalls() }
 
 // failMount makes the next mounts fail.
 func (f *fakeRunner) failMount(err error) *fakeRunner {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.mountErr = err
+	f.FailMount(err)
 	return f
 }
 
 // failUnmount makes the next unmounts fail.
 func (f *fakeRunner) failUnmount(err error) *fakeRunner {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.unmountErr = err
+	f.FailUnmount(err)
 	return f
 }
 
 func newFakeRunner() *fakeRunner {
-	f := &fakeRunner{handlers: map[string]responder{}}
+	f := &fakeRunner{handlers: map[string]responder{}, Fake: &mount.Fake{}}
 
 	// An empty volume group, so a provider with no fixtures sees no volumes
 	// rather than a parse failure.

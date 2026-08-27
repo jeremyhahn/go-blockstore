@@ -38,7 +38,23 @@
 // and make the default build provider-less.
 //
 // factory_local.go has landed: importing this package registers "local", backed
-// by github.com/jeremyhahn/go-blockstore/pkg/local, in every build. The tagged
-// backends are still to come (issues #3 and #4), so NewProvider returns
-// common.ErrProviderNotRegistered for "drbd" and "cephrbd".
+// by github.com/jeremyhahn/go-blockstore/pkg/local, in every build.
+// factory_drbd.go registers "drbd" whenever the drbd tag is set. The remaining
+// backend is still to come (issue #4), so NewProvider returns
+// common.ErrProviderNotRegistered for "cephrbd", and for "drbd" in a build
+// without the tag.
+//
+// # Settings keys
+//
+// The settings map NewProvider takes is provider-specific, but its KEYS follow
+// one convention across every backend: snake_case, mirroring go-objstore
+// (access_key_id, secret_access_key, encryption_kms_path). A concept two
+// providers share is spelled the same in both — the LVM volume group is
+// volume_group in local and in drbd, never vg in one and volume_group in the
+// other — so a caller configuring either does not have to remember which
+// spelling that one wants.
+//
+// Providers reject a key they do not recognize rather than ignoring it. A
+// mistyped setting that silently does nothing is a configuration bug that
+// surfaces much later, as wrong behavior on the node it was meant to fix.
 package factory

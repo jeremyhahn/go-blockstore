@@ -1,0 +1,53 @@
+[
+  {
+    "name": "vol1",
+    "node-id": 0,
+    "role": "Primary",
+    "suspended": false,
+    "write-ordering": "flush",
+    "devices": [
+      {
+        "volume": 0,
+        "minor": 0,
+        "disk-state": "UpToDate",
+        "client": false,
+        "quorum": false,
+        "size": 1048572,
+        "read": 0,
+        "written": 131072,
+        "al-writes": 12,
+        "bm-writes": 3,
+        "upper-pending": 0,
+        "lower-pending": 0
+      }
+    ],
+    "connections": [
+      {
+        "peer-node-id": 1,
+        "name": "node-b",
+        "connection": "StandAlone",
+        "congested": false,
+        "peer-role": "Unknown",
+        "ap-in-flight": 0,
+        "rs-in-flight": 0,
+        "peer_devices": [
+          {
+            "volume": 0,
+            "replication": "Off",
+            "peer-disk-state": "DUnknown",
+            "peer-client": false,
+            "resync-suspended": "no",
+            "received": 0,
+            "sent": 0,
+            "out-of-sync": 131072,
+            "pending": 0,
+            "unacked": 0,
+            "has-sync-details": false,
+            "has-online-verify-details": false,
+            "percent-in-sync": 87.50
+          }
+        ]
+      }
+    ]
+  }
+]

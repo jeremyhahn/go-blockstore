@@ -11,7 +11,22 @@
 // 2. Commercial License
 //    Contact licensing@automatethethings.com for commercial licensing options.
 
-package local
+// Package mount performs the two filesystem operations a storage provider
+// cannot route through an exec'd binary: mounting and unmounting.
+//
+// It is internal and shared rather than per-provider because the reason it
+// exists is the same for every backend that mounts. Validating a path and then
+// handing the STRING to mount(8) — or to mount(2) — leaves a window in which
+// the path can become a symlink, and the mount that follows is privileged: it
+// lands wherever the link points, including over /. Closing that window means
+// resolving the path to a descriptor with symlink resolution refused and then
+// operating on the descriptor, which no amount of argument checking around an
+// exec'd binary reproduces.
+//
+// One copy, because a security-relevant mechanism duplicated per provider is
+// one that drifts per provider. pkg/local and pkg/drbd both consume this, and
+// pkg/cephrbd will make three.
+package mount
 
 import "context"
 
@@ -26,9 +41,9 @@ import "context"
 // refused and then operating on the descriptor, which no amount of argument
 // checking around an exec'd binary can reproduce.
 //
-// It is an interface for the same reason CommandRunner is: so tests can drive
-// every path around it without root or a real filesystem. The real
-// implementation is used unless one is injected.
+// It is an interface for the same reason a command runner is: so tests can
+// drive every path around it without root or a real filesystem. System() is
+// used unless a provider is given one.
 type Mounter interface {
 	// Mount attaches source at target. flags are MS_* bits and data is the
 	// filesystem-specific option string, split by mountArguments.
@@ -37,3 +52,8 @@ type Mounter interface {
 	// Unmount detaches whatever is mounted at target.
 	Unmount(ctx context.Context, target string) error
 }
+
+// System returns the real Mounter: it pins a target to a descriptor and then
+// operates on the descriptor. Off Linux it refuses, because a target cannot be
+// pinned there.
+func System() Mounter { return systemMounter{} }

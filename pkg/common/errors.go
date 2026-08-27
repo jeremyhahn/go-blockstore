@@ -70,6 +70,31 @@ var (
 	// a volume that is not replicated.
 	ErrNotReplicated = errors.New("not replicated")
 
+	// ErrNotPrimary is returned when an operation needs the local node to hold
+	// the primary role for a replicated volume and it does not.
+	//
+	// It is the portable "promote first, then retry" branch. A replicated
+	// backend denies every write to a secondary — DRBD will not even open the
+	// device — so mounting, formatting and snapshotting a secondary all fail
+	// for one reason, and one that a Promote fixes.
+	//
+	// It is deliberately not ErrUnsupported. That sentinel tells a caller the
+	// backend cannot serve the request at all and retrying is pointless; this
+	// one says the request is fine and the volume is simply in the wrong role
+	// at the moment. A controller holding the volume's primary lease acts on
+	// the difference.
+	ErrNotPrimary = errors.New("not primary on this node")
+
+	// ErrHasSnapshots is returned by Delete when snapshots of the volume still
+	// exist.
+	//
+	// Deletion does not cascade. Removing a volume takes its snapshots with it
+	// — they are copy-on-write areas over an origin that is going away — and
+	// destroying a restore point is not something to do as a side effect of
+	// destroying something else. Callers that mean it delete the snapshots
+	// first, which is one more call and an explicit one.
+	ErrHasSnapshots = errors.New("volume has snapshots")
+
 	// ErrProviderNotRegistered is returned when a provider is requested by a
 	// name that has not been registered.
 	ErrProviderNotRegistered = errors.New("provider not registered")

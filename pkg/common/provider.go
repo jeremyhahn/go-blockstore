@@ -107,6 +107,13 @@ type VolumeProvider interface {
 	// its SnapshotID. It returns ErrNotFound if the volume does not exist,
 	// ErrAlreadyExists if the volume already has a snapshot by that name, and
 	// ErrUnsupported on a provider without snapshot support.
+	//
+	// A replicated provider returns ErrNotPrimary when the local node holds the
+	// secondary role. A secondary's backing device receives the replication
+	// stream with no filesystem above it ordering those writes, so a snapshot
+	// of one captures a state no filesystem ever had — and the condition is
+	// fixed by a Promote, which is what ErrNotPrimary says and what
+	// ErrUnsupported would deny.
 	Snapshot(ctx context.Context, volID, name string) (SnapshotID, error)
 
 	// ListSnapshots returns the snapshots taken from the volume, in unspecified
@@ -125,7 +132,14 @@ type VolumeProvider interface {
 	DeleteSnapshot(ctx context.Context, snapID SnapshotID) error
 
 	// Delete permanently removes the volume. It returns ErrNotFound if the
-	// volume does not exist.
+	// volume does not exist, and ErrHasSnapshots if the volume still has
+	// snapshots.
+	//
+	// It does not cascade. A provider whose snapshots cannot outlive their
+	// origin — LVM copy-on-write snapshots, among others — would destroy them
+	// as a side effect of removing the volume, so it refuses instead and the
+	// caller deletes them first. Losing a restore point is a decision worth
+	// making out loud.
 	Delete(ctx context.Context, volID string) error
 
 	// Status reports the current state of the volume. It returns ErrNotFound if

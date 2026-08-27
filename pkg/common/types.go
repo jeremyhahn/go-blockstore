@@ -84,6 +84,32 @@ const (
 
 	// ReplStateUpToDate indicates the volume is connected and fully synchronized.
 	ReplStateUpToDate ReplConnState = "uptodate"
+
+	// ReplStateInconsistent indicates the volume is connected and replicating
+	// normally, but the LOCAL copy is not current — mid-resync, outdated,
+	// failed, or without a backing device at all.
+	//
+	// It is distinct from ReplStateUnknown, and the distinction is the point: a
+	// controller deciding whether to promote must tell "the local copy is known
+	// to be bad" from "the state could not be determined". Both forbid
+	// promotion, but only the first is a fact about the volume.
+	//
+	// It does not say WHY the copy is not current. A provider that can
+	// distinguish an inconsistent disk from an absent one reports the
+	// difference through VolumeStatus.State, which has VolumeStateError for a
+	// device that cannot serve reads at all.
+	ReplStateInconsistent ReplConnState = "inconsistent"
+
+	// ReplStateDown indicates the volume is configured for replication but is
+	// not running it — the resource exists and the provider knows about it, and
+	// nothing is up.
+	//
+	// It sits between the two states it is easily confused with.
+	// ReplStateStandalone means the volume IS up and has stopped talking to its
+	// peer, which is an operator-visible decision; ReplStateUnknown means the
+	// provider could not determine anything. Down is neither: it is a definite
+	// answer, and the answer is that replication is not happening.
+	ReplStateDown ReplConnState = "down"
 )
 
 // EventType classifies a coordinator Watch event.
@@ -114,8 +140,20 @@ type VolumeSpec struct {
 	// StorageClass names the provider-specific class/tier backing the volume.
 	StorageClass string
 
-	// Replicas is the desired number of replicas. A value of 1 (or 0, treated
-	// as 1) requests a non-replicated volume.
+	// Replicas is the desired number of replicas, in three branches:
+	//
+	// Zero means UNSPECIFIED, and the provider uses its natural count — one for
+	// a local volume, two for a replicated pair. It does not mean one. A caller
+	// that leaves the field alone is asking for whatever the provider it chose
+	// is for, not asserting that the volume must not be replicated.
+	//
+	// A negative value is never meaningful and returns ErrInvalidArgument.
+	//
+	// A positive value the provider cannot honor returns ErrUnsupported, not
+	// ErrInvalidArgument: asking a two-node replication backend for a single
+	// copy is a well-formed request that a different backend serves happily, so
+	// the answer is "choose another provider", which is what ErrUnsupported
+	// means and what ErrInvalidArgument would hide.
 	Replicas int
 
 	// FSType is the filesystem to create on the volume (e.g. "ext4", "xfs").
