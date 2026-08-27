@@ -27,8 +27,9 @@ import "context"
 // one as hostile and validate it against an allowlist before it reaches mount,
 // lvcreate, drbdadm or any other system tool. Values must be passed as separate
 // argv elements to an exec'd binary, never interpolated into a shell command
-// line, and a value that fails validation is rejected with an error rather than
-// escaped and passed on.
+// line, and a value that fails validation is rejected rather than escaped and
+// passed on — with ErrInvalidArgument, wrapped with the detail saying which
+// value and why, and before the provider has run anything.
 type VolumeProvider interface {
 	// Provision creates a new volume matching the given spec and returns the
 	// resulting Volume. It returns ErrAlreadyExists if a volume with the same
@@ -45,6 +46,18 @@ type VolumeProvider interface {
 	// Attach makes the volume available as a block device on the given node and
 	// returns the resulting AttachInfo. It returns ErrNotFound if the volume
 	// does not exist.
+	//
+	// A well-formed request naming a node this provider cannot serve returns
+	// ErrUnsupported, wrapped with detail identifying the node and why it is out
+	// of reach. The request is not wrong — a different backend could serve it,
+	// and the caller placing the workload is the one that knows the topology —
+	// so it is reported as a capability this provider lacks rather than as a bad
+	// argument. A single-host backend answers this way for every node but its
+	// own; a replicated one only for nodes outside the set it replicates to.
+	//
+	// A node that is not merely unreachable but meaningless to the backend —
+	// absent from its configuration entirely — is ErrInvalidArgument instead,
+	// because no amount of choosing a different provider makes that name valid.
 	Attach(ctx context.Context, volID string, node NodeID) (AttachInfo, error)
 
 	// Detach removes the volume's block device from the given node. It returns
@@ -67,6 +80,27 @@ type VolumeProvider interface {
 	// volume does not exist. Providers are not required to support shrinking; a
 	// newSize below the current capacity returns ErrUnsupported on a provider
 	// that cannot shrink.
+	//
+	// Resize grows the block device, and it grows the filesystem too when the
+	// volume was provisioned with an FSType the provider knows and that
+	// filesystem can be grown in the state the volume is currently in — ext2,
+	// ext3 and ext4 mounted or not; XFS only while mounted, having no offline
+	// grow. Where the filesystem cannot be grown as things stand, the device is
+	// still grown and the call still succeeds; the provider documents the state
+	// that leaves behind, so an operator knows an unmounted XFS volume needs
+	// growing after its next mount. A raw volume has nothing to grow but itself.
+	//
+	// Growing what sits on top of the device is part of the operation, not a
+	// separate one, so a provider whose device growth succeeded and whose
+	// filesystem growth did not must let a repeat of the same request finish the
+	// job. Treating an already-large-enough device as nothing to do would report
+	// success over a filesystem still at its old size.
+	//
+	// Backends that allocate in fixed units may round newSize up, so the volume
+	// can end up larger than asked for. It is never smaller, and a provider
+	// compares against the rounded figure when deciding whether a request is a
+	// shrink — otherwise repeating a request it has already rounded up looks
+	// like one.
 	Resize(ctx context.Context, volID string, newSize int64) error
 
 	// Snapshot creates a named point-in-time snapshot of the volume and returns

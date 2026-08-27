@@ -61,6 +61,26 @@ linters:
       enabled-tags:
         - diagnostic
         - performance
+      settings:
+        hugeParam:
+          # Raised from gocritic's default of 80 bytes, for one structural
+          # reason: common.VolumeSpec is 88 bytes and VolumeProvider.Provision
+          # takes it BY VALUE. That is the contract every backend implements, so
+          # at the default threshold every provider in this repo — local, and
+          # drbd and cephrbd when they land — reports hugeParam on a signature
+          # none of them is free to change. A gate that fails on the interface
+          # it exists to guard teaches people to reach for nolint.
+          #
+          # The advice is also not worth taking here. hugeParam is a performance
+          # rule, and these functions fork and exec lvcreate, cryptsetup and
+          # mkfs; an 88-byte copy against a process spawn — argon2 in
+          # luksFormat alone runs for seconds — is unmeasurable. Passing the
+          # spec by pointer would buy nothing and hand every provider a nil to
+          # check and a caller's struct it could mutate.
+          #
+          # 128 still catches a genuinely oversized parameter. Raise it again
+          # only for another type the contract forces, and say which here.
+          sizeThreshold: 128
     govet:
       enable:
         - shadow

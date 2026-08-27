@@ -1,0 +1,171 @@
+// Copyright (c) 2025 Jeremy Hahn
+// Copyright (c) 2025 Automate The Things, LLC
+//
+// This file is part of go-blockstore.
+//
+// go-blockstore is dual-licensed:
+//
+// 1. GNU Affero General Public License v3.0 (AGPL-3.0)
+//    See LICENSE file or visit https://www.gnu.org/licenses/agpl-3.0.html
+//
+// 2. Commercial License
+//    Contact licensing@automatethethings.com for commercial licensing options.
+
+// Package local implements the common.VolumeProvider contract over LVM and
+// LUKS2 on a single host. It carries no build tag and is always compiled: it is
+// the fundamental backend, the one that has to exist for a binary built with no
+// tags at all to be able to do anything.
+//
+// # The model
+//
+// A volume is a logical volume in one configured volume group, and its ID is
+// that logical volume's name. There is no sidecar metadata store and no
+// in-memory volume table — everything the provider needs to answer a question
+// it reads back from LVM, blkid and findmnt at the time it is asked. A provider
+// restarted mid-flight therefore sees exactly what its predecessor saw, and two
+// processes pointed at the same volume group do not have to agree on anything
+// beyond the group's name. The cost is that most calls run a few commands
+// instead of consulting a cache, which is not the expensive part of creating a
+// filesystem.
+//
+// The state a volume moves through maps onto LVM and device-mapper directly:
+//
+//	Provision  lvcreate, optional cryptsetup luksFormat, optional mkfs;
+//	           the volume is left deactivated and reports as available
+//	Attach     lvchange -ay, and cryptsetup open when the volume is a LUKS
+//	           container; reports the plaintext device either way
+//	Mount      mount(8) against the attached device
+//	Unmount    umount(8), converging when the volume is not mounted there
+//	Detach     cryptsetup close, lvchange -an
+//	Delete     unmount, lock, lvremove
+//
+// Volumes are created with LVM autoactivation switched off, which is what makes
+// Detach mean anything: autoactivation is on by default and udev reactivates a
+// whole volume group in response to unrelated device events, so a detached
+// volume otherwise reappears within seconds and Status starts reporting it
+// attached again. Activation belongs to this provider, not to boot or udev.
+// That flag needs LVM 2.03.12 (2021) or newer, which is the library's floor.
+//
+// Encryption is discovered rather than remembered. Attach probes the logical
+// volume with blkid and reaches for cryptsetup only on a crypto_LUKS
+// signature, so a provider configured without Options.Encrypted still handles
+// volumes that are encrypted, and a host that has no encrypted volumes never
+// invokes cryptsetup at all.
+//
+// # Keys
+//
+// A passphrase never exists as an ordinary []byte. It arrives through a
+// KeyProvider callback as a go-enclave MemoryEnclave — mlock'd pages, fenced by
+// guard pages, kept out of core dumps and wiped on release — and becomes a
+// []byte only inside the WithBytes borrow that writes it to cryptsetup's
+// standard input, which the provider then destroys. A []byte would have been
+// unfixable: zeroing the slice a caller holds reaches neither the copies the
+// garbage collector may have made nor the pages the kernel may have swapped,
+// and the material would be in any core dump taken meanwhile.
+//
+// If the kernel will not lock pages — RLIMIT_MEMLOCK, almost always — the
+// operation FAILS with an error naming the limit. It does not fall back to
+// unprotected memory, because a silent fallback would leave callers believing in
+// a guarantee that had stopped holding.
+//
+// The provider has no opinion about where a key came from: a TPM-sealed key is
+// unsealed by whoever holds the TPM — go-trusted-platform, in this stack — and
+// handed over already unsealed, in an enclave. Keeping TPM specifics out of this
+// package is what lets the same provider run on hardware that has no TPM, and
+// keeps the library free of dependencies its other backends have no use for.
+//
+// # Concurrency
+//
+// Every state-changing operation holds a per-volume advisory lock for its whole
+// read-decide-act sequence, rollback included. The provider keeps no state of
+// its own — it reads the volume group, decides, and acts across several
+// commands — so without one, two operations interleave inside that gap and act
+// on a world that moved underneath them. Resize reads a volume as detached and
+// starts growing it; Attach completes in between; Resize's closing deactivation
+// then detaches a volume the other caller was just told it could use.
+//
+// The lock is an flock on a file per volume under Options.LockDir. That choice
+// buys two things a mutex could not. Two Provider values in one process open
+// the file separately and so conflict, and two separate DAEMONS over one volume
+// group conflict as well — which is not hypothetical, since nothing here stops
+// an operator running a second one. It is also released by the kernel when the
+// process dies, so a crash mid-operation leaves no volume locked forever.
+//
+// Locks are taken once at the operation boundary and never nested, and a
+// snapshot has no lock of its own: operations touching an origin and its
+// snapshot take the ORIGIN's, since a snapshot is created under its origin,
+// shares its activation and dies with it. The one operation needing two is a
+// restore, which reads one volume's snapshot while creating another; it takes
+// both in sorted order, so two such operations cannot each hold one and wait for
+// the other.
+//
+// Status and ListSnapshots take no lock. They change nothing, and a caller
+// acting on what they return would be racing whatever happened next however the
+// read were synchronized — the lock a transition needs is the one the transition
+// takes.
+//
+// # What a deleted volume leaves behind
+//
+// LVM does not clear an extent when a volume is deleted, and it does not clear
+// one when it allocates it to the next volume either — lvcreate zeroes the first
+// few kilobytes, enough that a stale filesystem signature is not detected, not
+// enough that the last tenant's data is gone. The extents lvextend adds to a
+// growing volume come from the same free pool. Attach hands back the raw logical
+// volume for an unencrypted volume, so a caller reading past its filesystem, or
+// reading a raw volume at all, can find what a deleted volume wrote there.
+//
+// Put plainly: an unencrypted volume on non-discarding media retains readable
+// data after Delete unless Options.WipeOnDelete is set.
+//
+// This is LVM's behavior rather than something this provider introduces, and
+// how much of it bites depends on the storage: a host with
+// devices/issue_discards set to 1 over a backing device that supports discard
+// gets zeroed extents for free, because lvremove discards them. LVM's default
+// is 0, and rotating disks do not discard at all.
+//
+// Options.Encrypted is the recommended answer. What survives in a freed extent
+// is then ciphertext whose key went away with the LUKS header, and it costs
+// nothing at delete time. Options.WipeOnDelete is the direct one for
+// deployments that cannot encrypt, zero-filling a volume before removing it so
+// extents are clean before anything reuses them; it is off by default because
+// zero-filling every deleted volume costs minutes per terabyte on rotating
+// disks, which is not a cost to impose on deployments that do not need it.
+//
+// # Mount targets
+//
+// A mount target is resolved to a DESCRIPTOR before it is used, with openat2
+// refusing to traverse a symlink anywhere along the path, and the mount is then
+// performed against that descriptor. Validating a path and handing the string to
+// a mount leaves a window in which the path can become a symlink, and the mount
+// that follows it is privileged: it lands wherever the link points, including
+// over the root filesystem. No amount of checking around a path can close that,
+// because the check and the use are separate resolutions of the same name.
+//
+// This is why mounting does not go through CommandRunner like everything else.
+// It is the one pair of operations where the target has to be held, so they go
+// through Mounter instead, which mount(2) and umount2(2) reach directly. The
+// unmount pins the target's PARENT and passes UMOUNT_NOFOLLOW, since a
+// descriptor on the target itself holds the mounted filesystem open and the
+// unmount then fails.
+//
+// A kernel without openat2 — before Linux 5.6 — is refused rather than served by
+// the racy path.
+//
+// # Hostile input
+//
+// common.VolumeProvider makes the provider responsible for validating the
+// free-form strings it is handed, and this one does it with allowlists at the
+// API boundary, before any command is built. Volume and snapshot names are
+// letters, digits and non-leading hyphens; filesystem types are looked up in a
+// table that also decides which mkfs binary runs; mount flags are matched whole
+// against a fixed set; mount targets must be clean absolute paths. Everything
+// that passes goes to the CommandRunner as individual argv elements, and
+// nothing anywhere is escaped and passed on — a value that fails validation is
+// rejected with common.ErrInvalidArgument.
+//
+// # Testing
+//
+// Every system command goes through CommandRunner, so the unit tests drive the
+// whole provider against a fake and need no root, no LVM and no block device.
+// Tests that do need real ones live behind the local_integration build tag.
+package local

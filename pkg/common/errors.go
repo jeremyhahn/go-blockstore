@@ -42,6 +42,30 @@ var (
 	// provider.
 	ErrUnsupported = errors.New("operation not supported by provider")
 
+	// ErrInvalidArgument is the portable sentinel for hostile or malformed input
+	// rejected by a provider's own validation — a volume or snapshot name
+	// outside the character set a backend will accept, a filesystem type it will
+	// not create, a mount flag not on its allowlist, a mount target that is not
+	// a clean absolute path, a node that appears nowhere in the backend's
+	// configuration.
+	//
+	// It is the counterpart to ErrUnsupported rather than a variant of it.
+	// ErrUnsupported answers a well-formed request this backend cannot serve;
+	// this one says the request never became well-formed, so no other provider
+	// would take it either and the fix belongs to whoever supplied the value.
+	// The VolumeProvider doc makes validation the provider's job; this is what
+	// providers report it with, so a caller writes one branch instead of one per
+	// backend.
+	//
+	// Providers WRAP it with the detail that identifies the offending value:
+	//
+	//	return fmt.Errorf("%w: volume name %q contains %q", common.ErrInvalidArgument, name, string(c))
+	//
+	// Returning the bare sentinel passes the caller a rejection with nothing to
+	// act on — which value, and why — and validation errors are read by whoever
+	// has to correct the input.
+	ErrInvalidArgument = errors.New("invalid argument")
+
 	// ErrNotReplicated is returned when a replication operation is requested for
 	// a volume that is not replicated.
 	ErrNotReplicated = errors.New("not replicated")

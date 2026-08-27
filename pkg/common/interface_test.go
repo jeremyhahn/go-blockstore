@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,6 +139,7 @@ func TestSentinelErrorsAreDistinct(t *testing.T) {
 		"ErrSnapshotNotFound":      common.ErrSnapshotNotFound,
 		"ErrNotAttached":           common.ErrNotAttached,
 		"ErrUnsupported":           common.ErrUnsupported,
+		"ErrInvalidArgument":       common.ErrInvalidArgument,
 		"ErrNotReplicated":         common.ErrNotReplicated,
 		"ErrProviderNotRegistered": common.ErrProviderNotRegistered,
 		"ErrLeaseHeld":             common.ErrLeaseHeld,
@@ -159,6 +161,38 @@ func TestSentinelErrorsAreDistinct(t *testing.T) {
 				t.Errorf("errors.Is(%s, %s) = true, want false: sentinels must be distinct", name, otherName)
 			}
 		}
+	}
+}
+
+// TestInvalidArgumentIsNotUnsupported pins the distinction those two sentinels
+// carry, which decides what a caller does next. ErrUnsupported means the request
+// was fine and this backend cannot serve it, so another provider might;
+// ErrInvalidArgument means the request never became well-formed, so no provider
+// will take it and the value itself has to change.
+func TestInvalidArgumentIsNotUnsupported(t *testing.T) {
+	err := fmt.Errorf("volume name %q contains %q: %w", "a;b", ";", common.ErrInvalidArgument)
+
+	if !errors.Is(err, common.ErrInvalidArgument) {
+		t.Error("errors.Is(err, ErrInvalidArgument) = false, want true")
+	}
+	if errors.Is(err, common.ErrUnsupported) {
+		t.Error("errors.Is(err, ErrUnsupported) = true, want false: a malformed request is not an unsupported one")
+	}
+}
+
+// TestInvalidArgumentSurvivesWrapping is the property the wrap-with-detail rule
+// depends on: the sentinel has to stay matchable through the context a provider
+// adds, or providers would have to choose between a portable branch and a usable
+// message.
+func TestInvalidArgumentSurvivesWrapping(t *testing.T) {
+	err := fmt.Errorf("%w: mount flag %q is not permitted", common.ErrInvalidArgument, "noatime,exec")
+	wrapped := fmt.Errorf("mounting volume %q: %w", "data", err)
+
+	if !errors.Is(wrapped, common.ErrInvalidArgument) {
+		t.Error("errors.Is(wrapped, ErrInvalidArgument) = false, want true")
+	}
+	if !strings.Contains(wrapped.Error(), "noatime,exec") {
+		t.Errorf("wrapped error = %q, want it to name the offending value", wrapped)
 	}
 }
 

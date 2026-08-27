@@ -37,7 +37,8 @@
 // sees "drbd" from ListProviders. Tagging the local provider would invert that
 // and make the default build provider-less.
 //
-// Until those files land this package is the registry alone. Nothing registers
-// itself yet, so ListProviders returns an empty slice and NewProvider returns
-// common.ErrProviderNotRegistered for every name, "local" included.
+// factory_local.go has landed: importing this package registers "local", backed
+// by github.com/jeremyhahn/go-blockstore/pkg/local, in every build. The tagged
+// backends are still to come (issues #3 and #4), so NewProvider returns
+// common.ErrProviderNotRegistered for "drbd" and "cephrbd".
 package factory
