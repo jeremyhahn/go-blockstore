@@ -61,6 +61,11 @@ const (
 // It is not a tuning knob, which is why it is not in Config. It is small enough
 // that a renewal which could still save the lease gets many attempts inside
 // that window, and large enough that "many" is not "as many as possible".
+//
+// It floors, it does not extend: a wait is still capped at the lease actually
+// remaining, so the floor can never push an attempt past a deadline that was
+// still live. Stopping a spin is worth twenty milliseconds of CPU; it is not
+// worth forfeiting leadership.
 const minRenewDelay = 20 * time.Millisecond
 
 // Clock is the controller's view of time. It exists so the renewal cadence and

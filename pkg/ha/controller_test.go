@@ -787,7 +787,9 @@ func TestRenewDelay(t *testing.T) {
 		{"exactly twice the interval still waits the interval", 2 * interval, interval},
 		{"less than twice the interval waits half of what is left", 4 * time.Second, 2 * time.Second},
 		{"a nearly spent lease waits a nearly spent half", time.Second, 500 * time.Millisecond},
-		{"a nearly spent half is floored", 10 * time.Millisecond, minRenewDelay},
+		{"a half above the floor is taken", 50 * time.Millisecond, 25 * time.Millisecond},
+		{"a half below the floor takes the floor", 30 * time.Millisecond, minRenewDelay},
+		{"but the floor never outruns the lease itself", 10 * time.Millisecond, 10 * time.Millisecond},
 		{"a deadline already reached takes the floor, not zero", 0, minRenewDelay},
 		{"and so does one already passed", -time.Minute, minRenewDelay},
 	}

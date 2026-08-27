@@ -698,10 +698,15 @@ func (c *Controller) renewDelay(deadline time.Time) time.Duration {
 	if remaining <= 0 {
 		return minRenewDelay
 	}
-	if half := remaining / 2; half < c.cfg.RenewInterval {
-		return max(half, minRenewDelay)
-	}
-	return c.cfg.RenewInterval
+	delay := min(c.cfg.RenewInterval, remaining/2)
+	delay = max(delay, minRenewDelay)
+	// Never sleep PAST a deadline that is still live. The floor exists to stop
+	// a spin once the deadline has gone by; applied to a lease that has less
+	// than it left, it would forfeit leadership by skipping the last renewal
+	// that could still have saved it — trading an availability loss for a CPU
+	// saving of twenty milliseconds. At most one wait can be shorter than the
+	// floor, because the next one starts past the deadline and takes it.
+	return min(delay, remaining)
 }
 
 // authorityEnded reports whether this reconcile may still act or speak.

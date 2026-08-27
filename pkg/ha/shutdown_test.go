@@ -711,6 +711,13 @@ func TestALeaseEndingDuringTheShutdownDemoteIsFenced(t *testing.T) {
 	if n := countOp(r.coord.recorded(), "Release"); n != 0 {
 		t.Fatalf("Release was attempted %d times on a lease that had already ended", n)
 	}
+	// The demote here SUCCEEDED, so the role was yielded and the hazard
+	// sentinel must be absent. A sentinel that appeared on every fence would
+	// tell a consumer nothing, and the thing it is meant to single out is the
+	// node that may still be writable.
+	if errors.Is(got.Err, ErrRoleNotYielded) {
+		t.Fatalf("final Err = %v claims the role was not yielded, but the demote succeeded", got.Err)
+	}
 }
 
 // ActionTimeout bounds the whole shutdown, renewals included. A demote that
@@ -829,6 +836,15 @@ func TestALeaseEndingAndAFailedDemoteBothSurvive(t *testing.T) {
 	}
 	if !errors.Is(got.Err, stillOpen) {
 		t.Fatalf("final Err = %v, want it to carry the failed demote too", got.Err)
+	}
+	// The hazard sentinel, which is the whole point of this combination: the
+	// lease is gone AND the role was not given back, so this node may still be
+	// writable with nothing authorizing it. Consumers branch on this to find
+	// exactly that condition, and ErrFenced alone does not say it — a fence
+	// whose demote succeeded carries ErrFenced too.
+	if !errors.Is(got.Err, ErrRoleNotYielded) {
+		t.Fatalf("final Err = %v, want ErrRoleNotYielded: the lease is gone and the role was never yielded, "+
+			"which is precisely the condition the sentinel exists to mark", got.Err)
 	}
 }
 
