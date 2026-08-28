@@ -1,0 +1,512 @@
+# Release — tag-driven, per conventions/release-versioning.md §5.
+#
+# go-blockstore is a LIBRARY: no cmd/, no binaries, no container images. So the
+# fleet release pipeline collapses to the two jobs that are actually about the
+# release itself — validate the tag, then publish it. There is nothing to
+# cross-compile, nothing to checksum and nothing to announce, and jobs that
+# exist only to do nothing are the shape a real gap hides in.
+#
+# The tag is what a consumer pins. `make release-alpha` is what creates it
+# (Makefile, release-alpha-template v2.2); this workflow is what runs once the
+# tag lands. Both read the same VERSION and CHANGELOG.md, from opposite sides:
+# the target refuses to CUT a tag those files do not support, and this workflow
+# refuses to PUBLISH one they do not match.
+#
+# Action pinning follows this repo's merged CI and nightly workflows: GitHub's
+# own `actions/*` ride their major tag, genuinely third-party actions are
+# pinned by commit SHA with the version in a trailing comment (nightly.yml does
+# exactly this for aquasecurity/trivy-action).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+  # RECOVERY PATH, carried over from go-xkms#44. A tag push is the normal
+  # trigger, but a published tag CANNOT be moved to re-fire it: the module
+  # proxy caches a tag and deleting it does not unpublish it. When the pipeline
+  # itself is what broke, the tag is already out there and the only way back is
+  # to dispatch a FIXED workflow AT the stranded tag — which is why the tag
+  # arrives as an input rather than as the ref. Dispatching at the old tag runs
+  # the old (broken) workflow definition, so that does not work.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build a release for, e.g. v0.3.2-alpha. The tag is read, never written.'
+        required: true
+        type: string
+
+env:
+  # The tag this run releases. On a tag push github.ref_name IS the tag; on a
+  # dispatch it is the branch we were dispatched from, so the input wins. Every
+  # checkout and every version derivation below reads THIS, so the two trigger
+  # paths cannot disagree about which tag is being released.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+permissions:
+  contents: write
+
+jobs:
+  # Fails a tag whose VERSION file or CHANGELOG heading does not match it
+  # (release-versioning.md P4 Option A). A module tag cannot be retracted, so
+  # this runs before anything is created — and it is cheap, so it runs first.
+  #
+  # The drift this catches is measured, not hypothetical: release-versioning.md
+  # §2 records go-xkms sitting at VERSION 0.2.3-alpha against a newest tag of
+  # v0.2.2-alpha, and §5 records go-objstore's v0.2.1-alpha shipping with no
+  # CHANGELOG entry at all. Nothing else in the repo reconciles the three.
+  #
+  # No `setup-go` step here on purpose: nothing in this job shells out to go.
+  # The repo is a single module with no nested sdk/go, so the reciprocal
+  # cross-module pin check the multi-module repos carry has nothing to check.
+  # Add setup-go WITH any step that invokes go — that omission is precisely the
+  # go-xkms#44 defect, and it is invisible on a developer machine that has go
+  # on PATH.
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      # The commit this job actually validated. create-release pins to it, so a
+      # tag moved between the two jobs cannot slip an unvalidated tree through.
+      commit: ${{ steps.verified.outputs.commit }}
+    steps:
+      # BEFORE the checkout, because the checkout consumes RELEASE_TAG and on a
+      # workflow_dispatch that string is an INPUT, not a ref the push event
+      # already proved exists.
+      #
+      # The v-prefix is a requirement, not decoration: everything downstream
+      # derives the unprefixed version with `${RELEASE_TAG#v}`, which is a
+      # no-op on a value that never had the prefix. Dispatching `0.4.0-alpha`
+      # would therefore sail through the VERSION-file comparison — the file
+      # holds exactly that unprefixed string — while naming a tag that does not
+      # follow the convention.
+      - name: Validate the release tag string
+        run: |
+          set -euo pipefail
+          case "${RELEASE_TAG}" in
+            v*) : ;;
+            *)  echo "FAIL: release tag '${RELEASE_TAG}' is not v-prefixed"; exit 1 ;;
+          esac
+          # WHOLE-STRING character gate, before the grep below.
+          #
+          # `grep` anchors ^ and $ to a LINE, not to the string, so a value
+          # carrying a newline passes the SemVer check as long as ANY ONE of
+          # its lines matches — `v1.2.3\n../../anything` would clear it. A
+          # `case` glob matches the entire value and has no such seam, so the
+          # character set is enforced here and the grammar below only ever sees
+          # a single line. (Measured: the assembled regex accepts a two-line
+          # value whose first line is `1.2.3`.)
+          #
+          # `+` is admitted here ONLY so that a tag carrying build metadata
+          # reaches the SemVer check and gets its specific diagnostic instead of
+          # a blunt character error; the grammar below still refuses it.
+          case "${RELEASE_TAG}" in
+            *[!0-9A-Za-z.+-]*)
+              echo "FAIL: release tag '${RELEASE_TAG}' contains a character that is not [0-9A-Za-z.+-]"
+              exit 1 ;;
+          esac
+
+          VERSION="${RELEASE_TAG#v}"
+
+          # The SemVer 2.0.0 grammar, assembled from its own productions rather
+          # than approximated. The approximation this replaces was
+          # `[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?`, which accepted three
+          # classes of malformed tag — `1.2.3-alpha..1` and `1.2.3-alpha.`
+          # (empty identifiers, since `.` was just another allowed character)
+          # and `1.2.3-01` (a numeric identifier with a leading zero, spec
+          # rule 9). `make release-alpha` is stricter and would refuse all
+          # three, but this workflow is also reachable by a hand-pushed tag and
+          # by dispatch, so the loose check was the real gate.
+          #
+          # num   — numeric identifier: no leading zeros (rule 9). Also applied
+          #         to major/minor/patch, which are numeric identifiers too, so
+          #         `01.2.3` is refused for the same reason.
+          # alnum — alphanumeric identifier: [0-9A-Za-z-] with at least one
+          #         character that is not a digit, which is what distinguishes
+          #         it from num and makes `alpha`, `rc-1` and `x1` legal.
+          num='(0|[1-9][0-9]*)'
+          alnum='[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*'
+          ident="(${num}|${alnum})"
+          semver="^${num}\.${num}\.${num}(-${ident}(\.${ident})*)?$"
+
+          if ! echo "$VERSION" | grep -qE "$semver"; then
+            echo "FAIL: tag ${RELEASE_TAG} is not a valid SemVer 2.0.0 version"
+            echo "      (empty identifiers, leading-zero numeric identifiers and"
+            echo "       build metadata are all refused — see the workflow comment)"
+            exit 1
+          fi
+
+          # SECOND GATE: well-formed is not the same as releasable here.
+          #
+          # The check above answers "is this SemVer". This one answers "is this
+          # a release form this project can actually ORDER", and it exists
+          # because the two had drifted apart: the validator accepted any
+          # SemVer prerelease while the previous-tag walk sorts with git, and
+          # git's version sort is NOT SemVer for prerelease identifiers.
+          # Measured — `v2.0.0-alpha2` vs `v2.0.0-alpha10`: git splits the
+          # digit run and orders alpha2 first; SemVer 11.4.2 compares a
+          # single alphanumeric identifier LEXICALLY, which puts alpha10 first.
+          # A validator that admits more than the sorter can order yields a
+          # wrong PREV_TAG, which silently truncates the release notes and
+          # points the compare link at the wrong range.
+          #
+          # release-versioning.md decides which side moves. §1 fixes the format
+          # at `MAJOR.MINOR.PATCH[-alpha]`, names alpha/beta/rc as the three
+          # forms the release workflows treat as pre-releases, records that
+          # numbered pre-releases like `-alpha.1` exist in exactly one VERSION
+          # file and "have never been tagged", and anticipates the suffix being
+          # DROPPED at a first stable release. So the sanctioned TAG vocabulary
+          # is bare, and over exactly that set git's ordering IS SemVer —
+          # measured: alpha, beta, rc, then the stable release, which is
+          # 11.4.2 (lexical) and 11.3 (prerelease precedes release).
+          #
+          # Narrowing here rather than writing a SemVer comparator is therefore
+          # the convention-correct fix, not the cheap one: a comparator would
+          # buy ordering for forms the convention says are not tagged. If §1
+          # ever sanctions numbered pre-releases, this gate is what widens, and
+          # the walk below needs a real §11 comparator FIRST.
+          sanctioned="^${num}\.${num}\.${num}(-(alpha|beta|rc))?$"
+          if ! echo "$VERSION" | grep -qE "$sanctioned"; then
+            echo "FAIL: ${RELEASE_TAG} is well-formed SemVer but is not a release form this project supports."
+            echo "      Supported: X.Y.Z, X.Y.Z-alpha, X.Y.Z-beta, X.Y.Z-rc (release-versioning.md §1)."
+            echo "      Numbered or dotted pre-release identifiers are refused: git's tag ordering"
+            echo "      disagrees with SemVer on them, so the previous-tag walk would pick wrongly."
+            exit 1
+          fi
+
+          # BUILD METADATA (`+build`) IS REFUSED OUTRIGHT, deliberately — note
+          # there is no `\+...` branch above.
+          #
+          # release-versioning.md declares the format as `MAJOR.MINOR.PATCH
+          # [-alpha]` and mentions build metadata nowhere; no tag in the
+          # portfolio carries it. Two mechanical reasons back the convention:
+          #
+          #  - §2 makes the VERSION file the tag minus the `v`, and validate
+          #    compares them literally, so `+build` would have to be committed
+          #    into VERSION verbatim.
+          #  - SemVer §10 says build metadata is IGNORED for precedence, so
+          #    `v1.2.3`, `v1.2.3+build.a` and `v1.2.3+build.b` are one version
+          #    in three refs (measured — git lists all three and no ordering
+          #    separates them). "The greatest tag strictly below this one",
+          #    which the release notes depend on, then has no defined answer.
+          #
+          # If the convention ever adopts build metadata, this is the place to
+          # add it AND the previous-tag walk needs a tie-break rule first.
+          echo "OK: ${RELEASE_TAG} is a well-formed v-prefixed SemVer 2.0.0 version"
+
+      # FULLY QUALIFIED refs/tags/ — never the bare name. `ref: v0.4.0-alpha`
+      # is ambiguous and git resolves a BRANCH of that name first, so anyone
+      # able to push a branch could hand this workflow a tree of their choosing
+      # while `refs/tags/v0.4.0-alpha` does not exist at all. The release action
+      # downstream would then CREATE the missing tag through the API, which is
+      # the exact opposite of this path's read-only contract ("the tag is read,
+      # never written"). refs/tags/ cannot be satisfied by a branch, and a
+      # missing tag fails the checkout outright.
+      #
+      # fetch-depth: 0 so the explicit resolution below has the tag objects.
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      # Belt to the checkout's suspenders, and the step that states the
+      # invariant in the repo rather than trusting an action's ref handling:
+      # the tag must exist AS A TAG, and the tree under test must be ITS commit.
+      #
+      # Exit codes are read, not inverted — the round-1 lesson. `rev-parse -q
+      # --verify` answers 0 (resolved) or 1 (no such ref); anything else is a
+      # question that was never answered and must not read as success.
+      #
+      # `^{commit}` PEELS the tag. Every tag this repo cuts is annotated, so
+      # `refs/tags/v0.3.1-alpha` names a tag OBJECT whose own sha differs from
+      # the commit it points at (measured: 6c0c4aa vs 05b9948). Comparing the
+      # unpeeled sha against HEAD would fail on every legitimate release.
+      - name: Verify the ref is a real tag at the checked-out commit
+        id: verified
+        run: |
+          set -euo pipefail
+          rc=0
+          git rev-parse -q --verify "refs/tags/${RELEASE_TAG}^{commit}" >/dev/null 2>&1 || rc=$?
+          case "$rc" in
+            0) : ;;
+            1) echo "FAIL: refs/tags/${RELEASE_TAG} does not exist. A branch or commit of that name is not a release tag"; exit 1 ;;
+            *) echo "FAIL: could not resolve refs/tags/${RELEASE_TAG} (rev-parse exit ${rc}). Refusing to continue: an unanswered question is not a yes"; exit 1 ;;
+          esac
+          TAG_COMMIT="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+            echo "FAIL: refs/tags/${RELEASE_TAG} points at ${TAG_COMMIT} but the checkout is at ${HEAD_COMMIT}"
+            exit 1
+          fi
+          # Published so create-release can pin to the commit that was actually
+          # validated, rather than re-resolving the tag and trusting whatever it
+          # points at by then. See the check in that job.
+          echo "commit=${TAG_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "OK: refs/tags/${RELEASE_TAG} is a tag at ${TAG_COMMIT}, which is the checked-out tree"
+
+      - name: Validate tag against VERSION and CHANGELOG
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          # VERSION is unprefixed and the tag is v-prefixed. That is the
+          # convention (release-versioning.md §2), which is exactly why the two
+          # can drift without anything noticing.
+          # EXACT BYTE COMPARISON, not a normalised one.
+          #
+          # This previously read `tr -d '[:space:]' < VERSION`, which deletes
+          # EVERY whitespace byte rather than the trailing newline it meant to
+          # drop. `0.3. 1-alpha`, `0.3.1- alpha`, a leading space, or a value
+          # split across two lines all collapse to `0.3.1-alpha` and PASS — so
+          # the one check that exists to keep VERSION and the tag in lockstep
+          # would certify a file that does not contain the version. Normalising
+          # the input to a check is answering a different question than the one
+          # asked, the same shape as the CHANGELOG regex-vs-literal defect.
+          #
+          # `cmp` against the exact bytes the release path writes is the whole
+          # check: the Makefile emits `printf '%s\n' "$VERSION" > VERSION`, so
+          # this is that statement inverted. Anything else — embedded space,
+          # surrounding space, a second line, a missing trailing newline, CRLF
+          # from an editor — is a mismatch, which is what it should be, because
+          # every one of those means the committed file is not the version.
+          if ! printf '%s\n' "$VERSION" | cmp -s - VERSION; then
+            echo "FAIL: the VERSION file is not exactly '${VERSION}' plus one newline."
+            echo "      The tag is ${RELEASE_TAG}, so VERSION must contain '${VERSION}'."
+            echo "      Actual bytes:"
+            od -c VERSION | head -5
+            exit 1
+          fi
+          # LITERAL match, and deliberately the SAME predicate the extraction
+          # step below uses — `index($0, ver) == 1`, not a regex. A regex here
+          # would accept headings the extractor then cannot find: the dots in
+          # `0.3.2-alpha` are wildcards, so `## [0x3x2-alpha]` satisfies
+          # `^## \[0.3.2-alpha\]` and fails the literal lookup afterwards. That
+          # gap is only reachable once the tag is already published and
+          # unretractable, which is the one place it must not be reachable.
+          # If this predicate changes, change it in both places together.
+          if ! awk -v ver="## [${VERSION}]" \
+                 'index($0, ver) == 1 { f = 1 } END { exit f ? 0 : 1 }' CHANGELOG.md; then
+            echo "FAIL: CHANGELOG.md has no '## [${VERSION}]' section heading"
+            exit 1
+          fi
+          echo "OK: tag ${RELEASE_TAG} matches VERSION and CHANGELOG"
+
+  create-release:
+    name: Create Release
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # fetch-depth: 0 — the notes below need the tag namespace and the history
+      # between two tags. A shallow clone has neither.
+      # FULLY QUALIFIED, for the same reason as in validate — a `needs:` edge
+      # orders the jobs but does not make this job inherit the other's ref
+      # resolution. This checkout is its own attack surface and carries its own
+      # guard.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - name: Resolve version and previous tag
+        id: version
+        env:
+          VALIDATED_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VALIDATED_COMMIT:-}" ]; then
+            echo "FAIL: the validate job published no commit. Refusing to publish an unpinned release;"
+            echo "      an absent guard value is not a passing guard."
+            exit 1
+          fi
+          VERSION="${RELEASE_TAG#v}"
+
+          # Re-verified here, immediately before the only step that publishes.
+          # validate proved this on ITS checkout; this is the one whose tree
+          # becomes the release.
+          rc=0
+          git rev-parse -q --verify "refs/tags/${RELEASE_TAG}^{commit}" >/dev/null 2>&1 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "FAIL: refs/tags/${RELEASE_TAG} does not resolve to a commit (rev-parse exit ${rc})"
+            exit 1
+          fi
+          TAG_COMMIT="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+            echo "FAIL: refs/tags/${RELEASE_TAG} points at ${TAG_COMMIT} but the checkout is at ${HEAD_COMMIT}"
+            exit 1
+          fi
+
+          # TIME-OF-CHECK / TIME-OF-USE. Everything above proves the tag is
+          # self-consistent RIGHT NOW; it does not prove it is the same tag
+          # `validate` approved. The two jobs check out independently, and a tag
+          # is only immutable by convention (release-versioning.md §3) — nothing
+          # mechanically stops a force-update in the window between them. Absent
+          # this comparison the pipeline would happily publish a tree that never
+          # passed the VERSION or CHANGELOG gate, having reported both as green.
+          #
+          # Pinning to validate's output closes the window. Note it FAILS rather
+          # than quietly releasing the validated commit instead: a tag that moved
+          # mid-release violates §3, and the right response to an immutability
+          # breach is to stop and let a human look, not to paper over which of
+          # the two commits was meant.
+          if [ "$TAG_COMMIT" != "$VALIDATED_COMMIT" ]; then
+            echo "FAIL: refs/tags/${RELEASE_TAG} now points at ${TAG_COMMIT}, but the validate job approved ${VALIDATED_COMMIT}."
+            echo "      The tag moved mid-release. Published tags are immutable (release-versioning.md §3);"
+            echo "      refusing to publish a tree that did not pass validation."
+            exit 1
+          fi
+
+          # STRUCTURAL prerelease classification: is there a hyphen after the
+          # patch component of the already-shape-validated version?
+          #
+          # NOT a substring test for alpha/beta/rc. release-versioning.md §1
+          # records `-alpha` as the only vocabulary in use today, but the tag
+          # validator accepts any SemVer prerelease and §1 also anticipates the
+          # prerelease suffix being DROPPED at a stable release. A substring
+          # test therefore fails in the dangerous direction on both ends:
+          # `v0.4.0-preview` is a prerelease that contains none of the three
+          # magic words, so it would publish as STABLE and become `latest` for
+          # every consumer. Deriving from the grammar cannot miss a suffix
+          # nobody thought to enumerate.
+          PRERELEASE_ID="$(printf '%s' "$VERSION" \
+            | sed -n 's/^[0-9]\{1,\}\.[0-9]\{1,\}\.[0-9]\{1,\}-\(.*\)$/\1/p')"
+          if [ -n "$PRERELEASE_ID" ]; then
+            IS_PRERELEASE=true
+          else
+            IS_PRERELEASE=false
+          fi
+          echo "Prerelease: ${IS_PRERELEASE} (identifier: ${PRERELEASE_ID:-none})"
+
+          # The greatest tag STRICTLY BELOW this one, in version order.
+          #
+          # Version order rather than commit date because `git describe` walks
+          # the graph and answers a different question. "Strictly below" rather
+          # than "the highest other tag" because of the recovery path: a
+          # dispatch at a stranded older tag, or a patch cut on an earlier
+          # line, is not the newest tag in the repo — and taking the newest
+          # remaining one there yields a LATER tag, which makes
+          # `git log PREV..RELEASE` empty and points the compare link
+          # backwards. Ascending sort, stop at the release tag, take the last
+          # line before it.
+          # `-c versionsort.suffix=-` is load-bearing, not tidiness. Git's bare
+          # v:refname sort is NOT SemVer order: it places `v0.4.0` BEFORE
+          # `v0.4.0-alpha`, because a shorter string sorts first once the
+          # numeric fields tie. SemVer says the opposite — a prerelease
+          # precedes its own release. Cutting the stable `v0.4.0` after
+          # `v0.4.0-alpha` would then stop the walk below at the wrong line and
+          # select the tag BEFORE the prerelease, silently dropping every
+          # commit between them from the notes and the compare link.
+          #
+          # Setting the suffix to a bare `-` marks anything after a hyphen as a
+          # prerelease generically, which is the same refusal-to-enumerate that
+          # the prerelease classification above makes: no list of
+          # alpha/beta/rc to fall out of date. Measured against a scratch repo
+          # (2026-08-27): with this setting the order is
+          # v0.4.0-alpha, v0.4.0-beta, v0.4.0 — SemVer; without it, v0.4.0
+          # comes first.
+          # The walk is RESTRICTED to the sanctioned tag forms, which is the
+          # other half of the validator/sorter mismatch. Narrowing what this
+          # workflow will RELEASE does not narrow what it will READ: a tag in
+          # some other shape, pushed by hand or predating the gate, is still in
+          # the namespace, and one `v2.0.0-alpha2` alongside a `v2.0.0-alpha10`
+          # would misorder the walk for a release that is itself perfectly
+          # sanctioned. Filtering to the set git can provably order confines
+          # the sort to its correct domain instead of hoping the namespace
+          # stays clean. grep preserves the order the sort produced.
+          # Re-declared: each `run:` block is its own shell, so the numeric
+          # identifier from the validate job is not in scope here. Keep the two
+          # spellings identical — they describe one vocabulary.
+          num='(0|[1-9][0-9]*)'
+          sanctioned_tag="^v${num}\.${num}\.${num}(-(alpha|beta|rc))?$"
+          PREV_TAG="$(git -c versionsort.suffix=- tag --list 'v*' --sort=v:refname \
+                      | grep -E "$sanctioned_tag" \
+                      | awk -v cur="${RELEASE_TAG}" '$0 == cur { exit } { print }' \
+                      | tail -n1 || true)"
+          {
+            echo "version=${VERSION}"
+            echo "prev_tag=${PREV_TAG}"
+            echo "prerelease=${IS_PRERELEASE}"
+            # The released commit. NOT github.sha: on a recovery dispatch that
+            # is the HEAD of the branch we were dispatched from, not the tag's
+            # commit. Verified above to be the tag's own peeled commit.
+            echo "commit=${TAG_COMMIT}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing ${RELEASE_TAG} (previous: ${PREV_TAG:-none}) at $(git rev-parse HEAD)"
+
+      # The release body is the COMMITTED CHANGELOG section, not a git log dump.
+      #
+      # The fleet template generates notes from `git log` and overwrites
+      # CHANGELOG.md in the runner workspace with the result, so the committed
+      # file is never read — which release-versioning.md §5 names as the thing
+      # that lets the changelog rot ("the kind of drift the generated-notes
+      # workflow encourages, since it never reads the committed file"). The
+      # validate job above already guarantees the section exists, so reading it
+      # costs nothing and makes the human-written entry the published one.
+      #
+      # The commit list is kept, appended underneath, because it is the part a
+      # changelog genuinely cannot replace.
+      - name: Build release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PREV_TAG: ${{ steps.version.outputs.prev_tag }}
+        run: |
+          set -euo pipefail
+          # Everything between this version's heading and the next `## ` one.
+          awk -v ver="## [${VERSION}]" '
+            index($0, ver) == 1 { inside = 1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "FAIL: extracted an empty section for ${VERSION} from CHANGELOG.md"
+            exit 1
+          fi
+
+          {
+            echo
+            echo '## Install'
+            echo
+            echo '```'
+            echo "go get github.com/jeremyhahn/go-blockstore@v${VERSION}"
+            echo '```'
+            echo
+            echo '## Commits'
+            echo
+          } >> release-notes.md
+
+          if [ -n "${PREV_TAG}" ]; then
+            git log "${PREV_TAG}..${RELEASE_TAG}" --no-merges --pretty=format:'* %s (%h)' >> release-notes.md
+            printf '\n\n**Full changelog**: %s/%s/compare/%s...%s\n' \
+              "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${PREV_TAG}" "${RELEASE_TAG}" >> release-notes.md
+          else
+            git log --no-merges --pretty=format:'* %s (%h)' >> release-notes.md
+            printf '\n' >> release-notes.md
+          fi
+
+          cat release-notes.md
+
+      - name: Create release
+        # THIRD-PARTY — pinned by commit SHA, per the rule nightly.yml applies
+        # to aquasecurity/trivy-action. A mutable `@v2` is a standing write to
+        # this repo's releases held by whoever can move that tag.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          body_path: release-notes.md
+          draft: false
+          # Derived STRUCTURALLY in the step above, not by substring. A
+          # `contains(version, 'alpha')` test publishes `v0.4.0-preview` as a
+          # stable release — and stable means `latest` for every consumer.
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          # Defense in depth. This API creates the tag when it is absent, and
+          # with no target_commitish it creates it on the DEFAULT BRANCH head —
+          # publishing a commit nobody reviewed as the release. The guards above
+          # mean an absent tag never reaches this step; naming the verified
+          # commit means that even if one did, the object published is the one
+          # that was validated rather than whatever main happens to point at.
+          target_commitish: ${{ steps.version.outputs.commit }}
+          generate_release_notes: false

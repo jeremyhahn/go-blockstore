@@ -47,6 +47,30 @@ GOCLEAN := $(GO) clean
 PROJECT_NAME := go-blockstore
 MODULE := github.com/jeremyhahn/go-blockstore
 
+# Release identity, for `release-alpha` below. All three exist because the
+# alternatives are wrong in ways that do not announce themselves:
+#
+# REPO_NAME is the LITERAL repo name and must never become $(notdir $(CURDIR)),
+# which derives the SIGNING IDENTITY from the checkout directory — a worktree,
+# CI workspace or clone named anything else then signs and attributes the
+# release as the wrong agent (measured in go-enclave, 2026-08-26: a directory
+# named `mk` signed as agent-mk). This repo is developed in worktrees named
+# `go-blockstore-<issue>`, so that failure mode is not theoretical here.
+#
+# RELEASE_REMOTE is a DEVIATION from release-alpha-template v2.2, which
+# hardcodes `dev`. No repository on this workstation has a remote by that name:
+# go-blockstore, go-objstore, go-qrdb, go-quicbaas and go-xkms all reach Gitea
+# through `origin` (checked 2026-08-27). The template's own duplicate-tag check
+# is `! git ls-remote --exit-code --tags dev ...`, which SUCCEEDS when the
+# remote does not exist — so with the hardcoded name the guard silently
+# evaporates and the push fails afterward, having already committed VERSION.
+# The remote is therefore named once, defaulted to what is actually configured,
+# and its existence is asserted before it is trusted. Override for a checkout
+# that does follow version-control.md's naming: RELEASE_REMOTE=dev.
+AGENT_GIT ?= /home/jhahn/sources/automatethethings/software/scripts/agent-git.sh
+REPO_NAME ?= go-blockstore
+RELEASE_REMOTE ?= origin
+
 COVERAGE_DIR := coverage
 COVERAGE_PROFILE := $(COVERAGE_DIR)/unit.out
 
@@ -463,6 +487,178 @@ ci-fast:
 	@echo "$(CYAN)$(BOLD)[4/4] Test + coverage$(RESET)"
 	@$(MAKE) --no-print-directory coverage
 
+# ==============================================================================
+# Release
+# ==============================================================================
+
+# release-alpha-template: v2.2, copied from
+# software/templates/make/release-alpha.mk in the automatethethings repo. That
+# file carries the full rationale; the short form is that it replaces a v1
+# recipe which auto-incremented PATCH only (an API addition shipped labelled a
+# bugfix), created LIGHTWEIGHT UNSIGNED tags under the owner's identity, pushed
+# every local tag, and `|| true`-swallowed a failed VERSION commit so a tag
+# could disagree with its own VERSION file. None of that failed loudly.
+#
+# The v2 contract, unchanged here:
+#   - The version is EXPLICIT. No auto-increment: whoever cuts the release
+#     decides patch-vs-minor-vs-major per release-versioning.md and says so.
+#     Pre-1.0 that decision matters more than usual, because MINOR is where
+#     breakage lives — an auto-incremented PATCH cannot express it.
+#   - Every git write goes through agent-git.sh (identity + SSH signing as
+#     agent-go-blockstore); the tag is ANNOTATED and signed.
+#   - Pushes ONLY the release commit and the named tag. Never --tags.
+#     ATOMICALLY: `--atomic` is load-bearing and is NOT a synonym for listing
+#     both refs on one command line. Without it git sends the two updates
+#     independently and the server applies each on its own, so a protected
+#     `main` can reject the commit while the TAG still lands — and a published
+#     tag cannot be retracted, so the recipe's nonzero exit arrives after the
+#     irreversible half already happened. It fails the other way too: the tag
+#     rejected, main advanced, and VERSION now claims a release that has no
+#     tag. Same lesson go-qrdb's release-lockstep header records. Verified
+#     against a hook-rejecting bare remote, both with and without the flag.
+#   - Cut from `main` ONLY, since `push <remote> HEAD` publishes whatever
+#     branch is checked out.
+#   - Fail-closed end to end: no `|| true`; any failing step aborts before the
+#     tag exists.
+#   - Error messages are SINGLE-quoted, deliberately. A double-quoted `echo` is
+#     a live command-substitution context, and error strings are exactly what
+#     people edit casually — a backtick or $(...) added there gets EXECUTED at
+#     the moment a release is already failing.
+#
+# THREE DEVIATIONS from the template. The first two settle a conflict between
+# the template and conventions/release-versioning.md, which is normative; the
+# third closes a hole in the template's own fail-closed contract:
+#
+#   1. The VERSION file is written UNPREFIXED. The template writes $(VERSION)
+#      verbatim, i.e. `v0.3.2-alpha`. §2 of release-versioning.md states the
+#      opposite in a table — VERSION is unprefixed, the tag carries the `v` —
+#      and every repo in the portfolio follows it. It also breaks the standard
+#      reconciliation `VERSION=$${GITHUB_REF#refs/tags/v}`, which is what
+#      .github/workflows/release.yml validates against.
+#   2. The CHANGELOG section guard anchors on the unprefixed heading and
+#      matches it LITERALLY. Two problems with the template's
+#      `^#+ +\[?v0.3.2-alpha\]?`: it wants the v-prefix, which no Keep a
+#      Changelog heading carries, so left as-is it would refuse every
+#      well-formed release; and it is a REGEX, in which the dots of a version
+#      are wildcards and `#+ +\[?` accepts heading shapes the release workflow
+#      does not. So `## [0x3x2-alpha]` — or `### 0.3.2-alpha` — passes this
+#      guard, the tag gets cut and pushed, and only then does the workflow's
+#      literal lookup fail, on a tag that can no longer be retracted. This
+#      guard is now the SAME predicate the workflow uses, because a
+#      pre-flight check that is not identical to the thing it clears for is
+#      not a check.
+#   3. The remote duplicate-tag check reads the EXIT CODE instead of inverting
+#      it with `!`. `git ls-remote --exit-code` answers three different things
+#      and the template's `! ... || { error }` collapses them to two: 0 = the
+#      tag exists, 2 = it does not, anything else (128 on an unreachable or
+#      unauthenticated remote) = the question was never answered. Under `!`
+#      that third case reads as "absent" and the recipe proceeds to commit
+#      VERSION and create the tag before the push fails — which is the exact
+#      half-released state the check exists to prevent. Codes verified against
+#      this remote on 2026-08-27, not assumed.
+#
+# The fourth deviation, RELEASE_REMOTE, is documented at its definition above.
+# All four are reported upstream for the template; do not "fix" them back.
+#
+# STANDING INVARIANT, and the one to check when editing either file: the
+# version grammar accepted HERE must be a strict SUBSET of the one
+# .github/workflows/release.yml accepts. This target's job is to fail BEFORE a
+# tag exists; the workflow's is to fail after, when nothing can be taken back.
+# So the target may be stricter (it is — it demands `-alpha`, where the
+# workflow also accepts a stable release), but it must never be LOOSER on any
+# axis. It briefly was: tightening the workflow to full SemVer left this guard
+# accepting `v01.2.3-alpha`, which the target would happily tag and the
+# workflow would then reject on an unretractable tag — the same
+# check-does-not-match-what-it-clears-for defect the CHANGELOG guard had.
+# THE MAKE -> SHELL CROSSING HAPPENS EXACTLY ONCE, HERE.
+#
+# Every value below can be set from the command line, which makes it attacker
+# input the moment anyone pastes a release command. A `$(VAR)` written in a
+# recipe BODY is not a shell parameter — make splices the value into the recipe
+# TEXT and the shell then parses the result as source. Quoting is no defence,
+# because the quotes are in the template while the value becomes syntax inside
+# them: `make release-alpha 'VERSION=v0.3.2-alpha`touch /tmp/pwn`'` runs the
+# backticks at the FIRST guard line, before any check can reject the string.
+# Measured, both vectors, before this was written: backticks execute, and so
+# does a value carrying an embedded double quote, which closes the guard's own
+# quoting and appends a command. (`$(...)` and `;` happen not to fire — make
+# eats the former as a variable reference and the latter stays inside the
+# quotes — which is exactly the kind of partial immunity that makes this look
+# safe when spot-checked.)
+#
+# Target-specific `export` moves each value into the recipe's ENVIRONMENT
+# instead. It reaches the shell through execve as data, never through the
+# parser, so a backtick in it is a byte. The recipe body below therefore
+# references ONLY shell parameters — "$$REL_VERSION" and friends — and never
+# `$(VERSION)`. Keep it that way: reintroducing a single `$(...)` carrying a
+# settable value reopens this.
+#
+# Note the corollary, which is the part that reads wrong at first glance:
+# `echo "ERROR: $$REL_VERSION"` in double quotes is SAFE, because the shell
+# does not re-scan the result of a parameter expansion for command
+# substitution. The v2.2 rule about single-quoting error messages was aimed at
+# a different hazard — a backtick typed into the literal message text — and
+# that still holds for the literal parts.
+#
+# The colour variables are exported for the same reason, which is easy to miss:
+# a command-line assignment overrides even a `:=` set in this file, so `$(GREEN)`
+# spliced into the last line would be one more splice point. It is a far less
+# plausible vector than VERSION — a pasted `GREEN=...` looks wrong where a
+# pasted `VERSION=...` looks routine — but leaving it would make the rule above
+# untrue, and a rule with one exception is not checkable. (The colour variables
+# are used this way throughout the rest of this Makefile; those recipes neither
+# sign nor push, so they are out of scope here rather than fixed silently.)
+#
+# `$(value VERSION)` rather than `$(VERSION)`: it yields the variable's RAW
+# text without expanding it, so a make FUNCTION smuggled into the value —
+# `VERSION='$(shell ...)v0.3.2-alpha'` — is not evaluated by this assignment,
+# and REL_VERSION ends up holding the literal `$(shell ...)` text, which the
+# grammar guard then rejects.
+#
+# BE CLEAR ABOUT WHAT THAT DOES AND DOES NOT BUY, because the honest limit
+# matters more than the mitigation. It does NOT close the make-function vector.
+# Measured three ways: with `:=$(VERSION)`, with `:=$(value VERSION)`, and with
+# a Makefile that never mentions the variable at all, `$(shell touch canary)`
+# RAN IN ALL THREE. Make expands a command-line variable while exporting it to
+# the recipe environment whether or not any rule references it, so no Makefile
+# can prevent it — a one-line Makefile with an empty target is equally exposed.
+# `$(value)` only stops the SECOND evaluation this assignment would add (an
+# `$(info)` payload printed twice without it, once with).
+#
+# So: the shell-metacharacter vector below is ours and is closed. The
+# make-function vector belongs to `make` itself and is out of reach from here;
+# it is why a release command line is only ever pasted from a trusted source.
+release-alpha: export REL_VERSION   := $(value VERSION)
+release-alpha: export REL_REMOTE    := $(RELEASE_REMOTE)
+release-alpha: export REL_REPO      := $(REPO_NAME)
+release-alpha: export REL_AGENT_GIT := $(AGENT_GIT)
+release-alpha: export REL_GREEN     := $(GREEN)
+release-alpha: export REL_RESET     := $(RESET)
+.PHONY: release-alpha
+## release-alpha: Cut and push a signed release tag (VERSION=vX.Y.Z-alpha)
+release-alpha:
+	@test -n "$$REL_VERSION" || { echo 'ERROR: state the version explicitly: make release-alpha VERSION=vX.Y.Z-alpha (release-versioning.md decides patch/minor/major — the recipe refuses to guess)'; exit 1; }
+	@printf '%s' "$$REL_VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha$$' || { echo 'ERROR: VERSION is not of the form vX.Y.Z-alpha, with no leading zeros in X, Y or Z (SemVer rule 9 — and release.yml refuses what this would otherwise let you tag)'; exit 1; }
+	@test -n "$$REL_REPO" || { echo 'ERROR: REPO_NAME is empty — set it to the literal repo name in the Makefile, never $$(notdir $$(CURDIR))'; exit 1; }
+	@test -x "$$REL_AGENT_GIT" || { echo 'ERROR: AGENT_GIT does not point at an executable agent-git.sh — every git write in this recipe signs through it'; exit 1; }
+	@test "$$(git rev-parse --abbrev-ref HEAD)" = main || { echo "ERROR: releases are cut from main; you are on $$(git rev-parse --abbrev-ref HEAD). Pushing HEAD would publish this branch."; exit 1; }
+	@git remote get-url "$$REL_REMOTE" >/dev/null 2>&1 || { echo "ERROR: no git remote named $$REL_REMOTE. Set RELEASE_REMOTE to the Gitea remote; the duplicate-tag check below FAILS OPEN without it"; exit 1; }
+	@! git rev-parse -q --verify "refs/tags/$$REL_VERSION" >/dev/null || { echo "ERROR: tag $$REL_VERSION already exists locally"; exit 1; }
+	@rc=0; git ls-remote --exit-code --tags "$$REL_REMOTE" "refs/tags/$$REL_VERSION" >/dev/null 2>&1 || rc=$$?; \
+	case "$$rc" in \
+	  0) echo "ERROR: tag $$REL_VERSION already exists on $$REL_REMOTE (a local check alone would miss this and fail the push AFTER committing VERSION)"; exit 1 ;; \
+	  2) : ;; \
+	  *) echo "ERROR: could not reach $$REL_REMOTE to check whether tag $$REL_VERSION exists. Refusing to continue: an unreachable remote is not an absent tag"; exit 1 ;; \
+	esac
+	@test -z "$$(git status --porcelain)" || { echo 'ERROR: working tree not clean'; exit 1; }
+	@ver="## [$${REL_VERSION#v}]"; awk -v ver="$$ver" 'index($$0, ver) == 1 { f = 1 } END { exit f ? 0 : 1 }' CHANGELOG.md || { echo "ERROR: CHANGELOG.md has no '$$ver' section heading. Matched LITERALLY and anchored at the line start, exactly as .github/workflows/release.yml matches it — an unanchored prose mention does not count, and neither does a near-miss heading"; exit 1; }
+	@printf '%s\n' "$${REL_VERSION#v}" > VERSION
+	"$$REL_AGENT_GIT" "$$REL_REPO" add VERSION
+	"$$REL_AGENT_GIT" "$$REL_REPO" commit -m "chore(release): $$REL_VERSION"
+	"$$REL_AGENT_GIT" "$$REL_REPO" tag -a "$$REL_VERSION" -m "$$REL_VERSION"
+	"$$REL_AGENT_GIT" "$$REL_REPO" push --atomic "$$REL_REMOTE" HEAD "refs/tags/$$REL_VERSION"
+	@printf '%b✓ Released %s (signed, annotated, single tag pushed)%b\n' "$$REL_GREEN" "$$REL_VERSION" "$$REL_RESET"
+
 .PHONY: clean
 ## clean: Remove build and test output
 clean:
@@ -488,3 +684,6 @@ help:
 	@echo "$(BOLD)Variables$(RESET)"
 	@echo "  $(CYAN)TAGS$(RESET)               build tags for every go invocation (default: none)"
 	@echo "                     e.g. make test TAGS=drbd"
+	@echo "  $(CYAN)VERSION$(RESET)            the release tag, required by release-alpha; no default"
+	@echo "                     e.g. make release-alpha VERSION=v0.3.2-alpha"
+	@echo "  $(CYAN)RELEASE_REMOTE$(RESET)     git remote the release is pushed to (default: origin)"
