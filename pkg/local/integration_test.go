@@ -15,9 +15,15 @@
 
 // These tests drive the provider against real LVM, LUKS and filesystems. They
 // need root, a loop device, and the lvm2, cryptsetup, e2fsprogs and util-linux
-// tooling, so they are selected by a build tag rather than skipped at run time:
+// tooling, so they are selected by a build tag rather than skipped at run time,
+// and they additionally require GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 to
+// acknowledge that they create and destroy storage on the host:
 //
-//	sudo -E go test -tags local_integration -race ./pkg/local/
+//	sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 go test -tags local_integration -race ./pkg/local/
+//
+// or, equivalently:
+//
+//	sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 make integration-test-local
 //
 // Selecting them with a tag and failing when the environment is not there is
 // deliberate. A testing.Short guard, or a skip on "not root", turns a suite
@@ -48,11 +54,21 @@ import (
 // It has to hold a volume, a grown volume and a snapshot's copy-on-write area.
 const backingSizeMB = 512
 
+// envDestructive is the explicit acknowledgement this suite requires before it
+// touches the host, mirroring GO_BLOCKSTORE_DRBD_ALLOW_DESTRUCTIVE in pkg/drbd.
+// The build tag already keeps this file out of an ordinary `go test`, but the
+// tag alone does not stop `sudo -E go test -tags local_integration ./...` run
+// by reflex on a box whose loop devices and volume groups are not disposable —
+// this suite creates and destroys both. Requiring the variable makes the intent
+// deliberate; the operator supplies it (the Makefile target does not, matching
+// pkg/drbd), e.g. `sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 make integration-test-local`.
+const envDestructive = "GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE"
+
 // testVG builds a throwaway volume group on a loopback file and returns its
 // name, tearing the whole thing down when the test ends.
 func testVG(t *testing.T) string {
 	t.Helper()
-	requireRoot(t)
+	requireDestructiveEnv(t)
 
 	vg := fmt.Sprintf("bsit%d", os.Getpid())
 	backing := filepath.Join(t.TempDir(), "backing.img")
@@ -137,8 +153,19 @@ func assertFIPSHeader(t *testing.T, device string) {
 	}
 }
 
-func requireRoot(t *testing.T) {
+// requireDestructiveEnv gates every test through testVG: it fails unless the
+// operator has acknowledged the host cost and is running as root. The
+// acknowledgement is checked FIRST, so an invocation that never meant to touch
+// this host stops before the root check even reports. A missing environment is
+// a hard failure, not a skip — the build tag selected this file, so having been
+// compiled in, it was meant to run (same reasoning as pkg/drbd).
+func requireDestructiveEnv(t *testing.T) {
 	t.Helper()
+	if os.Getenv(envDestructive) != "1" {
+		t.Fatalf("%s must be set to 1: this suite creates and destroys loop devices, "+
+			"volume groups and LUKS volumes on this host. Acknowledge and run it with, e.g.: "+
+			"sudo -E %s=1 make integration-test-local", envDestructive, envDestructive)
+	}
 	if os.Geteuid() != 0 {
 		t.Fatal("these tests manage loop devices and LVM and must run as root; re-run with sudo -E")
 	}

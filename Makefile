@@ -89,7 +89,18 @@ TEST_TIMEOUT := 900s
 # .github/workflows/nightly.yml reads the same file, so the scanner in CI and
 # the scanner on a developer's machine are the same build. Bump it there, not
 # here.
-TRIVY_VERSION := $(shell tr -d ' \t\n\r' < .trivy-version 2>/dev/null)
+#
+# Read as ONE bare token, not scrubbed. The prior `tr -d ' \t\n\r'` DELETED all
+# whitespace, so a malformed `.trivy-version` holding `0.74 .0` — or a stray
+# second line — silently normalised to a plausible-looking version instead of
+# being caught. A version string does not tolerate embedded whitespace: awk
+# counts every whitespace-delimited token in the file and emits the value ONLY
+# when there is exactly one, trimming surrounding whitespace as a side effect.
+# An internally-spaced or multi-token file yields empty, which the trivy target
+# then surfaces as a mismatch against whatever is installed rather than acting
+# on a scrubbed guess. (scripts/install-trivy.sh independently re-validates the
+# file as a strict semver before it fetches anything, so install fails loud too.)
+TRIVY_VERSION := $(shell awk '{for(i=1;i<=NF;i++){n++;v=$$i}} END{if(n==1)print v}' .trivy-version 2>/dev/null)
 
 RESET := \033[0m
 BOLD := \033[1m
@@ -169,22 +180,27 @@ race:
 
 .PHONY: integration-test
 ## integration-test: Run the integration suite (build tag: integration)
-# The drbd provider's real-cluster suite is NOT in here, and that is deliberate.
-# It carries `drbd_integration` as a second tag because it creates and destroys
-# logical volumes and DRBD resources on the host it runs on: under `integration`
-# it would run from `make ci`, on every machine, either doing that or hard
-# failing on its own destructive-operation guard.
+# TWO real-provider suites are deliberately NOT in here, each behind its own
+# second build tag because each creates and destroys storage on the host it runs
+# on — under `integration` they would run from `make ci`, on every machine,
+# either doing that or hard-failing on their own destructive-operation guard:
+#
+#   drbd  → pkg/drbd, tag `drbd_integration`      (logical volumes + DRBD resources)
+#   local → pkg/local, tag `local_integration`    (loop devices + VGs + LUKS volumes)
 #
 # The cost of that separation is that a green run of THIS target says nothing
-# about the drbd provider, so the banner says so rather than letting a developer
-# assume otherwise. Running it needs a configured two-node pair and root:
+# about either real provider, so the banner names both rather than letting a
+# developer assume otherwise. Each is operator-run and needs root:
 #
-#     make integration-test-drbd
+#     make integration-test-drbd     # needs a configured two-node pair
+#     make integration-test-local    # needs loopback (losetup)
 #
 integration-test:
 	@echo "$(CYAN)$(BOLD)→ Running integration tests...$(RESET)"
 	$(GO) test -tags=integration$(if $(strip $(TAGS)),$(comma)$(strip $(TAGS)),) -count=1 -timeout=$(TEST_TIMEOUT) ./...
-	@echo "$(YELLOW)  note: the drbd real-cluster suite is not included; see integration-test-drbd$(RESET)"
+	@echo "$(YELLOW)  note: the destructive real-provider suites are NOT included:$(RESET)"
+	@echo "$(YELLOW)        drbd real-cluster    → make integration-test-drbd$(RESET)"
+	@echo "$(YELLOW)        local real LVM/LUKS  → make integration-test-local$(RESET)"
 	@echo "$(GREEN)✓ Integration tests complete$(RESET)"
 
 .PHONY: integration-test-drbd
@@ -198,6 +214,30 @@ integration-test-drbd:
 	@echo "$(YELLOW)  DESTRUCTIVE: creates and destroys LVs and DRBD resources on this host$(RESET)"
 	$(GO) test -tags=drbd,drbd_integration -count=1 -timeout=$(TEST_TIMEOUT) -run Integration ./pkg/drbd/
 	@echo "$(GREEN)✓ drbd real-cluster suite complete$(RESET)"
+
+.PHONY: integration-test-local
+## integration-test-local: Run the local provider's real LVM/LUKS suite (DESTRUCTIVE, needs root + loopback)
+# The exact mirror of integration-test-drbd, for the local provider. Its suite
+# (~20 tests, incl. #11's sizing/restore/tag proofs) drives real LVM, LUKS and
+# filesystems over a loopback file, so it creates and destroys loop devices,
+# volume groups and LUKS volumes on THIS host. It is tag-gated (local_integration)
+# so an ordinary `make integration-test` never compiles it, and — matching the
+# drbd convention exactly — it refuses to run without
+# GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1, so an accidental invocation stops
+# rather than starting. Set that and run as root:
+#
+#     sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 make integration-test-local
+#
+# `sudo -E` preserves the variable across the privilege change; without -E the
+# environment is scrubbed and the in-test guard fails as designed.
+#
+# NOT wired into `make ci` or the CI unit lane, same as the drbd suite: it needs
+# root and losetup, which the shared runner does not grant. It is operator-run.
+integration-test-local:
+	@echo "$(CYAN)$(BOLD)→ Running the local provider real LVM/LUKS suite...$(RESET)"
+	@echo "$(YELLOW)  DESTRUCTIVE: creates and destroys loop devices, VGs and LUKS volumes on this host$(RESET)"
+	$(GO) test -tags=local_integration -count=1 -timeout=$(TEST_TIMEOUT) -run Integration ./pkg/local/
+	@echo "$(GREEN)✓ local provider real suite complete$(RESET)"
 
 .PHONY: coverage
 ## coverage: Enforce the coverage threshold and write an HTML report
@@ -271,17 +311,34 @@ golangci-lint:
 	@echo "$(GREEN)✓ golangci-lint passed$(RESET)"
 
 .PHONY: actionlint
-## actionlint: Lint the workflow files
+## actionlint: Lint the workflow files (requires shellcheck for the SC* rules)
 # A missing actionlint FAILS this target. It used to warn and return 0, which is
 # the same fail-open the trivy target carried: `make lint` would report success
 # with a declared check never run, and on a machine without the binary it would
 # report success forever. `lint` is part of `ci`, so that silence propagated
 # straight into the pipeline's exit code.
 #
+# A missing SHELLCHECK fails it for the same reason, and this one is subtler.
+# actionlint delegates every SC-prefixed rule to shellcheck, invoking it BY NAME
+# from PATH. With shellcheck not on PATH it DISABLES those rules and still EXITS
+# 0 at default verbosity — only `-verbose` prints "Rule shellcheck was
+# disabled". So actionlint appearing to pass says nothing about the shell inside
+# `run:` steps: a real SC2046 reached main that way (fixed in #21). The check is
+# `command -v shellcheck` and not a GOPATH/bin probe ON PURPOSE — actionlint
+# spawns whatever `shellcheck` PATH resolves, so a binary installed to GOPATH/bin
+# that is not on PATH is invisible to it, and asserting the wrong location would
+# be a check narrower than what it verifies. `make install-tools` installs it;
+# put GOPATH/bin on PATH.
+#
 # The runner labels it must accept live in .github/actionlint.yaml — without
 # that file every self-hosted label reads as an unknown runner; with it, a
 # MISSPELLED label is still caught.
 actionlint:
+	@if ! command -v shellcheck > /dev/null 2>&1; then \
+		echo "$(RED)✗ shellcheck not on PATH — actionlint would SILENTLY skip every SC* rule and still exit 0$(RESET)"; \
+		echo "$(YELLOW)  Install: make install-tools (then put \$$(go env GOPATH)/bin on PATH)$(RESET)"; \
+		exit 1; \
+	fi
 	@GOPATH=$$($(GO) env GOPATH); \
 	BIN=""; \
 	for cand in "$$GOPATH/bin/actionlint" $$(command -v actionlint 2>/dev/null); do \
@@ -293,7 +350,7 @@ actionlint:
 		exit 1; \
 	fi; \
 	"$$BIN"
-	@echo "$(GREEN)✓ actionlint passed$(RESET)"
+	@echo "$(GREEN)✓ actionlint passed (shellcheck present; SC* rules live)$(RESET)"
 
 # ==============================================================================
 # Security (devops.md §8)
@@ -301,12 +358,15 @@ actionlint:
 
 .PHONY: install-tools
 ## install-tools: Install the pinned linter and the security scanners
-# trivy is not a `go install` target, so it comes from scripts/install-trivy.sh
-# — the same script .github/workflows/nightly.yml runs, which downloads the
-# PINNED release artifact and verifies its published SHA-256 before executing
-# anything. Nothing here pipes a fetched script into a shell. One installer for
-# both call sites, so the scanner on a dev box and the scanner in CI cannot
-# drift apart.
+# trivy and shellcheck are not `go install` targets, so they come from
+# scripts/install-trivy.sh and scripts/install-shellcheck.sh — the same scripts
+# CI runs (nightly.yml for trivy, the lint job for shellcheck), each of which
+# downloads the PINNED release artifact and verifies its SHA-256 before
+# executing anything. Nothing here pipes a fetched script into a shell. One
+# installer per tool for both call sites, so the binary on a dev box and the one
+# in CI cannot drift apart. shellcheck backs actionlint's SC* rules; without it
+# actionlint disables those rules and exits 0, which is the fail-open the lint
+# target now refuses (see the actionlint target).
 #
 # It writes into GOPATH/bin and needs no root, and it lives in this
 # explicitly-invoked target so nothing mutates a developer's machine as a side
@@ -321,8 +381,18 @@ install-tools:
 	@$(GO) install golang.org/x/vuln/cmd/govulncheck@latest
 	@echo "$(CYAN)  actionlint$(RESET)"
 	@$(GO) install github.com/rhysd/actionlint/cmd/actionlint@latest
+	@echo "$(CYAN)  shellcheck (pinned, checksum-verified)$(RESET)"
+	@./scripts/install-shellcheck.sh "$$($(GO) env GOPATH)/bin"
 	@echo "$(CYAN)  trivy $(TRIVY_VERSION) (pinned, checksum-verified)$(RESET)"
-	@./scripts/install-trivy.sh "$$($(GO) env GOPATH)/bin"
+	@# Pass the STRICTLY-parsed version through, and refuse to install without it.
+	@# TRIVY_VERSION above resolves to empty on a malformed .trivy-version (embedded
+	@# whitespace or multiple tokens); without this guard install-trivy.sh would
+	@# then fall back to reading the file ITSELF with `tr -d`, scrub `0.74 .0` to
+	@# `0.74.0` and install that — the exact normalize-not-verify hole the read was
+	@# hardened to close, reopened one layer down. Failing here keeps the parsed
+	@# value the single source and never lets the scrubbing fallback run.
+	@test -n "$(TRIVY_VERSION)" || { echo "$(RED)✗ .trivy-version is malformed (empty, whitespace, or multi-token) — refusing to install a scrubbed guess$(RESET)"; exit 1; }
+	@./scripts/install-trivy.sh "$$($(GO) env GOPATH)/bin" "$(TRIVY_VERSION)"
 	@echo "$(GREEN)✓ Tools installed to $$($(GO) env GOPATH)/bin$(RESET)"
 	@echo '$(YELLOW)  Put that directory on your PATH, or the security targets will not find them.$(RESET)'
 

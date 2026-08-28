@@ -137,10 +137,14 @@ contract-validated, not hardware-validated, failover.
 `go test ./...` runs the whole suite against fakes — no root, no LVM, no block
 devices. The tests that drive real LVM, LUKS and filesystems are selected by a
 build tag rather than skipped at run time, so a suite that cannot run fails
-instead of quietly passing:
+instead of quietly passing. They also require an explicit acknowledgement,
+`GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1`, because they create and destroy loop
+devices, volume groups and LUKS volumes on the host:
 
 ```
-sudo -E go test -tags local_integration -race ./pkg/local/
+sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 make integration-test-local
+# or, directly:
+sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 go test -tags local_integration -race ./pkg/local/
 ```
 
 They build their own volume group on a loopback file and tear it down again.

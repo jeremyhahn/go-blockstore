@@ -130,6 +130,17 @@ jobs:
           done
           echo "actionlint install failed after 3 attempts"; exit 1
 
+      # actionlint delegates every SC-prefixed rule to shellcheck, invoked BY
+      # NAME from PATH. With shellcheck absent it DISABLES those rules and still
+      # exits 0 at default verbosity — so without this step the actionlint gate
+      # below would be a paper gate for the shell inside `run:` steps, which is
+      # exactly how a real SC2046 reached main (#21). Pinned and checksum-verified
+      # through the same scripts/install-shellcheck.sh that `make install-tools`
+      # runs, so the shellcheck in CI and on a dev box are the same binary. It
+      # installs to GOPATH/bin, which setup-go has already put on PATH.
+      - name: Install shellcheck
+        run: ./scripts/install-shellcheck.sh "$(go env GOPATH)/bin"
+
       - name: actionlint
         run: actionlint
 
