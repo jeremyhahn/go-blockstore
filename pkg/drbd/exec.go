@@ -118,20 +118,22 @@ const maxStderr = 4096
 // second lock on the same door, and the one that holds if the first is ever
 // widened without thinking about what the name is used for.
 var allowedBinaries = map[string]struct{}{
-	binDRBDAdm:   {},
-	binDRBDSetup: {},
-	binLVCreate:  {},
-	binLVRemove:  {},
-	binLVExtend:  {},
-	binLVS:       {},
-	binFindmnt:   {},
-	binBlkid:     {},
-	binDD:        {},
-	binResize2fs: {},
-	binXFSGrowfs: {},
-	binE2fsck:    {},
-	"mkfs.ext4":  {},
-	"mkfs.xfs":   {},
+	binDRBDAdm:    {},
+	binDRBDSetup:  {},
+	binLVCreate:   {},
+	binLVRemove:   {},
+	binLVExtend:   {},
+	binLVS:        {},
+	binLVChange:   {},
+	binFindmnt:    {},
+	binBlkid:      {},
+	binBlkdiscard: {},
+	binDD:         {},
+	binResize2fs:  {},
+	binXFSGrowfs:  {},
+	binE2fsck:     {},
+	"mkfs.ext4":   {},
+	"mkfs.xfs":    {},
 }
 
 // execRunner is the production CommandRunner: it execs the binary with the

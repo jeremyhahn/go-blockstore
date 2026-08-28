@@ -65,6 +65,15 @@ const (
 	// accident or mistakes it for a tuning knob. Absent — the default — a
 	// resource cannot be provisioned without a secret.
 	SettingAllowUnauthenticatedPeers = "allow_unauthenticated_peers"
+
+	// SettingWipeOnDelete ("true"/"false") zero-fills a volume's backing device
+	// before removing it, so its contents do not survive in the volume group's
+	// free extents. It defaults to false.
+	//
+	// Read Config.WipeOnDelete before leaving it at that default: it documents
+	// what an unwiped delete leaves behind, and what this option does and does
+	// not reach.
+	SettingWipeOnDelete = "wipe_on_delete"
 )
 
 // Defaults for the optional settings.
@@ -135,6 +144,50 @@ type Config struct {
 	// AllowUnauthenticatedPeers provisions resources with no peer
 	// authentication. It is off unless explicitly set.
 	AllowUnauthenticatedPeers bool
+
+	// WipeOnDelete zero-fills a volume's backing logical volume before removing
+	// it, so its contents do not survive in the volume group's free extents.
+	//
+	// Read this before leaving it at its default: AN UNENCRYPTED VOLUME ON
+	// NON-DISCARDING MEDIA RETAINS READABLE DATA AFTER Delete UNLESS
+	// WipeOnDelete IS SET. Its extents go back to the volume group holding
+	// whatever was written to them, and the next volume to be allocated those
+	// extents can read it — lvcreate zeroes only the first few kilobytes of a
+	// new volume, enough that a stale filesystem signature is not detected, not
+	// enough that the last tenant's data is gone. The extents lvextend adds to a
+	// growing volume come from the same pool. Replication does not change this:
+	// what DRBD wrote to the backing device is plain data on both nodes, so the
+	// exposure exists once per copy.
+	//
+	// ENCRYPTION IS THE BETTER MITIGATION, and this provider does not offer it
+	// yet. What survives in a freed extent is then ciphertext whose key went
+	// away with the LUKS header, at none of the cost: a wipe writes the whole
+	// volume, which is minutes per terabyte on rotating disks, while encryption
+	// costs nothing at delete time. pkg/local has it today as Options.Encrypted;
+	// the LUKS-above-DRBD work that brings it here is tracked separately. Until
+	// then this option is the mitigation available on this provider, and the
+	// choice is between paying for it and accepting the remanence.
+	//
+	// How much the exposure bites depends on the storage. With LVM's
+	// devices/issue_discards set to 1 over a backing device that supports
+	// discard, lvremove discards the freed extents and they read back as zeroes
+	// whatever this option says. The LVM default is 0, and rotating disks do not
+	// discard at all, which is the case the option is for. Do not infer from a
+	// host where the data happens to be gone that it will be gone on the next
+	// one.
+	//
+	// What it does NOT reach is a snapshot's copy-on-write extents, which hold
+	// the pre-snapshot copies of everything the origin has overwritten since.
+	// Delete cannot encounter that here — it refuses a volume that still has
+	// snapshots, with common.ErrHasSnapshots — so on this provider the hazard is
+	// unreachable rather than merely unlikely; see Delete. A caller that removes
+	// the snapshots first and then deletes the origin has still had those CoW
+	// extents freed unwiped by the snapshot removal, and encryption is the only
+	// complete answer for a volume that has ever been snapshotted.
+	//
+	// It defaults to false, matching LVM's own behavior rather than imposing a
+	// full-volume zero-fill on every deletion in every deployment.
+	WipeOnDelete bool
 }
 
 // ParseConfig validates a settings map and fills in defaults.
@@ -149,6 +202,7 @@ func ParseConfig(settings map[string]string) (Config, error) {
 		SettingPeerNode: {}, SettingPeerAddress: {}, SettingPeerNodeID: {},
 		SettingMinorBase: {}, SettingPortBase: {}, SettingSnapshotSizePercent: {},
 		SettingReplicationSecretFile: {}, SettingAllowUnauthenticatedPeers: {},
+		SettingWipeOnDelete: {},
 	}
 	for k := range settings {
 		if _, ok := known[k]; !ok {
@@ -237,6 +291,9 @@ func ParseConfig(settings map[string]string) (Config, error) {
 		cfg.ReplicationSecretFile = v
 	}
 	if cfg.AllowUnauthenticatedPeers, err = optionalBool(settings, SettingAllowUnauthenticatedPeers); err != nil {
+		return Config{}, err
+	}
+	if cfg.WipeOnDelete, err = optionalBool(settings, SettingWipeOnDelete); err != nil {
 		return Config{}, err
 	}
 	// Setting both says two contradictory things about the same resource. The

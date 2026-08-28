@@ -1518,6 +1518,339 @@ func TestDeleteRefusesVolumeWithSnapshots(t *testing.T) {
 	r.assertNotRan(t, "lvremove")
 }
 
+// newWipingProvider is a provider with wipe_on_delete turned on.
+func newWipingProvider(t *testing.T) (*Provider, *fakeRunner) {
+	t.Helper()
+	p, r, _ := newTestProviderWith(t, func(s map[string]string) {
+		s[SettingWipeOnDelete] = "true"
+	})
+	return p, r
+}
+
+// TestDeleteWipesTheBackingVolumeWhenConfigured covers the option's whole point
+// and, more importantly, WHERE and WHEN the wipe happens.
+//
+// The target is the backing logical volume, not /dev/drbd0. The extents handed
+// back to the volume group are the LV's, so the LV is what has to be
+// overwritten; going through the DRBD device would also replicate every zero to
+// the peer, resyncing a volume that is being destroyed.
+//
+// The ordering is the other half. DRBD holds its backing device open while the
+// resource is up, so a wipe before "drbdadm down" would fail on a busy device,
+// and one after lvremove would have nothing to address.
+func TestDeleteWipesTheBackingVolumeWhenConfigured(t *testing.T) {
+	p, r := newWipingProvider(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	r.scriptStatus(secondaryStatus(testVolume, 0))
+	r.scriptLVS(lvsJSON(lvEntry{Name: "vol1", VG: testVG, Size: strconv.FormatInt(testSize, 10), Attr: attrActiveVolume}))
+	r.on(binDRBDAdm, "down", testVolume).returns("")
+	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").returns("")
+	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
+
+	if err := p.Delete(context.Background(), testVolume); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	// Already active, so it is left exactly as found.
+	r.assertNotRan(t, "lvchange")
+	r.assertRan(t, "blkdiscard --zeroout /dev/vg0/vol1")
+	// Not the replicated device: zeroing that would go to the peer as well.
+	r.assertNotRan(t, "/dev/drbd0")
+
+	cmds := r.commands()
+	downAt := indexOfCommand(cmds, "drbdadm down vol1")
+	wipeAt := indexOfCommand(cmds, "blkdiscard --zeroout /dev/vg0/vol1")
+	removeAt := indexOfCommand(cmds, "lvremove --force vg0/vol1")
+	if downAt < 0 || wipeAt < 0 || removeAt < 0 {
+		t.Fatalf("expected the teardown, the wipe and the removal; ran:\n  %s", strings.Join(cmds, "\n  "))
+	}
+	if downAt > wipeAt || wipeAt > removeAt {
+		t.Errorf("wipe must fall between the teardown and the removal, got down=%d wipe=%d remove=%d:\n  %s",
+			downAt, wipeAt, removeAt, strings.Join(cmds, "\n  "))
+	}
+}
+
+// TestDeleteDoesNotWipeByDefault pins the default. A full-volume zero-fill on
+// every deletion is minutes per terabyte on rotating disks, which is not
+// something to impose on a deployment that did not ask for it.
+func TestDeleteDoesNotWipeByDefault(t *testing.T) {
+	p, r := newTestProvider(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	r.scriptStatus(secondaryStatus(testVolume, 0))
+	r.scriptLVS(lvsJSON(lvEntry{Name: "vol1", VG: testVG, Size: strconv.FormatInt(testSize, 10), Attr: attrActiveVolume}))
+	r.on(binDRBDAdm, "down", testVolume).returns("")
+	// Scripted to succeed, so its absence proves the option gates it rather
+	// than the fake refusing the command.
+	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").returns("")
+	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
+
+	if err := p.Delete(context.Background(), testVolume); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	r.assertNotRan(t, "blkdiscard")
+	r.assertRan(t, "lvremove --force vg0/vol1")
+}
+
+// TestDeleteStopsWhenTheWipeFails is the safe direction. The caller asked for
+// the contents to be destroyed before the volume was; if that did not happen,
+// removing the volume anyway would hand the extents back holding exactly the
+// data the option exists to keep out of them.
+func TestDeleteStopsWhenTheWipeFails(t *testing.T) {
+	p, r := newWipingProvider(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	r.scriptStatus(secondaryStatus(testVolume, 0))
+	r.scriptLVS(lvsJSON(lvEntry{Name: "vol1", VG: testVG, Size: strconv.FormatInt(testSize, 10), Attr: attrActiveVolume}))
+	r.on(binDRBDAdm, "down", testVolume).returns("")
+	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").fails(1, "blkdiscard: BLKZEROOUT ioctl failed: Operation not supported")
+	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
+
+	err := p.Delete(context.Background(), testVolume)
+	if err == nil {
+		t.Fatal("Delete succeeded despite the wipe failing")
+	}
+	for _, want := range []string{"vg0/vol1", "not supported"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the failure does not mention %q: %v", want, err)
+		}
+	}
+	// The volume is still there to try again on, and so is its record.
+	r.assertNotRan(t, "lvremove")
+	if _, statErr := os.Stat(p.metaPath(testVolume)); statErr != nil {
+		t.Errorf("the state record was removed after a failed wipe: %v", statErr)
+	}
+	if _, statErr := os.Stat(p.resPath(testVolume)); statErr != nil {
+		t.Errorf("the resource file was removed after a failed wipe: %v", statErr)
+	}
+}
+
+// TestDeleteWipesAnInactiveBackingVolume is the case my first pass assumed away.
+//
+// A DRBD backing volume is active whenever the resource has been up, so it is
+// easy to conclude there is no inactive state to handle. But Delete deliberately
+// serves volumes whose resource is already DOWN, and such a volume can have no
+// device node at all: after a reboot without autoactivation, after an
+// administrator deactivates it, or from a provisioning run that failed partway.
+//
+// Without the activation, blkdiscard fails on a device that is not there, the
+// wipe failure stops the delete by design, and wipe_on_delete becomes a
+// PERMANENT block on a perfectly valid deletion — the operator cannot get past
+// it without turning the option off. Fail-closed retention is meant to protect
+// data, not to strand a volume.
+func TestDeleteWipesAnInactiveBackingVolume(t *testing.T) {
+	p, r := newWipingProvider(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	// Resource down, and the backing volume carries no device node.
+	r.scriptStatus(emptyStatus)
+	r.scriptLVS(lvsJSON(lvEntry{
+		Name: "vol1", VG: testVG,
+		Size: strconv.FormatInt(testSize, 10), Attr: attrInactiveVolume,
+	}))
+	r.on(binLVChange, "--activate", "y", "--yes", "vg0/vol1").returns("")
+	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").returns("")
+	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
+
+	if err := p.Delete(context.Background(), testVolume); err != nil {
+		t.Fatalf("Delete of a volume with an inactive backing device: %v", err)
+	}
+
+	cmds := r.commands()
+	activateAt := indexOfCommand(cmds, "lvchange --activate y --yes vg0/vol1")
+	wipeAt := indexOfCommand(cmds, "blkdiscard --zeroout /dev/vg0/vol1")
+	removeAt := indexOfCommand(cmds, "lvremove --force vg0/vol1")
+	if activateAt < 0 || wipeAt < 0 || removeAt < 0 {
+		t.Fatalf("expected activation, wipe and removal; ran:\n  %s", strings.Join(cmds, "\n  "))
+	}
+	if activateAt > wipeAt || wipeAt > removeAt {
+		t.Errorf("want activate then wipe then remove, got %d/%d/%d:\n  %s",
+			activateAt, wipeAt, removeAt, strings.Join(cmds, "\n  "))
+	}
+	// The wipe succeeded, so lvremove takes the volume anyway; putting the
+	// device node back first would be work with no observer.
+	r.assertNotRan(t, "lvchange --activate n")
+}
+
+// TestFailedWipeRestoresAnInactiveVolume covers the other half of borrowing the
+// activation. The delete does not happen when the wipe fails, so a volume the
+// operator left deactivated must not be left activated by an operation they
+// watched fail.
+func TestFailedWipeRestoresAnInactiveVolume(t *testing.T) {
+	p, r := newWipingProvider(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	r.scriptStatus(emptyStatus)
+	r.scriptLVS(lvsJSON(lvEntry{
+		Name: "vol1", VG: testVG,
+		Size: strconv.FormatInt(testSize, 10), Attr: attrInactiveVolume,
+	}))
+	r.on(binLVChange, "--activate", "y", "--yes", "vg0/vol1").returns("")
+	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").fails(1, "blkdiscard: BLKZEROOUT ioctl failed: Operation not supported")
+	r.on(binLVChange, "--activate", "n", "--yes", "vg0/vol1").returns("")
+	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
+
+	err := p.Delete(context.Background(), testVolume)
+	if err == nil {
+		t.Fatal("Delete succeeded despite the wipe failing")
+	}
+	if !strings.Contains(err.Error(), "not supported") {
+		t.Errorf("the wipe failure is not reported: %v", err)
+	}
+	r.assertRan(t, "lvchange --activate n --yes vg0/vol1")
+	r.assertNotRan(t, "lvremove")
+	// And the volume is still there to try again on.
+	if _, statErr := os.Stat(p.metaPath(testVolume)); statErr != nil {
+		t.Errorf("the state record was removed after a failed wipe: %v", statErr)
+	}
+}
+
+// TestFailedRemovalRestoresAnInactiveVolume is the other error path out of a
+// borrowed activation, and the one easiest to miss: the wipe SUCCEEDED here, so
+// the code that borrowed the activation has already returned happy.
+//
+// lvremove can still fail — a transient LVM error, a device briefly busy — and
+// then the volume survives with an activation left over from an operation the
+// operator watched fail. Same leftover as the failed-wipe case, reached from the
+// other side.
+func TestFailedRemovalRestoresAnInactiveVolume(t *testing.T) {
+	p, r := newWipingProvider(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	r.scriptStatus(emptyStatus)
+	r.scriptLVS(lvsJSON(lvEntry{
+		Name: "vol1", VG: testVG,
+		Size: strconv.FormatInt(testSize, 10), Attr: attrInactiveVolume,
+	}))
+	r.on(binLVChange, "--activate", "y", "--yes", "vg0/vol1").returns("")
+	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").returns("")
+	r.on(binLVRemove, "--force", "vg0/vol1").fails(5, "Logical volume vg0/vol1 in use")
+	r.on(binLVChange, "--activate", "n", "--yes", "vg0/vol1").returns("")
+
+	err := p.Delete(context.Background(), testVolume)
+	if err == nil {
+		t.Fatal("Delete succeeded despite lvremove failing")
+	}
+	if !strings.Contains(err.Error(), "in use") {
+		t.Errorf("the removal failure is not reported: %v", err)
+	}
+	r.assertRan(t, "lvchange --activate n --yes vg0/vol1")
+	// The state record survives, so the delete can be retried.
+	if _, statErr := os.Stat(p.metaPath(testVolume)); statErr != nil {
+		t.Errorf("the state record was removed after a failed lvremove: %v", statErr)
+	}
+}
+
+// TestFailedRemovalLeavesAnActiveVolumeAlone is the same path for a volume that
+// was already active. Nothing was borrowed, so nothing is given back — a delete
+// that fails must not deactivate a volume it found running.
+func TestFailedRemovalLeavesAnActiveVolumeAlone(t *testing.T) {
+	p, r := newWipingProvider(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	r.scriptStatus(secondaryStatus(testVolume, 0))
+	r.scriptLVS(lvsJSON(lvEntry{
+		Name: "vol1", VG: testVG,
+		Size: strconv.FormatInt(testSize, 10), Attr: attrActiveVolume,
+	}))
+	r.on(binDRBDAdm, "down", testVolume).returns("")
+	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").returns("")
+	r.on(binLVRemove, "--force", "vg0/vol1").fails(5, "Logical volume vg0/vol1 in use")
+	// Scripted to succeed, so its absence is the decision not to run it.
+	r.on(binLVChange, "--activate", "n", "--yes", "vg0/vol1").returns("")
+
+	if err := p.Delete(context.Background(), testVolume); err == nil {
+		t.Fatal("Delete succeeded despite lvremove failing")
+	}
+	r.assertNotRan(t, "lvchange")
+}
+
+// TestBorrowedActivationIsGivenBackOnAFailedContext is the failure mode that
+// makes the two restore paths worth having at all.
+//
+// A cancellation or timeout DURING the wipe is the likeliest way to reach them —
+// blkdiscard is the long step, minutes per terabyte — and the compensating
+// lvchange must not inherit the context that just died. The production runner
+// execs through exec.CommandContext, so a canceled context means the cleanup
+// process never starts, and the restore silently does not happen while the code
+// reads as though it did.
+//
+// The fake refuses any command issued on a done context, exactly as the real
+// runner would, so the deactivation appearing in the log is the detached
+// context doing its job.
+func TestBorrowedActivationIsGivenBackOnAFailedContext(t *testing.T) {
+	p, r := newWipingProvider(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r.scriptStatus(emptyStatus)
+	r.scriptLVS(lvsJSON(lvEntry{
+		Name: "vol1", VG: testVG,
+		Size: strconv.FormatInt(testSize, 10), Attr: attrInactiveVolume,
+	}))
+	r.on(binLVChange, "--activate", "y", "--yes", "vg0/vol1").returns("")
+	// The caller gives up while the wipe is running, which is what a deadline
+	// on a long blkdiscard looks like from in here.
+	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").
+		fails(1, "interrupted").
+		then(cancel)
+	r.on(binLVChange, "--activate", "n", "--yes", "vg0/vol1").returns("")
+
+	if err := p.Delete(ctx, testVolume); err == nil {
+		t.Fatal("Delete succeeded despite the wipe failing")
+	}
+	r.assertRan(t, "lvchange --activate n --yes vg0/vol1")
+}
+
+// TestWipeNeverRunsUnderASnapshot is the measured copy-on-write constraint,
+// pinned as a property rather than left to the reading order of Delete.
+//
+// Zeroing an origin that still has a snapshot is CoW's worst case: every block
+// written pushes the block it replaced into the snapshot's CoW area, so the wipe
+// duplicates the data it is destroying into extents lvremove then frees. The
+// local lane measured it on LVM 2.03.16 — a 64 MiB origin under one snapshot
+// went from 0% to 100% CoW occupancy and overflowed into an unreadable state.
+//
+// Delete's snapshot refusal is what keeps that unreachable here. This asserts
+// the refusal still comes first with wiping ON, because the two are only
+// connected by ordering, and nothing else in the file would notice if they came
+// apart.
+func TestWipeNeverRunsUnderASnapshot(t *testing.T) {
+	p, r := newWipingProvider(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	r.scriptStatus(secondaryStatus(testVolume, 0))
+	r.scriptLVS(lvsJSON(
+		lvEntry{Name: "vol1", VG: testVG, Size: strconv.FormatInt(testSize, 10)},
+		lvEntry{Name: "vol1.snap.nightly", VG: testVG, Origin: "vol1"},
+	))
+	// Both scripted to succeed: nothing here may run, and the reason must be
+	// the refusal rather than an unscripted command.
+	r.on(binDRBDAdm, "down", testVolume).returns("")
+	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").returns("")
+	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
+
+	err := p.Delete(context.Background(), testVolume)
+	if !errors.Is(err, common.ErrHasSnapshots) {
+		t.Fatalf("Delete with snapshots = %v, want common.ErrHasSnapshots", err)
+	}
+	r.assertNotRan(t, "blkdiscard")
+	r.assertNotRan(t, "lvremove")
+	r.assertNotRan(t, "drbdadm down")
+}
+
 func TestDeleteWhenResourceIsDown(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, defaultSpec())

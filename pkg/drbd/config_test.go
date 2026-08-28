@@ -51,6 +51,61 @@ func TestParseConfigDefaults(t *testing.T) {
 	if cfg.SnapshotSizePercent != defaultSnapshotSizePercent {
 		t.Errorf("SnapshotSizePercent = %d, want %d", cfg.SnapshotSizePercent, defaultSnapshotSizePercent)
 	}
+	// Off unless asked for: a full-volume zero-fill on every delete is minutes
+	// per terabyte on rotating disks.
+	if cfg.WipeOnDelete {
+		t.Error("WipeOnDelete defaults to true; it must default to false")
+	}
+}
+
+// TestParseConfigWipeOnDelete pins the setting's spelling and its strictness.
+// The key is the canonical one pkg/local uses — an operator configuring either
+// provider should not have to remember which spelling this one wants — and the
+// value is true/false only, since a security option that silently reads as
+// false for "yes" or "1" is worse than one that refuses.
+func TestParseConfigWipeOnDelete(t *testing.T) {
+	base := func() map[string]string {
+		return map[string]string{
+			SettingVolumeGroup: testVG,
+			SettingNodeName:    testNode,
+			SettingNodeAddress: "10.10.0.1",
+			SettingPeerNode:    testPeer,
+			SettingPeerAddress: "10.10.0.2",
+		}
+	}
+	if SettingWipeOnDelete != "wipe_on_delete" {
+		t.Errorf("setting key = %q, want the canonical wipe_on_delete", SettingWipeOnDelete)
+	}
+	for _, tc := range []struct {
+		raw     string
+		want    bool
+		wantErr bool
+	}{
+		{raw: "true", want: true},
+		{raw: "false", want: false},
+		{raw: "", want: false},
+		{raw: "1", wantErr: true},
+		{raw: "yes", wantErr: true},
+		{raw: "TRUE", wantErr: true},
+	} {
+		t.Run("value "+tc.raw, func(t *testing.T) {
+			s := base()
+			s[SettingWipeOnDelete] = tc.raw
+			cfg, err := ParseConfig(s)
+			if tc.wantErr {
+				if !errors.Is(err, common.ErrInvalidArgument) {
+					t.Fatalf("ParseConfig(%q) = %v, want ErrInvalidArgument", tc.raw, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseConfig(%q): %v", tc.raw, err)
+			}
+			if cfg.WipeOnDelete != tc.want {
+				t.Errorf("WipeOnDelete = %v, want %v", cfg.WipeOnDelete, tc.want)
+			}
+		})
+	}
 }
 
 func TestParseConfigRejections(t *testing.T) {

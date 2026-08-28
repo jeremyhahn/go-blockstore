@@ -34,14 +34,15 @@ import (
 
 // The system tooling this provider execs, beyond the LVM binaries in lvm.go.
 const (
-	binDRBDAdm   = "drbdadm"
-	binDRBDSetup = "drbdsetup"
-	binFindmnt   = "findmnt"
-	binBlkid     = "blkid"
-	binDD        = "dd"
-	binResize2fs = "resize2fs"
-	binXFSGrowfs = "xfs_growfs"
-	binE2fsck    = "e2fsck"
+	binDRBDAdm    = "drbdadm"
+	binDRBDSetup  = "drbdsetup"
+	binFindmnt    = "findmnt"
+	binBlkid      = "blkid"
+	binBlkdiscard = "blkdiscard"
+	binDD         = "dd"
+	binResize2fs  = "resize2fs"
+	binXFSGrowfs  = "xfs_growfs"
+	binE2fsck     = "e2fsck"
 )
 
 // Exit codes this package interprets rather than treats as failure.
@@ -61,6 +62,25 @@ const (
 // kernel and the LVM metadata lock, and it is bounded at all because a cleanup
 // that hangs would hold the provider's mutex indefinitely.
 const rollbackTimeout = 2 * time.Minute
+
+// cleanupContext detaches from the caller's context for a compensating action,
+// bounded so a cleanup cannot hang forever either.
+//
+// The most likely reason to be running one is that ctx was canceled or its
+// deadline passed partway through the operation being compensated. Reusing it
+// makes every cleanup command fail instantly — the production runner execs
+// through exec.CommandContext, so a canceled context means the process never
+// starts — and leaves behind exactly the state the cleanup exists to undo. That
+// is worse than not attempting it, because the code reads as though the state
+// were restored.
+//
+// One function rather than the expression written at each site: the three
+// callers are a provisioning rollback and two deletion paths that give back a
+// borrowed activation, and they must not drift apart on a subtlety this easy to
+// get wrong by copying.
+func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+}
 
 // statusSizeUnit converts the device size in a drbdsetup status document to
 // bytes. DRBD reports sizes in KiB throughout, the JSON "size" field included.
@@ -549,7 +569,7 @@ func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (commo
 	// because the resource it could not take down may still be attached to the
 	// volume that removal would destroy.
 	rollback := func() error {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+		cleanupCtx, cancel := cleanupContext(ctx)
 		defer cancel()
 
 		// incomplete reports a cleanup that stopped early or partly failed,
@@ -1686,6 +1706,22 @@ func (p *Provider) DeleteSnapshot(ctx context.Context, snapID common.SnapshotID)
 // that cannot be established at all is refused with ErrRoleUnknown, because
 // only "is Secondary" makes the teardown safe and "is not Primary" does not
 // mean the same thing.
+//
+// With Config.WipeOnDelete the backing volume is zero-filled before it is
+// removed, so its contents do not linger in the free extents LVM hands to the
+// next volume. See that field for what the wipe covers and what it does not.
+//
+// The snapshot refusal above is also what makes that wipe safe to run
+// unconditionally, and it is worth saying why rather than leaving it to
+// coincidence. Zeroing an origin that still has a snapshot is copy-on-write's
+// worst case: every block written pushes the block it replaced into the
+// snapshot's CoW area, so the wipe duplicates the very data it is destroying
+// into extents lvremove then frees. Measured by the local lane on LVM 2.03.16,
+// wiping a 64 MiB origin under one snapshot drove CoW occupancy from 0% to 100%
+// and overflowed the snapshot into an unreadable state. Because a volume with
+// snapshots never reaches the wipe here, that trap is unreachable rather than
+// merely avoided by ordering — but it becomes reachable the moment the refusal
+// is relaxed, so the two belong together.
 func (p *Provider) Delete(ctx context.Context, volID string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1749,8 +1785,26 @@ func (p *Provider) Delete(ctx context.Context, volID string) error {
 	// A volume left half-provisioned may never have got its backing device.
 	// Removing what is not there is not a failure, and refusing to converge
 	// would leave the record needing to be deleted by hand.
-	if _, exists := findLV(lvs, meta.LV); exists {
+	if entry, exists := findLV(lvs, meta.LV); exists {
+		// The listing above already carries lv_attr, so the activation state
+		// costs no extra command to read.
+		wasActive := entry.active()
+		if p.cfg.WipeOnDelete {
+			if err := p.wipe(ctx, meta.LV, wasActive); err != nil {
+				return err
+			}
+		}
 		if err := p.lvRemove(ctx, meta.LV); err != nil {
+			// A wipe activates an inactive volume to have a device to write to
+			// and leaves it that way, because the removal was about to take it.
+			// When the REMOVAL is what failed, that activation is left over
+			// from an operation the operator watched fail — a volume they had
+			// deactivated, now carrying a device node nobody asked for.
+			if p.cfg.WipeOnDelete && !wasActive {
+				cleanupCtx, cancel := cleanupContext(ctx)
+				defer cancel()
+				return errors.Join(err, p.lvDeactivate(cleanupCtx, meta.LV))
+			}
 			return err
 		}
 	}
@@ -1759,6 +1813,73 @@ func (p *Provider) Delete(ctx context.Context, volID string) error {
 	}
 	if err := os.Remove(p.metaPath(meta.Name)); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("removing state for %q: %w", meta.Name, err)
+	}
+	return nil
+}
+
+// wipe zero-fills a backing logical volume so nothing of it survives in the
+// extents LVM returns to the free pool. It runs only with Config.WipeOnDelete
+// set; that field documents what the exposure is and what this does not cover.
+//
+// It goes over the BACKING volume, not /dev/drbd<minor>. The extents that get
+// freed are the logical volume's, so the logical volume is what has to be
+// overwritten — and the DRBD metadata living at the end of that device goes with
+// it, which is correct for something about to be removed. Writing through the
+// DRBD device instead would also replicate every zero to the peer, turning a
+// local cleanup into a full-volume resync of data that is being destroyed.
+//
+// blkdiscard --zeroout uses the device's own zeroing offload where the hardware
+// has one and falls back to writing zeroes where it does not, which is the
+// difference between seconds and hours on a large volume. It is the same
+// mechanism and the same flag pkg/local uses, deliberately: the two providers
+// carve from the same kind of volume group, and an operator comparing them
+// should not find two different answers to one question.
+//
+// ORDERING: this runs after the resource is down and before lvremove, and both
+// halves matter. DRBD holds its backing device open while the resource is up, so
+// a wipe attempted first fails on a busy device rather than quietly doing
+// nothing; and a wipe after the removal has nothing left to address.
+//
+// An INACTIVE backing volume is activated first, because it has no device node
+// to write to otherwise. It is tempting to think that cannot happen — a DRBD
+// backing volume is active whenever the resource has been up, and provisioning
+// brings it up before returning — but Delete deliberately serves states where
+// the resource is already down, and a volume reaches those with no device node
+// after a reboot without autoactivation, after an administrator deactivates it,
+// or from a provisioning run that failed partway. Assuming otherwise turns
+// wipe_on_delete into a PERMANENT block on an otherwise valid deletion: the
+// blkdiscard fails on a missing device, the wipe failure stops the delete by
+// design, and the operator cannot get past it without turning the option off.
+// The fail-closed retention is meant to protect data, not to strand a volume.
+//
+// A borrowed activation is given back on EITHER failure, and this function owns
+// only the first of them. If the wipe fails, it deactivates here. If the wipe
+// succeeds and the lvremove that follows fails, Delete deactivates there — the
+// volume survives that path too, so the activation is just as much a leftover
+// from an operation the operator watched fail. Restoring it matters for the
+// reason it does in pkg/local: a volume they left deactivated must not come back
+// carrying a device node nobody asked for. A volume that was already active is
+// left exactly as it was found, with no lvchange run at all.
+//
+// A failure here stops the delete. The volume and its record stay, which is the
+// honest outcome: the caller asked for the contents to be destroyed before the
+// volume was, and if that did not happen the volume should still be there to try
+// again on. Removing it anyway would hand the extents back holding exactly the
+// data this option exists to keep out of them.
+func (p *Provider) wipe(ctx context.Context, lv string, wasActive bool) error {
+	if !wasActive {
+		if err := p.lvActivate(ctx, lv); err != nil {
+			return err
+		}
+	}
+	if _, err := p.runner.Run(ctx, binBlkdiscard, "--zeroout", p.lvPath(lv)); err != nil {
+		wipeErr := fmt.Errorf("wiping %s before deleting it: %w", p.lvRef(lv), err)
+		if wasActive {
+			return wipeErr
+		}
+		cleanupCtx, cancel := cleanupContext(ctx)
+		defer cancel()
+		return errors.Join(wipeErr, p.lvDeactivate(cleanupCtx, lv))
 	}
 	return nil
 }

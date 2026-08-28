@@ -35,6 +35,7 @@ const (
 	binLVRemove = "lvremove"
 	binLVExtend = "lvextend"
 	binLVS      = "lvs"
+	binLVChange = "lvchange"
 )
 
 // snapSeparator joins a volume name and a snapshot name into one LV name.
@@ -292,6 +293,26 @@ func findLV(lvs []lvEntry, name string) (lvEntry, bool) {
 		}
 	}
 	return lvEntry{}, false
+}
+
+// lvActivate gives a logical volume a device node.
+//
+// --yes answers the confirmation lvchange raises in the cases that prompt; it
+// matches pkg/local's invocation, since both providers are activating the same
+// kind of volume for the same reason.
+func (p *Provider) lvActivate(ctx context.Context, lv string) error {
+	if _, err := p.runner.Run(ctx, binLVChange, "--activate", "y", "--yes", p.lvRef(lv)); err != nil {
+		return fmt.Errorf("activating %s: %w", p.lvRef(lv), err)
+	}
+	return nil
+}
+
+// lvDeactivate withdraws a logical volume's device node.
+func (p *Provider) lvDeactivate(ctx context.Context, lv string) error {
+	if _, err := p.runner.Run(ctx, binLVChange, "--activate", "n", "--yes", p.lvRef(lv)); err != nil {
+		return fmt.Errorf("deactivating %s: %w", p.lvRef(lv), err)
+	}
+	return nil
 }
 
 // lvPath is the device path of a logical volume in the provider's group.

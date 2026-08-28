@@ -238,7 +238,8 @@ func itoa(n int) string {
 func TestAllowedBinariesCoversEveryProgramWeRun(t *testing.T) {
 	for _, bin := range []string{
 		binDRBDAdm, binDRBDSetup, binLVCreate, binLVRemove, binLVExtend, binLVS,
-		binFindmnt, binBlkid, binDD, binResize2fs, binXFSGrowfs, binE2fsck,
+		binFindmnt, binBlkid, binBlkdiscard, binDD, binResize2fs, binXFSGrowfs, binE2fsck,
+		binLVChange,
 	} {
 		if _, ok := allowedBinaries[bin]; !ok {
 			t.Errorf("%q is run by this package but is not in allowedBinaries", bin)

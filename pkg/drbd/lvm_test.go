@@ -164,6 +164,7 @@ const (
 	attrActiveSnapshot   = "swi-a-s---"
 	attrInactiveSnapshot = "swi---s---"
 	attrActiveVolume     = "-wi-a-----"
+	attrInactiveVolume   = "-wi-------"
 )
 
 func TestLVEntryUsedBytes(t *testing.T) {

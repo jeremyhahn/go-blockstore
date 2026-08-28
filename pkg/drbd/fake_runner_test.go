@@ -243,9 +243,20 @@ func newTestProvider(t *testing.T) (*Provider, *fakeRunner) {
 
 func newTestProviderWithMounter(t *testing.T) (*Provider, *fakeRunner, *mount.Fake) {
 	t.Helper()
+	return newTestProviderWith(t, nil)
+}
+
+// newTestProviderWith is the same over settings the caller adjusts first, for
+// the tests that need a non-default option.
+func newTestProviderWith(t *testing.T, tweak func(map[string]string)) (*Provider, *fakeRunner, *mount.Fake) {
+	t.Helper()
 	r := newFakeRunner(t)
 	m := &mount.Fake{}
-	p, err := New(testSettings(t), WithRunner(r), WithMounter(m), WithSecretProvider(testSecretProvider))
+	settings := testSettings(t)
+	if tweak != nil {
+		tweak(settings)
+	}
+	p, err := New(settings, WithRunner(r), WithMounter(m), WithSecretProvider(testSecretProvider))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
