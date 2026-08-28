@@ -26,7 +26,7 @@ import (
 
 // lvFields is the -o column list requested from lvs. The parser below reads
 // exactly these, so the two move together.
-const lvFields = "lv_name,lv_size,lv_attr,origin,lv_time,data_percent,origin_size"
+const lvFields = "lv_name,lv_size,lv_attr,origin,lv_time,data_percent,origin_size,lv_tags"
 
 // lvsReport is the shape of `lvs --reportformat json`. LVM reports every value
 // as a string, including the numeric ones.
@@ -40,6 +40,7 @@ type lvsReport struct {
 			Time        string `json:"lv_time"`
 			DataPercent string `json:"data_percent"`
 			OriginSize  string `json:"origin_size"`
+			Tags        string `json:"lv_tags"`
 		} `json:"lv"`
 	} `json:"report"`
 }
@@ -70,6 +71,12 @@ type lvInfo struct {
 	// volume that is not a snapshot.
 	DataPercent float64
 
+	// Tags are the LVM tags set on the logical volume. This provider sets one,
+	// the header tag described on encryptedTagPrefix; anything else here
+	// belongs to the operator or to other tooling sharing the volume group, and
+	// is read past rather than touched.
+	Tags []string
+
 	// OriginSizeBytes is, on a SNAPSHOT, the size its origin had when the
 	// snapshot was taken — the size of the image the snapshot presents. It is 0
 	// on a volume that is not a snapshot.
@@ -86,6 +93,49 @@ type lvInfo struct {
 // active reports whether the logical volume is active on this host.
 func (l lvInfo) active() bool {
 	return len(l.Attr) >= 5 && l.Attr[4] == 'a'
+}
+
+// luksHeaderTags returns every tag on the volume that records a LUKS header
+// size. There should be at most one; LVM will happily hold several, so the
+// caller decides what to do about it rather than this silently picking.
+func (l lvInfo) luksHeaderTags() []string {
+	var found []string
+	for _, t := range l.Tags {
+		if strings.HasPrefix(t, encryptedTagPrefix) {
+			found = append(found, t)
+		}
+	}
+	return found
+}
+
+// luksHeaderFromTags reads the header size this volume was tagged with.
+//
+// The three answers are distinct on purpose. NOT TAGGED is a volume provisioned
+// before the tag existed, and is a legitimate state with a documented fallback.
+// TAGGED WITH SOMETHING UNREADABLE — a value that is not a positive number, or
+// several disagreeing tags — is not: it means the tag was hand-edited or two
+// writers disagreed, and answering with a number anyway would put a
+// plausible-looking figure where an unreadable one was, which is the one thing
+// this package refuses everywhere it reads a value back from a tool.
+func (l lvInfo) luksHeaderFromTags() (headerBytes int64, tagged bool, err error) {
+	found := l.luksHeaderTags()
+	switch len(found) {
+	case 0:
+		return 0, false, nil
+	case 1:
+		raw := strings.TrimPrefix(found[0], encryptedTagPrefix)
+		size, parseErr := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		if parseErr != nil {
+			return 0, true, fmt.Errorf("tag %q does not record a number", found[0])
+		}
+		if size <= 0 {
+			return 0, true, fmt.Errorf("tag %q records a header of %d bytes", found[0], size)
+		}
+		return size, true, nil
+	default:
+		return 0, true, fmt.Errorf("the volume carries %d disagreeing header tags: %s",
+			len(found), strings.Join(found, ", "))
+	}
 }
 
 // isSnapshot reports whether the logical volume is a snapshot of another.
@@ -114,6 +164,26 @@ var lvTimeLayouts = []string{
 	"2006-01-02 15:04:05 Z0700",
 	"2006-01-02T15:04:05-0700",
 	time.RFC3339,
+}
+
+// parseLVTags splits the lv_tags column, which lvs renders as a comma-separated
+// list and leaves EMPTY for an untagged volume — measured on LVM 2.03.16,
+// including through the JSON report, where the field is the empty string rather
+// than absent or null. Splitting "" yields one EMPTY tag rather than none, which
+// would make a volume with no tags look like a volume with one, so empties are
+// dropped both at the front and inside the loop.
+func parseLVTags(raw string) []string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	var tags []string
+	for _, tag := range strings.Split(trimmed, ",") {
+		if tag = strings.TrimSpace(tag); tag != "" {
+			tags = append(tags, tag)
+		}
+	}
+	return tags
 }
 
 func parseLVTime(s string) time.Time {
@@ -155,12 +225,17 @@ func (p *Provider) listLVs(ctx context.Context) ([]lvInfo, error) {
 
 	var infos []lvInfo
 	for _, r := range report.Report {
-		for _, lv := range r.LV {
+		// Indexed rather than ranged by value: one lvs row is several strings
+		// and copying each one per iteration is what gocritic's rangeValCopy is
+		// about. Nothing below mutates the row.
+		for i := range r.LV {
+			lv := &r.LV[i]
 			info := lvInfo{
 				Name:      lv.Name,
 				Attr:      lv.Attr,
 				Origin:    lv.Origin,
 				CreatedAt: parseLVTime(lv.Time),
+				Tags:      parseLVTags(lv.Tags),
 			}
 
 			size, err := parseLVNumber(lv.Size)
@@ -303,6 +378,40 @@ func maxRoundableBytes(extent int64) int64 {
 	return math.MaxInt64 - (extent - 1)
 }
 
+// maxUsableBytes is the largest USABLE capacity a caller can ask for on a
+// volume carrying overhead bytes of per-volume overhead, given a volume group
+// with this extent size.
+//
+// Both steps that turn a usable capacity into a backing size can overflow: the
+// addition of the overhead, and the rounding up to a whole extent inside
+// roundUpToExtent. This is the bound past which either of them would, so the
+// callers check once against it rather than each guarding half the arithmetic.
+//
+// The subtraction cannot itself go negative: maxRoundableBytes never returns
+// less than the extent size, and the guard below covers the degenerate case of
+// an overhead larger than the whole representable range.
+func maxUsableBytes(extent, overhead int64) int64 {
+	limit := maxRoundableBytes(extent)
+	if overhead >= limit {
+		return 0
+	}
+	return limit - overhead
+}
+
+// usableBytes is the capacity a caller can write to on a backing device of
+// backing bytes carrying overhead bytes of per-volume overhead.
+//
+// It floors at zero rather than going negative. A backing device smaller than
+// its own overhead is not a volume with negative capacity, it is a volume with
+// none — and a negative size reported through VolumeStatus would be read as a
+// number rather than as the nonsense it is.
+func usableBytes(backing, overhead int64) int64 {
+	if backing <= overhead {
+		return 0
+	}
+	return backing - overhead
+}
+
 // roundUpToExtent rounds a byte count up to a whole number of extents, the way
 // lvcreate and lvextend do.
 //
@@ -373,6 +482,58 @@ func (p *Provider) deactivate(ctx context.Context, name string) error {
 //
 // The flag needs LVM 2.03.12 (2021) or newer.
 var autoActivationOff = []string{"--setautoactivation", "n"}
+
+// addTag records a tag on a logical volume.
+//
+// It is idempotent: measured on LVM 2.03.16, adding a tag the volume already
+// carries exits 0 and leaves one copy of it, so a repeated call is a no-op
+// rather than something callers have to guard against.
+func (p *Provider) addTag(ctx context.Context, name, tag string) error {
+	if _, err := p.runner.Run(ctx, nil, "lvchange", "--addtag", tag, p.lvRef(name)); err != nil {
+		return fmt.Errorf("go-blockstore/local: tagging %s with %q: %w", p.lvRef(name), tag, err)
+	}
+	return nil
+}
+
+// deleteHeaderTags removes every header tag from a volume, for the case where
+// the probe says there should not be one at all.
+//
+// --deltag of a tag the volume does not carry exits 0 — measured — so this is
+// idempotent and needs no read-back to confirm what it removed.
+func (p *Provider) deleteHeaderTags(ctx context.Context, name string, tags []string) error {
+	args := make([]string, 0, 2*len(tags)+1)
+	for _, tag := range tags {
+		args = append(args, "--deltag", tag)
+	}
+	args = append(args, p.lvRef(name))
+
+	if _, err := p.runner.Run(ctx, nil, "lvchange", args...); err != nil {
+		return fmt.Errorf("go-blockstore/local: removing %s from %s: %w",
+			strings.Join(tags, ", "), p.lvRef(name), err)
+	}
+	return nil
+}
+
+// retagLUKSHeader makes the volume's recorded header size be exactly want,
+// removing any header tag that says something else.
+//
+// Both halves go to ONE lvchange — measured on LVM 2.03.16, --deltag and
+// --addtag are accepted together and applied in that order — so the volume is
+// never briefly untagged, and never briefly carrying two tags that disagree.
+func (p *Provider) retagLUKSHeader(ctx context.Context, name string, stale []string, want string) error {
+	args := make([]string, 0, 2*len(stale)+3)
+	for _, tag := range stale {
+		if tag != want {
+			args = append(args, "--deltag", tag)
+		}
+	}
+	args = append(args, "--addtag", want, p.lvRef(name))
+
+	if _, err := p.runner.Run(ctx, nil, "lvchange", args...); err != nil {
+		return fmt.Errorf("go-blockstore/local: recording %q on %s: %w", want, p.lvRef(name), err)
+	}
+	return nil
+}
 
 // createLV creates a logical volume of the given size.
 //

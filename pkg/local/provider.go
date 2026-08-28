@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -112,15 +113,13 @@ type Options struct {
 	// entered and hand this provider the result — feeding it in raw uses the
 	// wrong layer for the job, whichever KDF sits here.
 	//
-	// VolumeSpec.SizeBytes sizes the BACKING DEVICE, not the plaintext space on
-	// it. A LUKS2 header and its keyslot area live at the front of the container
-	// — 16 MiB with cryptsetup's defaults — so the mapping Attach hands back is
-	// that much smaller than the volume was asked for, and VolumeStatus.SizeBytes
-	// reports the backing device rather than the usable capacity. Size an
-	// encrypted volume with that overhead in mind. Whether SizeBytes should
-	// instead mean usable capacity is a contract question that reaches every
-	// backend with per-volume metadata, not something this provider should
-	// settle on its own.
+	// VolumeSpec.SizeBytes is USABLE capacity, and encryption does not change
+	// that: the logical volume is created luksHeaderBytes larger than the
+	// request so the plaintext mapping Attach hands back is at least the size
+	// that was asked for. Resize works the same way, and VolumeStatus.SizeBytes
+	// reports the usable figure. An encrypted volume is sized exactly like a
+	// plain one, and the header is this provider's problem rather than the
+	// caller's.
 	Encrypted bool
 
 	// KeyProvider supplies LUKS passphrases. It is required when Encrypted is
@@ -246,6 +245,66 @@ func New(opts Options) (*Provider, error) {
 // NodeID reports the node this provider manages volumes on.
 func (p *Provider) NodeID() common.NodeID { return p.nodeID }
 
+// newVolumeOverhead is what this provider adds on top of a requested capacity
+// when it creates a volume: a LUKS2 header when it is configured to encrypt,
+// nothing when it is not.
+//
+// It applies to volumes this provider is about to CREATE, which is why it reads
+// the configuration rather than the volume. What an existing volume costs is a
+// question about that volume, and volumeOverhead answers it by looking.
+func (p *Provider) newVolumeOverhead() int64 {
+	if p.encrypted {
+		return luksHeaderBytes
+	}
+	return 0
+}
+
+// volumeOverhead reports what an EXISTING volume spends on its own header, so
+// that a usable capacity can be turned into a backing size for it.
+//
+// It probes rather than consulting Options.Encrypted, for the same reason
+// Attach does: encryption is a property of the volume on disk, and a provider
+// configured either way handles volumes that are the other. Where the volume is
+// a LUKS container the figure comes from that container's own header, not from
+// luksHeaderBytes, because a volume restored from an encrypted snapshot carries
+// its source's header and that header need not be one this package wrote.
+//
+// A DETACHED volume has to be activated to be probed at all: an inactive
+// logical volume has no device node, and blkid answers a path that does not
+// exist with the same "nothing here" status it uses for a device with no
+// signature — so probing one without activating it would report every encrypted
+// volume as plain. It is put back as it was found.
+func (p *Provider) volumeOverhead(ctx context.Context, volID string, lv lvInfo) (overhead int64, err error) {
+	if !lv.active() {
+		if activateErr := p.activate(ctx, volID); activateErr != nil {
+			return 0, activateErr
+		}
+		defer func() {
+			err = errors.Join(err, p.deactivate(ctx, volID))
+		}()
+	}
+
+	fsType, probeErr := p.probeFSType(ctx, p.lvPath(volID))
+	if probeErr != nil {
+		return 0, probeErr
+	}
+
+	// Resize holds the lock and has just probed the volume, which makes it the
+	// other place a wrong tag can be put right. It does not NEED the tag — it
+	// sizes from the measured offset below — but a volume that is only ever
+	// resized and never attached would otherwise keep a lying tag forever, and
+	// the contract is that a tag can stay wrong only while the volume is
+	// detached.
+	if tagErr := p.reconcileHeaderTag(ctx, volID, lv, fsType); tagErr != nil {
+		return 0, tagErr
+	}
+
+	if fsType != fsTypeLUKS {
+		return 0, nil
+	}
+	return p.luksDataOffset(ctx, p.lvPath(volID))
+}
+
 // Provision creates a logical volume, optionally wrapping it in a LUKS2
 // container and creating a filesystem on it.
 //
@@ -262,6 +321,17 @@ func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (commo
 	}
 	if spec.SizeBytes <= 0 {
 		return common.Volume{}, fmt.Errorf("%w: SizeBytes must be positive, got %d", common.ErrInvalidArgument, spec.SizeBytes)
+	}
+	// SizeBytes is usable capacity, so the backing device is that plus this
+	// provider's overhead — and the addition has to be representable. A signed
+	// overflow in Go wraps rather than trapping, so without this check a size
+	// near math.MaxInt64 would reach lvcreate as a NEGATIVE byte count. It is
+	// malformed input rather than an unsupported operation: no backend could
+	// serve it, and the caller has to change the number rather than choose
+	// another provider.
+	if limit := math.MaxInt64 - p.newVolumeOverhead(); spec.SizeBytes > limit {
+		return common.Volume{}, fmt.Errorf("%w: SizeBytes %d exceeds the largest usable capacity this provider can back, %d",
+			common.ErrInvalidArgument, spec.SizeBytes, limit)
 	}
 	// Negative is malformed rather than unsupported: VolumeSpec.Replicas
 	// defines 0 and 1 as the non-replicated request and counts upward from
@@ -328,7 +398,9 @@ func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (commo
 		return p.provisionFromSnapshot(ctx, spec, lvs)
 	}
 
-	if err := p.createLV(ctx, spec.Name, spec.SizeBytes); err != nil {
+	// The backing device carries the caller's capacity AND this provider's
+	// header, so it is created larger than the request by exactly the latter.
+	if err := p.createLV(ctx, spec.Name, spec.SizeBytes+p.newVolumeOverhead()); err != nil {
 		return common.Volume{}, err
 	}
 
@@ -353,6 +425,13 @@ func (p *Provider) buildVolume(ctx context.Context, spec common.VolumeSpec) erro
 
 	if p.encrypted {
 		if err := p.luksFormat(ctx, spec.Name, device); err != nil {
+			return err
+		}
+		// Tagged the moment the container exists, and not before. Tagging at
+		// lvcreate would be one command fewer and would leave a window in which
+		// the tag claims an encryption that a failed luksFormat never
+		// delivered.
+		if err := p.addTag(ctx, spec.Name, encryptedTagFor(luksHeaderBytes)); err != nil {
 			return err
 		}
 		if err := p.luksOpen(ctx, spec.Name, device); err != nil {
@@ -415,9 +494,44 @@ func (p *Provider) abandon(ctx context.Context, name string) error {
 // The copy is a full byte-for-byte transfer rather than an LVM snapshot of the
 // snapshot, because a restored volume that stayed dependent on the snapshot
 // would die with it — and the point of restoring is to get something that
-// outlives the snapshot. The consequence worth knowing: restoring an encrypted
-// volume reproduces its LUKS header exactly, so the copy shares the original's
-// master key and UUID, and the same KeyProvider passphrase unlocks both.
+// outlives the snapshot.
+//
+// # What a restore preserves
+//
+// A restore preserves DATA lineage, not header lineage. The restored volume
+// holds the bytes the snapshot held; whether it holds them under the same LUKS
+// header depends on which of the three cases below it is, and the difference is
+// worth knowing because it decides which passphrase opens the result.
+//
+//   - A PLAINTEXT snapshot restored by a provider that does not encrypt is
+//     copied onto the new logical volume directly. Nothing to say about keys.
+//
+//   - A PLAINTEXT snapshot restored by a provider configured to encrypt is
+//     RE-ENCRYPTED on the way in: the new volume is formatted as a LUKS2
+//     container under this provider's own key, and the image is copied through
+//     the plaintext mapping so dm-crypt encrypts it in flight. The restored
+//     volume therefore has a DIFFERENT header from anything the source had —
+//     it had none — and opens with the key KeyProvider returns for the restored
+//     volume's own ID. No plaintext is written to the volume's extents at any
+//     point, and a failure part-way removes the volume rather than leaving one
+//     behind.
+//
+//   - An ENCRYPTED snapshot is ciphertext at the logical-volume level, header
+//     included, and is copied verbatim WITHOUT being reformatted. Reformatting
+//     it would be destructive rather than merely different: a fresh luksFormat
+//     writes a new header with a new master key, and the ciphertext copied over
+//     it was encrypted under the old one, so the result decrypts to nothing and
+//     does so silently. The restored volume consequently shares its source's
+//     header, master key and UUID, and it opens with the SOURCE's passphrase.
+//     Since KeyProvider is called with the volume's own ID, an implementation
+//     holding a distinct key per volume has to answer for the restored volume's
+//     name with the source's key — which is checked before anything is created,
+//     rather than discovered at the first Attach. See
+//     requireRestoredVolumeOpens.
+//
+// spec.SizeBytes is usable capacity in every case, and is compared against the
+// snapshot's USABLE capacity rather than its image size, so that the threshold
+// is in the units the caller asked in.
 func (p *Provider) provisionFromSnapshot(ctx context.Context, spec common.VolumeSpec, lvs []lvInfo) (common.Volume, error) {
 	snapID := string(spec.SourceSnapshotID)
 	snap, ok := lookupLV(lvs, snapID)
@@ -439,45 +553,30 @@ func (p *Provider) provisionFromSnapshot(ctx context.Context, spec common.Volume
 	// tail zeroing 128 MiB past what dd actually copied — leaving exactly the
 	// stale extents that zeroing exists to remove.
 	imageSize := snap.OriginSizeBytes
-	if spec.SizeBytes < imageSize {
-		return common.Volume{}, fmt.Errorf("%w: restoring %q needs at least %d bytes, spec asks for %d and this provider does not shrink during restore",
-			common.ErrUnsupported, snapID, imageSize, spec.SizeBytes)
-	}
 
-	// A restore is a byte copy, so the restored volume is encrypted exactly when
-	// its source was. On a provider configured to encrypt, copying a plaintext
-	// snapshot would hand back a plaintext volume under a configuration whose
-	// whole point is that it does not do that — silently, since nothing else in
-	// the call says otherwise. Refused rather than served.
-	if p.encrypted {
-		if err := p.requireEncryptedSource(ctx, snapID, origin); err != nil {
-			return common.Volume{}, err
-		}
-	}
-
-	if err := p.createLV(ctx, spec.Name, spec.SizeBytes); err != nil {
+	// The extent size is needed to know how far lvcreate will round the request
+	// up, which is where the restored volume actually ends. See
+	// zeroRestoreTail.
+	extent, err := p.extentSize(ctx)
+	if err != nil {
 		return common.Volume{}, err
 	}
 
-	if err := p.copySnapshot(ctx, snapID, origin, spec.Name); err != nil {
+	plan, err := p.planRestore(ctx, spec, snapID, origin, imageSize, extent)
+	if err != nil {
+		return common.Volume{}, err
+	}
+
+	if err := p.createLV(ctx, spec.Name, plan.backing); err != nil {
+		return common.Volume{}, err
+	}
+
+	if err := p.restoreImage(ctx, snapID, origin, spec.Name, plan); err != nil {
 		return common.Volume{}, errors.Join(err, p.abandon(ctx, spec.Name))
 	}
 
-	// Restoring into a volume larger than the snapshot leaves everything past
-	// the copied image holding whatever the volume group's free extents held —
-	// the same stale data a fresh volume would expose, arriving through a path
-	// that looks like it wrote the whole device. dd copies the origin's size and
-	// stops, so the tail is zeroed explicitly.
-	//
-	// An exact-size restore has no tail and is left alone. An origin's size is a
-	// whole number of extents by construction, so asking for exactly that size
-	// yields exactly that volume with nothing past the image — and issuing a
-	// zero-length zeroout there would make the ordinary restore depend on how
-	// the kernel and the device handle an operation at EOF.
-	if spec.SizeBytes > imageSize {
-		if err := p.zeroTail(ctx, spec.Name, imageSize); err != nil {
-			return common.Volume{}, errors.Join(err, p.abandon(ctx, spec.Name))
-		}
+	if err := p.zeroRestoreTail(ctx, spec.Name, plan); err != nil {
+		return common.Volume{}, errors.Join(err, p.abandon(ctx, spec.Name))
 	}
 
 	if err := p.deactivate(ctx, spec.Name); err != nil {
@@ -486,20 +585,110 @@ func (p *Provider) provisionFromSnapshot(ctx context.Context, spec common.Volume
 	return common.Volume{ID: spec.Name, Spec: spec}, nil
 }
 
-// requireEncryptedSource refuses a restore that would produce a plaintext volume
-// on a provider configured to encrypt.
+// restorePlan is how one restore will be carried out, decided before anything
+// is created so that every refusal happens while there is still nothing to
+// clean up.
+type restorePlan struct {
+	// backing is the size of the logical volume to create: the caller's usable
+	// capacity plus whatever header the restored volume will end up carrying.
+	backing int64
+
+	// imageEnd is the offset ON THE LOGICAL VOLUME one byte past the copied
+	// image, which is where tail zeroing starts. It is past the LUKS header on
+	// a re-encrypting restore, because there the image lands inside a container
+	// rather than at the front of the volume.
+	imageEnd int64
+
+	// volumeEnd is where the logical volume will actually end: backing rounded
+	// up to a whole extent, the way lvcreate rounds it. Anything between
+	// imageEnd and here is tail.
+	volumeEnd int64
+
+	// reencrypt copies the image through a freshly formatted LUKS mapping
+	// instead of onto the logical volume directly.
+	reencrypt bool
+
+	// encrypted is whether the RESTORED volume ends up holding a LUKS
+	// container, which is true both when this provider formats one and when the
+	// copied image already was one. It is what decides whether the volume is
+	// tagged, and the two cases become true at different moments — see
+	// restoreImage.
+	encrypted bool
+
+	// overhead is the header the restored volume ends up carrying: this
+	// package's own when it formats the container, and the SOURCE's when the
+	// image is copied verbatim. It is what gets recorded on the volume, which
+	// is the whole reason it is kept rather than folded into backing — the
+	// source's header is measured here and nowhere else afterwards.
+	overhead int64
+}
+
+// planRestore settles the sizing and the encryption route for a restore, and
+// performs every check that can refuse one.
 //
-// The check runs before anything is created, so a refusal leaves no volume
-// behind and — the part that matters — never writes the plaintext to extents it
-// would then have to free. Encrypting during the restore instead would mean
-// re-encrypting the image under this provider's key as it is copied, which gives
-// the restored volume a different LUKS header from the one it was taken from;
-// that is a change in what a restore MEANS, not an implementation detail, so it
-// is a decision for the owner rather than something to slip in here.
-func (p *Provider) requireEncryptedSource(ctx context.Context, snapID string, origin lvInfo) (err error) {
+// Everything it does happens before createLV, which is the property that
+// matters: a refusal leaves no volume behind, and — for the case that motivated
+// it — never writes a plaintext image to extents it would then have to free.
+func (p *Provider) planRestore(ctx context.Context, spec common.VolumeSpec, snapID string, origin lvInfo, imageSize, extent int64) (restorePlan, error) {
+	srcOffset, err := p.inspectSource(ctx, spec.Name, snapID, origin)
+	if err != nil {
+		return restorePlan{}, err
+	}
+
+	// Compared in USABLE bytes on both sides. The image includes the source's
+	// header when it has one, and the caller's request never does, so comparing
+	// the request against the raw image size would demand an extra header's
+	// worth of capacity for an encrypted source and reject restores that fit.
+	srcUsable := usableBytes(imageSize, srcOffset)
+	if spec.SizeBytes < srcUsable {
+		return restorePlan{}, fmt.Errorf("%w: restoring %q needs at least %d bytes of usable capacity, spec asks for %d and this provider does not shrink during restore",
+			common.ErrUnsupported, snapID, srcUsable, spec.SizeBytes)
+	}
+
+	// The overhead the RESTORED volume will carry, and where the image will sit
+	// on it. An encrypted source keeps its own header, so the copy starts at
+	// offset zero and the volume inherits that header's size; a plaintext image
+	// into an encrypting provider goes inside a container this package formats,
+	// so it starts past a header of this package's own size.
+	overhead, imageEnd, reencrypt := int64(0), imageSize, false
+	switch {
+	case srcOffset > 0:
+		overhead = srcOffset
+	case p.encrypted:
+		overhead, imageEnd, reencrypt = luksHeaderBytes, luksHeaderBytes+imageSize, true
+	}
+
+	// Guarded again here, and against the overhead the RESTORE will use:
+	// Provision's guard was against this provider's own, which is not the
+	// source's, and neither guard covered the extent rounding below.
+	if limit := maxUsableBytes(extent, overhead); spec.SizeBytes > limit {
+		return restorePlan{}, fmt.Errorf("%w: SizeBytes %d exceeds the largest usable capacity a restore of %q can hold, %d "+
+			"(this volume group's extents are %d bytes and the restored volume carries %d bytes of header)",
+			common.ErrInvalidArgument, spec.SizeBytes, snapID, limit, extent, overhead)
+	}
+
+	backing := spec.SizeBytes + overhead
+	return restorePlan{
+		backing:   backing,
+		imageEnd:  imageEnd,
+		volumeEnd: roundUpToExtent(backing, extent),
+		reencrypt: reencrypt,
+		encrypted: overhead > 0,
+		overhead:  overhead,
+	}, nil
+}
+
+// inspectSource reports what the snapshot's image holds: the data offset of the
+// LUKS container on it, or zero for plaintext.
+//
+// Reading either answer needs the snapshot activated, and activating a snapshot
+// activates its origin, so the origin's activation is captured and put back
+// around the whole inspection. The key check for an encrypted source rides
+// along inside the same activation rather than taking one of its own.
+func (p *Provider) inspectSource(ctx context.Context, destVolID, snapID string, origin lvInfo) (offset int64, err error) {
 	originWasActive := origin.active()
 	if activateErr := p.activate(ctx, snapID); activateErr != nil {
-		return activateErr
+		return 0, activateErr
 	}
 	defer func() {
 		err = errors.Join(err, p.restoreOriginActivation(ctx, origin.Name, originWasActive))
@@ -507,17 +696,57 @@ func (p *Provider) requireEncryptedSource(ctx context.Context, snapID string, or
 
 	fsType, probeErr := p.probeFSType(ctx, p.lvPath(snapID))
 	if probeErr != nil {
-		return probeErr
+		return 0, probeErr
 	}
-	if fsType == fsTypeLUKS {
-		return nil
+	if fsType != fsTypeLUKS {
+		return 0, nil
 	}
-	return fmt.Errorf("%w: this provider is configured to encrypt, and restoring from %q would copy a plaintext volume; "+
-		"restore with an unencrypted provider, or take the snapshot from an encrypted volume",
-		common.ErrUnsupported, snapID)
+
+	offset, err = p.luksDataOffset(ctx, p.lvPath(snapID))
+	if err != nil {
+		return 0, err
+	}
+	if checkErr := p.requireRestoredVolumeOpens(ctx, destVolID, snapID); checkErr != nil {
+		return 0, checkErr
+	}
+	return offset, nil
 }
 
-// copySnapshot transfers a snapshot's contents onto a new logical volume, with
+// requireRestoredVolumeOpens refuses a restore that would produce an encrypted
+// volume nobody can unlock.
+//
+// An encrypted snapshot is copied verbatim, master key and all, so the restored
+// volume opens with the SOURCE's passphrase and with nothing else. KeyProvider
+// is called with the volume's own ID, though, and an implementation holding a
+// distinct key per volume answers for the restored volume's name with a key
+// that opens nothing. Left unchecked that produces a volume which restores
+// cleanly, reports available, and fails at its first Attach — a silently
+// unreadable volume, which is the one outcome this path must not have.
+//
+// So the key is tested against the SNAPSHOT's header, which is the header the
+// restored volume is about to receive. --test-passphrase verifies it without
+// creating a mapping, so the snapshot is never exposed as a plaintext device to
+// answer the question, and the check runs before createLV, so a refusal costs
+// nothing and copies nothing.
+//
+// The fix, when it fires, is on the caller's side: have KeyProvider return the
+// source volume's passphrase for the restored volume's ID.
+func (p *Provider) requireRestoredVolumeOpens(ctx context.Context, destVolID, snapID string) error {
+	if p.keyProvider == nil {
+		return fmt.Errorf("%w: snapshot %q holds an encrypted volume, and restoring it with no KeyProvider configured "+
+			"would produce a container this provider has no key for; set Options.KeyProvider",
+			common.ErrInvalidArgument, snapID)
+	}
+	if err := p.luksTestPassphrase(ctx, destVolID, p.lvPath(snapID)); err != nil {
+		return fmt.Errorf("%w: restoring %q would give volume %q that snapshot's LUKS header, and the key KeyProvider "+
+			"returns for %q does not open it; a restore preserves the source's master key, so the restored volume "+
+			"needs the SOURCE's passphrase: %w",
+			common.ErrInvalidArgument, snapID, destVolID, destVolID, err)
+	}
+	return nil
+}
+
+// restoreImage transfers a snapshot's contents onto a new logical volume, with
 // both activated for the duration and the origin put back as it was found.
 //
 // LVM activates an origin and its snapshots as a single unit — measured on LVM
@@ -529,7 +758,14 @@ func (p *Provider) requireEncryptedSource(ctx context.Context, snapID string, or
 // using it, mounted filesystem included. So the origin's activation is captured
 // before the copy and restored after it, rather than the snapshot simply being
 // switched off.
-func (p *Provider) copySnapshot(ctx context.Context, snapID string, origin lvInfo, volID string) (err error) {
+//
+// On a RE-ENCRYPTING restore the destination is formatted and unlocked first,
+// and dd writes to the plaintext mapping rather than to the logical volume. The
+// bytes are encrypted by dm-crypt on their way to the disk, so the plaintext
+// exists only in the pipe between the two devices and never lands on an extent
+// — which is what lets a failure here be cleaned up by simply removing the
+// volume, since everything written to it is ciphertext.
+func (p *Provider) restoreImage(ctx context.Context, snapID string, origin lvInfo, volID string, plan restorePlan) (err error) {
 	originWasActive := origin.active()
 
 	if activateErr := p.activate(ctx, snapID); activateErr != nil {
@@ -546,17 +782,79 @@ func (p *Provider) copySnapshot(ctx context.Context, snapID string, origin lvInf
 		return activateErr
 	}
 
-	_, err = p.runner.Run(ctx, nil, "dd",
+	dest := p.lvPath(volID)
+	if plan.reencrypt {
+		if formatErr := p.luksFormat(ctx, volID, p.lvPath(volID)); formatErr != nil {
+			return formatErr
+		}
+		if tagErr := p.addTag(ctx, volID, encryptedTagFor(luksHeaderBytes)); tagErr != nil {
+			return tagErr
+		}
+		if openErr := p.luksOpen(ctx, volID, p.lvPath(volID)); openErr != nil {
+			return openErr
+		}
+		// Registered after the origin's, so it runs first: the mapping is torn
+		// down before anything else moves, and the volume is left the way
+		// Attach expects to find it — locked.
+		defer func() {
+			err = errors.Join(err, p.luksClose(ctx, volID))
+		}()
+		dest = p.cryptPath(volID)
+	}
+
+	if _, runErr := p.runner.Run(ctx, nil, "dd",
 		"if="+p.lvPath(snapID),
-		"of="+p.lvPath(volID),
+		"of="+dest,
 		"bs=4M",
 		"conv=fsync",
 		"status=none",
-	)
-	if err != nil {
-		return fmt.Errorf("go-blockstore/local: copying snapshot %q into %q: %w", snapID, volID, err)
+	); runErr != nil {
+		return fmt.Errorf("go-blockstore/local: copying snapshot %q into %q: %w", snapID, volID, runErr)
+	}
+
+	// A VERBATIM copy of an encrypted image is what makes this volume a
+	// container, so that is the moment it gets tagged — there was no luksFormat
+	// here to hang the tag on, and before the copy landed the claim would have
+	// been false. The re-encrypting path tagged itself earlier, when its own
+	// luksFormat made it true.
+	if plan.encrypted && !plan.reencrypt {
+		return p.addTag(ctx, volID, encryptedTagFor(plan.overhead))
 	}
 	return nil
+}
+
+// zeroRestoreTail clears whatever the restored volume holds past the copied
+// image.
+//
+// Restoring into a volume larger than the snapshot leaves everything past the
+// image holding what the volume group's free extents held — the same stale data
+// a fresh volume would expose, arriving through a path that looks like it wrote
+// the whole device. dd copies the image and stops, so the rest is zeroed
+// explicitly.
+//
+// The comparison is against where the volume will actually END — the request
+// rounded up to a whole extent, the way lvcreate rounds it — and not against
+// the request itself. Those used to be the same number and no longer are: an
+// origin's size is a whole number of extents by construction, so the old
+// "restore into exactly the image size" case really did produce a volume with
+// nothing past the image, but a backing size is now a usable capacity with a
+// header added to it and is extent-aligned only by luck. Deciding from the
+// request would leave that rounding slice — up to one extent of it — holding
+// whatever the previous tenant of those extents wrote, on exactly the restores
+// that look most ordinary.
+//
+// blkdiscard zeroes from the offset to the end of the device, so the slice is
+// covered as soon as the zeroing happens at all; the only thing this decides is
+// whether it happens.
+//
+// A volume with no tail is left alone: issuing a zero-length zeroout at EOF
+// would make the ordinary restore depend on how the kernel and the device
+// handle an operation there.
+func (p *Provider) zeroRestoreTail(ctx context.Context, volID string, plan restorePlan) error {
+	if plan.volumeEnd <= plan.imageEnd {
+		return nil
+	}
+	return p.zeroTail(ctx, volID, plan.imageEnd)
 }
 
 // zeroTail clears everything past offset on a freshly restored volume.
@@ -577,9 +875,11 @@ func (p *Provider) copySnapshot(ctx context.Context, snapID string, origin lvInf
 // meaning into it. The stale-data hazard is the one that was real, and it is on
 // the disk, not in the mapping.
 //
-// The offset is a whole number of LVM extents — it is the origin's size — so it
-// is aligned well past anything blkdiscard requires. The volume is activated for
-// the write and put back afterwards, in the state Provision hands it over in.
+// The offset is an origin's size, optionally past a LUKS header: a whole number
+// of LVM extents, or that plus luksHeaderBytes. Either way it is aligned well
+// past anything blkdiscard requires — the header is a whole number of
+// mebibytes, and blkdiscard asks for sectors. The volume is activated for the
+// write and put back afterwards, in the state Provision hands it over in.
 func (p *Provider) zeroTail(ctx context.Context, volID string, offset int64) (err error) {
 	if activateErr := p.activate(ctx, volID); activateErr != nil {
 		return activateErr
@@ -694,7 +994,7 @@ func (p *Provider) Attach(ctx context.Context, volID string, node common.NodeID)
 		return common.AttachInfo{}, activateErr
 	}
 
-	device, err := p.unlockForAttach(ctx, volID)
+	device, err := p.unlockForAttach(ctx, volID, lv)
 	if err != nil {
 		// A failed Attach leaves nothing behind. Unlocking can fail after
 		// activation succeeded — a wrong key, a cryptsetup that will not run —
@@ -713,11 +1013,25 @@ func (p *Provider) Attach(ctx context.Context, volID string, node common.NodeID)
 
 // unlockForAttach resolves an activated volume to the device a caller can
 // mount, unlocking its LUKS container along the way when it has one.
-func (p *Provider) unlockForAttach(ctx context.Context, volID string) (string, error) {
+//
+// It is also where a volume that predates the header tag acquires one. Attach is
+// the only operation that both HOLDS THE VOLUME'S LOCK and has already proved
+// the volume is a container by probing it, so the repair costs nothing here and
+// has nowhere else to live. A fleet provisioned before the tag existed heals
+// itself one attach at a time rather than needing a migration pass.
+func (p *Provider) unlockForAttach(ctx context.Context, volID string, lv lvInfo) (string, error) {
 	fsType, err := p.probeFSType(ctx, p.lvPath(volID))
 	if err != nil {
 		return "", err
 	}
+
+	// Before the plain-volume shortcut, not after it: a volume that is NOT a
+	// container can still be carrying a header tag that says it is, and this is
+	// the place holding the lock needed to take that back.
+	if recordErr := p.reconcileHeaderTag(ctx, volID, lv, fsType); recordErr != nil {
+		return "", recordErr
+	}
+
 	if fsType != fsTypeLUKS {
 		return p.lvPath(volID), nil
 	}
@@ -734,8 +1048,82 @@ func (p *Provider) unlockForAttach(ctx context.Context, volID string) (string, e
 	return p.cryptPath(volID), nil
 }
 
+// reconcileHeaderTag makes the volume's recorded header agree with what the
+// probe just found. It is the repair, and it runs from the two operations that
+// can perform one: Attach and Resize, both of which hold the volume's lock and
+// have just looked at the volume with a device node in front of them.
+//
+// It settles two different disagreements, and the right answer differs:
+//
+//   - A LUKS CONTAINER gets the measured offset recorded. That covers a volume
+//     provisioned before the tag existed, and one whose tag has drifted from
+//     the container. The number written is read out of the header rather than
+//     assumed, so a repair never invents one.
+//   - ANYTHING ELSE carrying a header tag has that tag REMOVED, because the
+//     probe has just proved it false. Status refuses such a volume while it is
+//     active, which is useful but cannot fix anything; this is where it gets
+//     fixed.
+//
+// A FAILED TAG WRITE IS TOLERATED IN EXACTLY ONE CASE: a LUKS container that
+// had NO header tag to begin with. The volume then stays untagged, which is the
+// legacy state Status documents and falls back for — nothing left behind lies,
+// and the next attempt tries again. That tolerance is what keeps a volume group
+// whose metadata is READ-ONLY usable for a recovery: such a group still
+// ACTIVATES volumes, because activation writes no metadata, so an attach gets
+// this far and only the tag write is refused, and turning that into an outage
+// to record a capacity hint would be the wrong trade.
+//
+// Every other failure is fatal, and the difference is what is left behind. An
+// absent tag claims nothing. A wrong or false one is consulted as authoritative
+// the moment the volume is detached, where there is no probe to catch it, and a
+// stale-smaller offset OVER-states usable capacity. Reporting success would
+// hand the caller a working volume and leave it misdescribed for every reader
+// after them.
+//
+// Reading the header is a different matter and is always fatal: this is reached
+// only after blkid called the volume a LUKS container, so a header that will
+// not read means the container is not in the state the probe said it was.
+func (p *Provider) reconcileHeaderTag(ctx context.Context, volID string, lv lvInfo, fsType string) error {
+	existing := lv.luksHeaderTags()
+
+	if fsType != fsTypeLUKS {
+		if len(existing) == 0 {
+			return nil
+		}
+		return p.deleteHeaderTags(ctx, volID, existing)
+	}
+
+	offset, err := p.luksDataOffset(ctx, p.lvPath(volID))
+	if err != nil {
+		return err
+	}
+
+	want := encryptedTagFor(offset)
+	if len(existing) == 1 && existing[0] == want {
+		return nil
+	}
+
+	retagErr := p.retagLUKSHeader(ctx, volID, existing, want)
+	if retagErr == nil {
+		return nil
+	}
+	if len(existing) == 0 {
+		return nil
+	}
+	return retagErr
+}
+
 // Detach locks the volume's LUKS container, if it has one, and deactivates the
 // logical volume. A volume still mounted cannot be deactivated; unmount first.
+//
+// It also reconciles the volume's recorded header, and this is the transition
+// where that matters most. Detach is the moment a volume enters the state in
+// which the tag is the ONLY source of its capacity, and the last moment the
+// container is readable — so a wrong tag surviving here is not latent, it is
+// load-bearing on the very next Status with no probe left to contradict it. The
+// reconcile therefore happens BEFORE the deactivation, and its failure fails
+// the Detach: leaving the volume active is a better outcome than putting it
+// away misdescribed.
 func (p *Provider) Detach(ctx context.Context, volID string, node common.NodeID) error {
 	if err := validateName("volume", volID); err != nil {
 		return err
@@ -761,7 +1149,15 @@ func (p *Provider) Detach(ctx context.Context, volID string, node common.NodeID)
 		return nil
 	}
 
-	if err := p.closeIfEncrypted(ctx, volID); err != nil {
+	fsType, err := p.probeFSType(ctx, p.lvPath(volID))
+	if err != nil {
+		return err
+	}
+	if err := p.reconcileHeaderTag(ctx, volID, lv, fsType); err != nil {
+		return err
+	}
+
+	if err := p.closeMapping(ctx, volID, fsType); err != nil {
 		return err
 	}
 	return p.deactivate(ctx, volID)
@@ -777,6 +1173,21 @@ func (p *Provider) closeIfEncrypted(ctx context.Context, volID string) error {
 	if err != nil {
 		return err
 	}
+	return p.closeMapping(ctx, volID, fsType)
+}
+
+// closeMapping is closeIfEncrypted for a caller that has already probed, so the
+// volume is not blkid'd twice on a path that needs the answer for something
+// else as well.
+//
+// It is deliberately NOT where the header tag gets reconciled, even though both
+// callers hold the lock and have the probe in hand. Delete reaches this through
+// closeIfEncrypted, and Delete is removing the volume — tag and all. Refusing to
+// destroy something because a piece of bookkeeping about it could not be
+// rewritten would be obstruction: there is no later reader left to mislead.
+// Detach reconciles explicitly instead, because Detach is the transition into
+// the state where the tag starts being believed.
+func (p *Provider) closeMapping(ctx context.Context, volID, fsType string) error {
 	if fsType != fsTypeLUKS {
 		return nil
 	}
@@ -902,10 +1313,17 @@ func (p *Provider) umount(ctx context.Context, target string) error {
 // provider that cannot verify the filesystem was prepared has no business
 // making that call.
 //
+// newSize is USABLE capacity, matching VolumeSpec.SizeBytes: an encrypted
+// volume's logical volume is grown by newSize plus its LUKS header, so the
+// plaintext mapping ends up the size that was asked for. Whether the volume is
+// encrypted is discovered by probing it, which a DETACHED volume has to be
+// activated for — so a resize of one activates it briefly to look, and again to
+// grow its filesystem, leaving it detached either way.
+//
 // LVM allocates in whole extents, so the volume can end up slightly larger than
-// newSize. It is never smaller. The shrink test is made against newSize rounded
-// up the same way, so repeating a request LVM has already rounded is a no-op
-// rather than a rejected shrink.
+// newSize. It is never smaller. The shrink test is made against newSize plus
+// the overhead and rounded up the same way, so repeating a request LVM has
+// already rounded is a no-op rather than a rejected shrink.
 //
 // Resize is written to converge on repetition. It grows the mapping and the
 // filesystem even when the block device is already large enough, because that
@@ -938,20 +1356,33 @@ func (p *Provider) Resize(ctx context.Context, volID string, newSize int64) erro
 	if err != nil {
 		return err
 	}
-	// A size that cannot survive being rounded up is malformed input rather than
-	// an unsupported operation: no backend could serve it, and the caller has to
-	// change the number rather than pick another provider.
-	if limit := maxRoundableBytes(extent); newSize > limit {
-		return fmt.Errorf("%w: newSize %d exceeds the largest size representable after rounding to this volume group's %d-byte extents, %d",
-			common.ErrInvalidArgument, newSize, extent, limit)
+	// newSize is USABLE capacity, so the backing device has to grow by the
+	// volume's own header as well. The overhead is read off the volume rather
+	// than assumed from this provider's configuration, because a provider
+	// handles volumes that were encrypted when it is not and the other way
+	// round.
+	overhead, err := p.volumeOverhead(ctx, volID, lv)
+	if err != nil {
+		return err
 	}
-	target := roundUpToExtent(newSize, extent)
+	// A size that cannot survive having the overhead added and then being
+	// rounded up is malformed input rather than an unsupported operation: no
+	// backend could serve it, and the caller has to change the number rather
+	// than pick another provider.
+	if limit := maxUsableBytes(extent, overhead); newSize > limit {
+		return fmt.Errorf("%w: newSize %d exceeds the largest usable capacity representable on this volume, %d "+
+			"(this volume group's extents are %d bytes and the volume carries %d bytes of header)",
+			common.ErrInvalidArgument, newSize, limit, extent, overhead)
+	}
+	backing := newSize + overhead
+	target := roundUpToExtent(backing, extent)
 	if target < lv.SizeBytes {
-		return fmt.Errorf("%w: shrinking %q from %d to %d bytes", common.ErrUnsupported, volID, lv.SizeBytes, target)
+		return fmt.Errorf("%w: shrinking %q from %d to %d usable bytes", common.ErrUnsupported,
+			volID, usableBytes(lv.SizeBytes, overhead), newSize)
 	}
 
 	if target > lv.SizeBytes {
-		_, err = p.runner.Run(ctx, nil, "lvextend", "--size", strconv.FormatInt(newSize, 10)+"b", p.lvRef(volID))
+		_, err = p.runner.Run(ctx, nil, "lvextend", "--size", strconv.FormatInt(backing, 10)+"b", p.lvRef(volID))
 		if err != nil {
 			return fmt.Errorf("go-blockstore/local: growing %s: %w", p.lvRef(volID), err)
 		}
@@ -1375,7 +1806,7 @@ func (p *Provider) wipe(ctx context.Context, volID string, wasActive bool) error
 	return nil
 }
 
-// Status reports the volume's size and how far along the
+// Status reports the volume's usable capacity and how far along the
 // available/attached/mounted progression it currently is.
 //
 // It takes NO lock, and so reports a moment rather than a guarantee. It changes
@@ -1384,6 +1815,30 @@ func (p *Provider) wipe(ctx context.Context, volID string, wasActive bool) error
 // transition needs is the one the transition itself takes. A caller that needs
 // a volume to still be in the state it just read has to hold something of its
 // own at a higher level; nothing this method could do would provide it.
+//
+// SizeBytes is USABLE capacity, per VolumeStatus.SizeBytes: for an encrypted
+// volume the header is subtracted, and it is subtracted whether the volume is
+// attached or not.
+//
+// Getting that right while holding no lock takes two sources, and they are not
+// equals. While a volume is ACTIVE the header is DISCOVERED — blkid, then the
+// container's own header — which is exact even for a volume restored verbatim
+// from an outside snapshot, whose header this package did not write. A DETACHED
+// volume cannot be probed at all: an inactive logical volume is absent from
+// /dev, and blkid answers a path that does not exist with the same status it
+// uses for a device carrying no signature, so probing one would report every
+// encrypted volume as plain. Activating it to look is not available here —
+// this method holds no lock, and moving a volume while another operation owns
+// it is what the locking exists to prevent. So the fact is REMEMBERED as an LVM
+// tag when it becomes true, and read back from the same lvs listing this method
+// already fetches. See encryptedTagPrefix.
+//
+// Two consequences worth stating. A tag that CONTRADICTS what blkid can see on
+// an active volume is an error rather than a tiebreak, because a tag that lies
+// should not outlive the one moment something could catch it. And a volume
+// provisioned before the tag existed carries none, so while detached it still
+// reports its backing size — the old behavior, now scoped to legacy volumes and
+// self-healing, since its next Attach tags it. reportedSize has the detail.
 func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatus, error) {
 	if err := validateName("volume", volID); err != nil {
 		return common.VolumeStatus{}, err
@@ -1398,16 +1853,22 @@ func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatu
 		return common.VolumeStatus{}, fmt.Errorf("%w: volume %q", common.ErrNotFound, volID)
 	}
 
+	device, fsType, err := p.resolveDevice(ctx, volID, lv)
+	if err != nil {
+		return common.VolumeStatus{}, err
+	}
+
 	status := common.VolumeStatus{
 		ID:        volID,
 		State:     common.VolumeStateAvailable,
 		SizeBytes: lv.SizeBytes,
 	}
-
-	device, err := p.attachedDevice(ctx, volID, lv)
-	if err != nil {
-		return common.VolumeStatus{}, err
+	size, sizeErr := p.reportedSize(ctx, volID, lv, fsType)
+	if sizeErr != nil {
+		return common.VolumeStatus{}, sizeErr
 	}
+	status.SizeBytes = size
+
 	if device == "" {
 		return status, nil
 	}
@@ -1425,6 +1886,240 @@ func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatu
 	return status, nil
 }
 
+// reportedSize is the capacity Status reports, which is usable capacity
+// wherever this provider can establish what the volume's overhead is.
+//
+// There are two sources for that and they are not equals. DISCOVERY — blkid on
+// the logical volume, then the container's own header — is the authority, and
+// it is exact: it reads the header the volume actually has, which matters for a
+// volume restored verbatim from somebody else's snapshot. It needs a device
+// node, so it is available only while the volume is active. The TAG is what
+// makes the answer survive into the state where discovery cannot run at all.
+//
+// So the three cases:
+//
+//   - ACTIVE: discovery decides, and a tag that disagrees with it is an error
+//     rather than a tiebreak. See below.
+//
+//   - DETACHED AND TAGGED: the header size comes off the tag, which recorded
+//     the number that was measured when the volume became a container. It is
+//     therefore exact for a volume carrying a FOREIGN header — one restored
+//     verbatim from an outside snapshot — and not only for containers this
+//     package formatted.
+//
+//     The tag is trusted here BECAUSE it cannot survive being wrong while the
+//     volume is up: an active volume has its tag checked against the container's
+//     real header, and a disagreement is refused rather than outvoted. So a tag
+//     that reaches this branch has either been validated against the header
+//     since it was written, or has never been attachable since — and either way
+//     the next Attach re-records it from the container.
+//
+//     A tag that is present but UNREADABLE — not a number, or several tags
+//     disagreeing — is an error rather than a fallback. It cannot happen by
+//     any path in this package, so it means the tag was hand-edited or two
+//     writers disagreed, and answering with a number anyway would be inventing
+//     one.
+//
+//   - DETACHED AND UNTAGGED: reported as the backing size. This is the legacy
+//     case and nothing else: a volume provisioned before the tag existed, or
+//     one whose repair-on-attach has not happened yet. It is the deviation this
+//     provider used to have for EVERY detached encrypted volume, now scoped to
+//     volumes that predate the tag and self-healing on their next Attach.
+//
+// A tag claiming encryption over a volume blkid can see is NOT encrypted is
+// refused outright, in the same spirit as a device-mapper name found over the
+// wrong backing device: it means the tag was applied to the wrong volume, or
+// somebody rewrote the container out of band, and either way something believes
+// this volume is encrypted when it is not. Reporting a capacity for it would be
+// the smallest of the problems. There is no logger in this package to warn
+// through, and quietly letting discovery win would leave the lie in place for
+// the next reader — including the detached path above, which has no probe to
+// correct it.
+func (p *Provider) reportedSize(ctx context.Context, volID string, lv lvInfo, fsType string) (int64, error) {
+	if !lv.active() {
+		return p.detachedSize(volID, lv)
+	}
+
+	tagged := len(lv.luksHeaderTags()) > 0
+
+	if fsType != fsTypeLUKS {
+		// A tag over a volume the probe says is NOT a container. Before calling
+		// that a contradiction, check it is not simply a volume that moved:
+		// this method holds no lock, and a Detach between the listing and the
+		// probe takes the device node away, which blkid reports with the same
+		// status it uses for a device carrying no signature. Reporting a
+		// tampering error for an ordinary detach would be worse than the bug it
+		// is looking for.
+		if !tagged {
+			return lv.SizeBytes, nil
+		}
+		current, exists, listErr := p.currentLV(ctx, volID)
+		switch {
+		case listErr != nil:
+			return 0, listErr
+		case !exists:
+			return 0, fmt.Errorf("%w: volume %q", common.ErrNotFound, volID)
+		case !current.active():
+			// It was detached underneath us. Answered by the detached path
+			// itself, not by something that resembles it.
+			return p.detachedSize(volID, current)
+		}
+		return 0, fmt.Errorf("go-blockstore/local: %s is tagged %q but carries %s, not a LUKS container; "+
+			"something rewrote it out of band or the tag was applied to the wrong volume. "+
+			"Remove the tag with `lvchange --deltag %s %s` once you have established which",
+			p.lvRef(volID), strings.Join(lv.luksHeaderTags(), ", "), describeFSType(fsType),
+			strings.Join(lv.luksHeaderTags(), " --deltag "), p.lvRef(volID))
+	}
+	return p.usableSize(ctx, volID, lv)
+}
+
+// currentLV re-reads one volume from the volume group, for the paths that have
+// to tell "the world moved underneath a lockless read" from "something is
+// genuinely wrong".
+func (p *Provider) currentLV(ctx context.Context, volID string) (lvInfo, bool, error) {
+	lvs, err := p.listLVs(ctx)
+	if err != nil {
+		return lvInfo{}, false, err
+	}
+	lv, exists := lookupLV(lvs, volID)
+	return lv, exists, nil
+}
+
+// describeFSType renders what blkid found for an error message, giving the
+// no-signature answer a name rather than printing an empty string.
+func describeFSType(fsType string) string {
+	if fsType == "" {
+		return "no filesystem signature"
+	}
+	return fsType
+}
+
+// usableSize reports the usable capacity of a volume that was just found to
+// hold a LUKS container, by reading that container's own header.
+//
+// The complication is that Status holds no lock, so the volume can move between
+// the probe that said "LUKS container" and the read of the header: a concurrent
+// Detach takes the device node away, a concurrent Delete takes the volume
+// itself, and the header read fails either way. Before this, both of those
+// races degraded quietly — blkid and cryptsetup status report a vanished device
+// as "nothing here" rather than as a failure — and turning them into a hard
+// Status error would make the method unreliable in exactly the concurrent use
+// it exists for.
+//
+// So a failed read is not believed on its own. The volume group is consulted
+// again, and the three cases are told apart:
+//
+//   - GONE: the volume was deleted, and ErrNotFound is the accurate answer —
+//     the same one Status would have given had the race resolved a moment
+//     earlier.
+//   - PRESENT BUT INACTIVE: the volume was detached, and the answer is whatever
+//     the DETACHED path gives for it — detachedSize, the same function an
+//     ordinary Status over a detached volume goes through. That is a subtracted
+//     header for a tagged volume, the backing size for an untagged legacy one,
+//     and an error for a tag that cannot be read. This branch used to answer
+//     with the backing size directly, which was right only while the detached
+//     answer was always the backing size, and silently over-stated capacity by
+//     a whole header once the tag arrived.
+//   - STILL ACTIVE: nothing moved, so the header genuinely cannot be read, and
+//     that is reported. Inventing a number here would put a plausible-looking
+//     figure where an unreadable one was, which is the failure mode this
+//     package refuses everywhere it reads a number back from a tool.
+func (p *Provider) usableSize(ctx context.Context, volID string, lv lvInfo) (int64, error) {
+	offset, err := p.luksDataOffset(ctx, p.lvPath(volID))
+	if err == nil {
+		if tagErr := p.requireTagMatchesHeader(volID, lv, offset); tagErr != nil {
+			return 0, tagErr
+		}
+		return usableBytes(lv.SizeBytes, offset), nil
+	}
+
+	lvs, listErr := p.listLVs(ctx)
+	if listErr != nil {
+		return 0, errors.Join(err, listErr)
+	}
+	current, exists := lookupLV(lvs, volID)
+	switch {
+	case !exists:
+		return 0, fmt.Errorf("%w: volume %q", common.ErrNotFound, volID)
+	case !current.active():
+		// Detached underneath the header read. This is the DETACHED case and
+		// gets the detached answer — which consults the tag. Returning the
+		// backing size here is what this function used to do, from before the
+		// tag existed, and it over-stated usable capacity by a whole header on
+		// exactly the volumes the tag was added to describe.
+		return p.detachedSize(volID, current)
+	default:
+		return 0, err
+	}
+}
+
+// requireTagMatchesHeader refuses a recorded header size that disagrees with the
+// header the container actually has.
+//
+// This is the rest of "on an active volume, discovery is the authority". That
+// rule was applied to WHETHER a volume is a container; it has to apply to the
+// header's SIZE too, because the size is the part the tag carries and the part
+// a detached read depends on. A tag recording 16 MiB over a 32 MiB header
+// returns the right number while the volume is up — the value is measured — and
+// then over-states usable capacity by 16 MiB the moment the volume is detached
+// and the stale tag becomes the only source. While the volume is active is the
+// LAST moment anything can catch that, so it is caught rather than outvoted.
+//
+// An UNTAGGED volume is the explicit exception, not an oversight: it is the
+// legacy state, it claims nothing, and there is nothing to disagree with.
+//
+// Nothing is repaired here. Status holds no lock, and rewriting a tag without
+// one races every operation that could be moving the volume. The repair belongs
+// to Attach, which holds the lock and reads the same header — so the error says
+// to attach it.
+func (p *Provider) requireTagMatchesHeader(volID string, lv lvInfo, offset int64) error {
+	header, tagged, err := lv.luksHeaderFromTags()
+	switch {
+	case !tagged:
+		return nil
+	case err != nil:
+		return fmt.Errorf("go-blockstore/local: %s records its LUKS header unreadably: %w; "+
+			"its container really has a %d-byte header. Attach the volume to have it re-recorded",
+			p.lvRef(volID), err, offset)
+	case header != offset:
+		return fmt.Errorf("go-blockstore/local: %s records a %d-byte LUKS header but its container has a "+
+			"%d-byte one; a detached read of this volume would report its capacity wrongly. "+
+			"Attach the volume to have the tag re-recorded from the container",
+			p.lvRef(volID), header, offset)
+	}
+	return nil
+}
+
+// detachedSize is the capacity reported for a volume that is not active, and
+// the ONLY place that decision is made.
+//
+// Three paths arrive at it: an ordinary Status over a detached volume, and two
+// races where a volume was found active and had been detached by the time
+// something looked closer — once before the probe, once before the header read.
+// They are the same question about the same volume and have to give the same
+// answer, so they share this function rather than agreeing by inspection. They
+// did not, once: the header-read race returned the backing size while the
+// ordinary path subtracted the header, which over-stated usable capacity by
+// exactly the amount the tag exists to record.
+//
+// Nothing here can probe. There is no device node on a detached volume and no
+// lock held to make one, so the tag is the only source, and its absence is a
+// legitimate answer rather than a failure — see reportedSize for what each
+// outcome means.
+func (p *Provider) detachedSize(volID string, lv lvInfo) (int64, error) {
+	header, tagged, err := lv.luksHeaderFromTags()
+	switch {
+	case err != nil:
+		return 0, fmt.Errorf("go-blockstore/local: %s records its LUKS header unreadably: %w; "+
+			"attach the volume to have it re-recorded from the container itself",
+			p.lvRef(volID), err)
+	case tagged:
+		return usableBytes(lv.SizeBytes, header), nil
+	default:
+		return lv.SizeBytes, nil
+	}
+}
+
 // attachedDevice resolves the block device a volume is currently reachable at,
 // or "" when it is not attached on this node.
 //
@@ -1434,26 +2129,42 @@ func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatu
 // attached would turn a clear ErrNotAttached from Mount into an obscure mount
 // failure.
 func (p *Provider) attachedDevice(ctx context.Context, volID string, lv lvInfo) (string, error) {
+	device, _, err := p.resolveDevice(ctx, volID, lv)
+	return device, err
+}
+
+// resolveDevice is attachedDevice plus what the logical volume was found to
+// hold, for the one caller that needs both.
+//
+// fsType is what blkid reported for the logical volume, and "" for a volume
+// that was not probed at all because it is inactive — which is a third answer,
+// distinct from "probed and found to carry no signature". Only an active
+// volume has a device node to probe, so the two cases cannot be told apart
+// downstream and are not asked to be: every caller treats a non-crypto_LUKS
+// answer as "not known to be encrypted".
+//
+// Returning it rather than probing twice is what keeps Status to one blkid.
+func (p *Provider) resolveDevice(ctx context.Context, volID string, lv lvInfo) (device, fsType string, err error) {
 	if !lv.active() {
-		return "", nil
+		return "", "", nil
 	}
 
-	fsType, err := p.probeFSType(ctx, p.lvPath(volID))
+	fsType, err = p.probeFSType(ctx, p.lvPath(volID))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if fsType != fsTypeLUKS {
-		return p.lvPath(volID), nil
+		return p.lvPath(volID), fsType, nil
 	}
 
 	open, err := p.luksIsOpen(ctx, volID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if !open {
-		return "", nil
+		return "", fsType, nil
 	}
-	return p.cryptPath(volID), nil
+	return p.cryptPath(volID), fsType, nil
 }
 
 // checkNode accepts this provider's node, or the empty NodeID meaning "here".

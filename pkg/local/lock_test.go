@@ -150,12 +150,15 @@ func TestOverlappingAttachesDoNotStealEachOthersRollback(t *testing.T) {
 	// The first unlock fails and gates there; later ones succeed.
 	var opens int
 	var mu sync.Mutex
-	runner.on("cryptsetup", func(args []string, _ []byte) ([]byte, error) {
+	runner.on("cryptsetup", func(args []string, stdin []byte) ([]byte, error) {
+		// Everything this test does not specifically stage goes to the fake's
+		// own cryptsetup, so the subcommands Attach issues around the unlock —
+		// status, and the header read that records the volume's encryption —
+		// behave the way they do everywhere else. Answering them ad hoc here
+		// silently changed what this test exercises the moment Attach grew
+		// another cryptsetup call.
 		if len(args) == 0 || args[0] != "open" {
-			if len(args) > 0 && args[0] == "status" {
-				return nil, &ExitError{Name: "cryptsetup", Args: args, Code: cryptsetupWrongDevice}
-			}
-			return nil, nil
+			return runner.cryptsetup(args, stdin)
 		}
 		mu.Lock()
 		opens++

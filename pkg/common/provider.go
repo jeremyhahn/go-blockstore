@@ -35,12 +35,21 @@ type VolumeProvider interface {
 	// resulting Volume. It returns ErrAlreadyExists if a volume with the same
 	// identity already exists.
 	//
+	// spec.SizeBytes is USABLE capacity, not the size of the device the
+	// provider allocates to hold it: a provider with per-volume overhead of its
+	// own adds that on top. See VolumeSpec.SizeBytes.
+	//
 	// A non-empty spec.SourceSnapshotID provisions the volume from that
 	// snapshot rather than empty, giving the new volume the snapshot's
 	// contents; it returns ErrSnapshotNotFound if no such snapshot exists. The
 	// rest of the spec still applies — notably spec.SizeBytes, which must be at
-	// least the snapshot's size, since a provider is not required to support
-	// shrinking during restore and returns ErrUnsupported if asked to.
+	// least the snapshot's USABLE size, since a provider is not required to
+	// support shrinking during restore and returns ErrUnsupported if asked to.
+	// Comparing against the snapshot's usable size rather than its image size
+	// is what keeps the restore threshold in the same units as the request: on
+	// a backend with overhead the two differ by exactly that overhead, and a
+	// caller that read a volume's size from Status can hand the same number
+	// back here.
 	Provision(ctx context.Context, spec VolumeSpec) (Volume, error)
 
 	// Attach makes the volume available as a block device on the given node and
@@ -76,10 +85,13 @@ type VolumeProvider interface {
 	// or not the mount ever happened.
 	Unmount(ctx context.Context, volID, target string) error
 
-	// Resize grows the volume to newSize bytes. It returns ErrNotFound if the
-	// volume does not exist. Providers are not required to support shrinking; a
-	// newSize below the current capacity returns ErrUnsupported on a provider
-	// that cannot shrink.
+	// Resize grows the volume to newSize bytes of USABLE capacity, in the same
+	// units VolumeSpec.SizeBytes and VolumeStatus.SizeBytes use — a provider
+	// with per-volume overhead grows the backing device by more than the
+	// difference, so that the caller ends up with the capacity it named. It
+	// returns ErrNotFound if the volume does not exist. Providers are not
+	// required to support shrinking; a newSize below the current capacity
+	// returns ErrUnsupported on a provider that cannot shrink.
 	//
 	// Resize grows the block device, and it grows the filesystem too when the
 	// volume was provisioned with an FSType the provider knows and that

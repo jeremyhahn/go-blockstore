@@ -134,7 +134,23 @@ type VolumeSpec struct {
 	// logical volume or resource.
 	Name string
 
-	// SizeBytes is the requested capacity of the volume in bytes.
+	// SizeBytes is the requested capacity of the volume in bytes, and it means
+	// the capacity THE CALLER CAN USE. A provider that needs room for its own
+	// per-volume structures — a LUKS2 header, DRBD's internal metadata —
+	// allocates that ON TOP, so the backing device it creates is larger than
+	// this number and the space this number describes is all available to the
+	// caller.
+	//
+	// The rule exists because the alternative cannot be written down once. If
+	// SizeBytes sized the backing device instead, every caller would have to
+	// know which backend it had reached and how much that backend skims off
+	// the front or the back — and would get it wrong silently, since a volume
+	// asked for at exactly the size of the data destined for it would come
+	// back too small only when the data arrived. Overhead is the provider's
+	// business, and the provider is the only party that knows it.
+	//
+	// Backends allocating in fixed units round up, so the usable capacity can
+	// exceed this. It is never below it.
 	SizeBytes int64
 
 	// StorageClass names the provider-specific class/tier backing the volume.
@@ -189,7 +205,20 @@ type VolumeStatus struct {
 	// State is the current lifecycle state of the volume.
 	State VolumeState
 
-	// SizeBytes is the current capacity of the volume in bytes.
+	// SizeBytes is the current capacity of the volume in bytes, in the same
+	// units VolumeSpec.SizeBytes is requested in: the capacity the CALLER CAN
+	// USE, with the provider's own overhead already subtracted. It is
+	// comparable against the size the volume was provisioned or resized to, and
+	// is at least that much.
+	//
+	// Reporting the backing device here instead would make Status disagree with
+	// Provision about what one volume's size is — a caller that asked for a
+	// gibibyte would read back a gibibyte plus a header and have no way to tell
+	// that apart from a volume somebody had grown.
+	//
+	// A provider that cannot determine its overhead for a volume in the state
+	// it is currently in documents what it reports instead; see the provider's
+	// own Status doc.
 	SizeBytes int64
 
 	// AttachedNodes lists the nodes the volume is currently attached to.

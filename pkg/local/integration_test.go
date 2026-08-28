@@ -1161,3 +1161,739 @@ func TestIntegrationHostileNamesNeverReachLVM(t *testing.T) {
 		t.Errorf("the volume group holds %v after rejected requests, want nothing", lvs)
 	}
 }
+
+// deviceSizeBytes reads a block device's real size from the kernel, which is
+// the only authority on how much of a container a caller can actually write to.
+func deviceSizeBytes(t *testing.T, device string) int64 {
+	t.Helper()
+	out := strings.TrimSpace(run(t, "blockdev", "--getsize64", device))
+	size, err := strconv.ParseInt(out, 10, 64)
+	if err != nil {
+		t.Fatalf("blockdev --getsize64 %s returned %q: %v", device, out, err)
+	}
+	return size
+}
+
+// TestIntegrationEncryptedVolumeDeliversTheRequestedCapacity is the assertion
+// behind the sizing rule: VolumeSpec.SizeBytes is what the CALLER CAN USE, so
+// the plaintext mapping an encrypted volume attaches as must be at least that
+// large. Before the rule it was a LUKS header SHORT of it, and nothing said so.
+//
+// It also pins the constant the sizing arithmetic is built on. luksHeaderBytes
+// is a measurement — 16 MiB, taken from cryptsetup 2.7.0 with the parameters
+// this provider formats with — and a measurement in a comment rots. Here the
+// same figure is derived from a real container: the logical volume's size less
+// the mapping's, which is by definition what the header cost.
+func TestIntegrationEncryptedVolumeDeliversTheRequestedCapacity(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	p, err := New(Options{
+		VolumeGroup: vg,
+		NodeID:      "test-node",
+		Encrypted:   true,
+		KeyProvider: mustStaticKeyIT(t, "integration-test-passphrase"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const requested = 64 << 20
+	vol, err := p.Provision(ctx, common.VolumeSpec{Name: "sized", SizeBytes: requested, FSType: "ext4"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, vol.ID) })
+
+	info, err := p.Attach(ctx, vol.ID, "test-node")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Detach(ctx, vol.ID, "test-node") })
+
+	// THE assertion. The device the caller was handed is the plaintext mapping,
+	// and it holds at least what was asked for.
+	mapping := deviceSizeBytes(t, info.DevicePath)
+	if mapping < requested {
+		t.Errorf("the plaintext mapping is %d bytes, %d short of the %d that were requested",
+			mapping, requested-mapping, requested)
+	}
+
+	// And the constant the arithmetic used is the overhead that really applied.
+	backing := deviceSizeBytes(t, p.lvPath(vol.ID))
+	if overhead := backing - mapping; overhead != luksHeaderBytes {
+		t.Errorf("this container's header cost %d bytes; luksHeaderBytes says %d. "+
+			"The constant was measured on cryptsetup 2.7.0 with the parameters luksFormat pins; "+
+			"if cryptsetup has changed its layout, re-measure it rather than adjusting this test",
+			overhead, luksHeaderBytes)
+	}
+
+	// Status reports the usable figure, in the units the volume was asked for.
+	status, err := p.Status(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.SizeBytes < requested {
+		t.Errorf("Status.SizeBytes = %d, below the %d requested", status.SizeBytes, requested)
+	}
+	if status.SizeBytes != mapping {
+		t.Errorf("Status.SizeBytes = %d but the mapping is %d; Status is not reporting usable capacity",
+			status.SizeBytes, mapping)
+	}
+
+	// The rule holds across a resize too, which is the other place the
+	// arithmetic lives.
+	const grown = 128 << 20
+	if err := p.Resize(ctx, vol.ID, grown); err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+	if got := deviceSizeBytes(t, info.DevicePath); got < grown {
+		t.Errorf("after Resize the mapping is %d bytes, below the %d requested", got, grown)
+	}
+}
+
+// TestIntegrationReencryptingRestore is ruling #11b end to end: a snapshot of a
+// PLAINTEXT volume restored by a provider configured to encrypt produces an
+// encrypted volume holding the same data.
+//
+// The two assertions that matter pull in opposite directions and are both
+// required. The data has to survive — attach, mount, and the files read back
+// byte-identical — and the plaintext must NOT survive anywhere it could be
+// read: the logical volume is scanned for the marker, and finding it would mean
+// the copy went onto the extents instead of through the mapping, which is the
+// silent downgrade this path exists to avoid.
+func TestIntegrationReencryptingRestore(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	// A plain provider makes the source volume and the snapshot.
+	plain, err := New(Options{VolumeGroup: vg, NodeID: "test-node"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	src, err := plain.Provision(ctx, common.VolumeSpec{Name: "src", SizeBytes: 64 << 20, FSType: "ext4"})
+	if err != nil {
+		t.Fatalf("Provision source: %v", err)
+	}
+	t.Cleanup(func() { _ = plain.Delete(ctx, src.ID) })
+
+	const marker = "restore-me-through-dm-crypt"
+	target := filepath.Join(t.TempDir(), "src")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if _, err := plain.Attach(ctx, src.ID, "test-node"); err != nil {
+		t.Fatalf("Attach source: %v", err)
+	}
+	if err := plain.Mount(ctx, src.ID, target, common.MountOptions{}); err != nil {
+		t.Fatalf("Mount source: %v", err)
+	}
+	payload := bytes.Repeat([]byte(marker+"\n"), 512)
+	if err := os.WriteFile(filepath.Join(target, "payload"), payload, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := plain.Unmount(ctx, src.ID, target); err != nil {
+		t.Fatalf("Unmount source: %v", err)
+	}
+	if err := plain.Detach(ctx, src.ID, "test-node"); err != nil {
+		t.Fatalf("Detach source: %v", err)
+	}
+
+	snapID, err := plain.Snapshot(ctx, src.ID, "nightly")
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	t.Cleanup(func() { _ = plain.DeleteSnapshot(ctx, snapID) })
+
+	// An encrypting provider restores it. Before ruling #11b this returned
+	// ErrUnsupported.
+	enc, err := New(Options{
+		VolumeGroup: vg,
+		NodeID:      "test-node",
+		Encrypted:   true,
+		KeyProvider: mustStaticKeyIT(t, "integration-test-passphrase"),
+	})
+	if err != nil {
+		t.Fatalf("New encrypting: %v", err)
+	}
+
+	restored, err := enc.Provision(ctx, common.VolumeSpec{
+		Name:             "restored",
+		SizeBytes:        64 << 20,
+		SourceSnapshotID: snapID,
+	})
+	if err != nil {
+		t.Fatalf("re-encrypting restore: %v", err)
+	}
+	t.Cleanup(func() { _ = enc.Delete(ctx, restored.ID) })
+
+	info, err := enc.Attach(ctx, restored.ID, "test-node")
+	if err != nil {
+		t.Fatalf("Attach restored: %v", err)
+	}
+	t.Cleanup(func() { _ = enc.Detach(ctx, restored.ID, "test-node") })
+
+	// It really is a container, formatted the way this provider formats them,
+	// and the caller was handed the mapping rather than the raw volume.
+	if fsType, probeErr := enc.probeFSType(ctx, enc.lvPath(restored.ID)); probeErr != nil {
+		t.Fatalf("probeFSType: %v", probeErr)
+	} else if fsType != fsTypeLUKS {
+		t.Fatalf("the restored volume is %q, want a LUKS container", fsType)
+	}
+	assertFIPSHeader(t, enc.lvPath(restored.ID))
+	if info.DevicePath != enc.cryptPath(restored.ID) {
+		t.Errorf("DevicePath = %q, want the plaintext mapping %q", info.DevicePath, enc.cryptPath(restored.ID))
+	}
+
+	// The sizing rule holds here too: usable capacity is what was asked for.
+	if got := deviceSizeBytes(t, info.DevicePath); got < 64<<20 {
+		t.Errorf("the restored mapping is %d bytes, below the %d requested", got, 64<<20)
+	}
+
+	// The data survived, byte for byte.
+	restoredTarget := filepath.Join(t.TempDir(), "restored")
+	if err := os.MkdirAll(restoredTarget, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := enc.Mount(ctx, restored.ID, restoredTarget, common.MountOptions{}); err != nil {
+		t.Fatalf("Mount restored: %v", err)
+	}
+	t.Cleanup(func() { _ = enc.Unmount(ctx, restored.ID, restoredTarget) })
+
+	got, err := os.ReadFile(filepath.Join(restoredTarget, "payload"))
+	if err != nil {
+		t.Fatalf("reading the restored payload: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("the restored payload differs from the source: %d bytes vs %d", len(got), len(payload))
+	}
+
+	// And the plaintext is nowhere on the volume's own extents. This is the
+	// assertion that would catch a copy written to the logical volume instead
+	// of through the mapping — which would pass every check above.
+	if markerPresent(t, enc.lvPath(restored.ID), marker) {
+		t.Error("the source's plaintext is readable on the restored volume's extents; " +
+			"the copy did not go through the dm-crypt mapping")
+	}
+}
+
+// TestIntegrationEncryptedSourceRestorePreservesTheHeader is the other half of
+// ruling #11b. A snapshot of an ENCRYPTED volume is ciphertext at the logical
+// volume level, so it is copied verbatim and the restored volume keeps its
+// source's header — which is checked here by UUID, the one field that would
+// change if the container had been reformatted.
+//
+// Reformatting would be destructive rather than merely different: a fresh
+// header carries a fresh master key, and ciphertext copied over it decrypts to
+// nothing. The mount at the end is what proves that did not happen.
+func TestIntegrationEncryptedSourceRestorePreservesTheHeader(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	p, err := New(Options{
+		VolumeGroup: vg,
+		NodeID:      "test-node",
+		Encrypted:   true,
+		KeyProvider: mustStaticKeyIT(t, "integration-test-passphrase"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	src, err := p.Provision(ctx, common.VolumeSpec{Name: "src", SizeBytes: 64 << 20, FSType: "ext4"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, src.ID) })
+
+	target := filepath.Join(t.TempDir(), "src")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if _, err := p.Attach(ctx, src.ID, "test-node"); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if err := p.Mount(ctx, src.ID, target, common.MountOptions{}); err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	payload := []byte("ciphertext lineage")
+	if err := os.WriteFile(filepath.Join(target, "payload"), payload, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// The source's header identity, read before the copy.
+	srcUUID := strings.TrimSpace(run(t, "cryptsetup", "luksUUID", p.lvPath(src.ID)))
+	if srcUUID == "" {
+		t.Fatal("cryptsetup luksUUID reported nothing for the source")
+	}
+
+	if err := p.Unmount(ctx, src.ID, target); err != nil {
+		t.Fatalf("Unmount: %v", err)
+	}
+	if err := p.Detach(ctx, src.ID, "test-node"); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+
+	snapID, err := p.Snapshot(ctx, src.ID, "nightly")
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	t.Cleanup(func() { _ = p.DeleteSnapshot(ctx, snapID) })
+
+	// Sized at the source's USABLE capacity, which under the sizing rule is
+	// simply the size the source was provisioned at: the header the source
+	// carries is subtracted from its image and added back to the restore, and
+	// the two cancel. That the same number works on both ends is the point of
+	// the rule.
+	restored, err := p.Provision(ctx, common.VolumeSpec{
+		Name:             "restored",
+		SizeBytes:        64 << 20,
+		SourceSnapshotID: snapID,
+	})
+	if err != nil {
+		t.Fatalf("restore from an encrypted snapshot: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, restored.ID) })
+
+	info, err := p.Attach(ctx, restored.ID, "test-node")
+	if err != nil {
+		t.Fatalf("Attach restored: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Detach(ctx, restored.ID, "test-node") })
+
+	// Same header, which is what "copied verbatim" means and what makes the
+	// source's passphrase the one that opens it.
+	restoredUUID := strings.TrimSpace(run(t, "cryptsetup", "luksUUID", p.lvPath(restored.ID)))
+	if restoredUUID != srcUUID {
+		t.Errorf("the restored volume's LUKS UUID is %q, want the source's %q; the container was reformatted",
+			restoredUUID, srcUUID)
+	}
+
+	// And it opens and holds the data, which is the check that a reformat would
+	// have failed.
+	restoredTarget := filepath.Join(t.TempDir(), "restored")
+	if err := os.MkdirAll(restoredTarget, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := p.Mount(ctx, restored.ID, restoredTarget, common.MountOptions{}); err != nil {
+		t.Fatalf("Mount restored: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Unmount(ctx, restored.ID, restoredTarget) })
+
+	got, err := os.ReadFile(filepath.Join(restoredTarget, "payload"))
+	if err != nil {
+		t.Fatalf("reading the restored payload: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("restored payload = %q, want %q", got, payload)
+	}
+	_ = info
+}
+
+// TestIntegrationEncryptedRestoreRefusesAKeyThatWouldNotOpenIt drives the
+// key check against real cryptsetup rather than a fake exit status.
+//
+// The KeyProvider here holds a distinct key per volume, which the interface
+// explicitly allows — and which is exactly what makes a verbatim restore
+// dangerous, since the restored volume opens only with its SOURCE's passphrase.
+// Without the check this restore would succeed and the volume would be
+// unreadable forever.
+func TestIntegrationEncryptedRestoreRefusesAKeyThatWouldNotOpenIt(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	perVolume := func(_ context.Context, volID string) (*enclave.MemoryEnclave, error) {
+		return enclave.NewMemoryEnclave([]byte("passphrase-for-" + volID))
+	}
+
+	p, err := New(Options{
+		VolumeGroup: vg,
+		NodeID:      "test-node",
+		Encrypted:   true,
+		KeyProvider: perVolume,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	src, err := p.Provision(ctx, common.VolumeSpec{Name: "src", SizeBytes: 64 << 20, FSType: "ext4"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, src.ID) })
+
+	snapID, err := p.Snapshot(ctx, src.ID, "nightly")
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	t.Cleanup(func() { _ = p.DeleteSnapshot(ctx, snapID) })
+
+	// "restored" gets a different passphrase from "src", so the copied header
+	// would not open under it.
+	_, err = p.Provision(ctx, common.VolumeSpec{
+		Name:             "restored",
+		SizeBytes:        64 << 20,
+		SourceSnapshotID: snapID,
+	})
+	if !errors.Is(err, common.ErrInvalidArgument) {
+		t.Fatalf("Provision = %v, want ErrInvalidArgument", err)
+	}
+
+	// Refused before anything was created: no unreadable volume was left
+	// behind for an operator to find later.
+	if _, statusErr := p.Status(ctx, "restored"); !errors.Is(statusErr, common.ErrNotFound) {
+		t.Errorf("Status of the refused volume = %v, want ErrNotFound; a volume was left behind", statusErr)
+	}
+}
+
+// lvTags reads the LVM tags on a logical volume straight from lvs.
+func lvTags(t *testing.T, vg, lv string) string {
+	t.Helper()
+	return strings.TrimSpace(run(t, "lvs", "--noheadings", "-o", "lv_tags", vg+"/"+lv))
+}
+
+// TestIntegrationEncryptionIsRememberedAcrossDetach is the ruling that made the
+// tag exist, driven against real LVM.
+//
+// A detached encrypted volume has no device node — there is nothing to probe,
+// and Status holds no lock and will not activate one to look. Before the tag it
+// could only report its backing size, a LUKS header more than its usable
+// capacity. Here the same volume is asked while attached and while detached and
+// has to give the same answer both times.
+func TestIntegrationEncryptionIsRememberedAcrossDetach(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	p, err := New(Options{
+		VolumeGroup: vg,
+		NodeID:      "test-node",
+		Encrypted:   true,
+		KeyProvider: mustStaticKeyIT(t, "integration-test-passphrase"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const requested = 64 << 20
+	vol, err := p.Provision(ctx, common.VolumeSpec{Name: "remembered", SizeBytes: requested, FSType: "ext4"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, vol.ID) })
+
+	// Provision leaves the volume DETACHED, so this is the state the tag exists
+	// for — and it is the very first thing asked of the volume.
+	if tags := lvTags(t, vg, vol.ID); !strings.Contains(tags, encryptedTagPrefix) {
+		t.Fatalf("lv_tags = %q, want it to contain %q", tags, encryptedTagPrefix)
+	}
+
+	detached, err := p.Status(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("Status while detached: %v", err)
+	}
+	if detached.State != common.VolumeStateAvailable {
+		t.Errorf("State = %q, want available", detached.State)
+	}
+	if detached.SizeBytes < requested {
+		t.Errorf("detached Status.SizeBytes = %d, below the %d requested; "+
+			"the tag did not carry the volume's encryption across the detach", detached.SizeBytes, requested)
+	}
+
+	// The same question with the volume up, where discovery answers it instead.
+	info, err := p.Attach(ctx, vol.ID, "test-node")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Detach(ctx, vol.ID, "test-node") })
+
+	attached, err := p.Status(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("Status while attached: %v", err)
+	}
+	if attached.SizeBytes != detached.SizeBytes {
+		t.Errorf("Status reports %d attached and %d detached; the two sources disagree",
+			attached.SizeBytes, detached.SizeBytes)
+	}
+	// And both agree with the device the caller actually got.
+	if mapping := deviceSizeBytes(t, info.DevicePath); attached.SizeBytes != mapping {
+		t.Errorf("Status.SizeBytes = %d but the mapping is %d", attached.SizeBytes, mapping)
+	}
+}
+
+// TestIntegrationLegacyVolumeIsRetaggedOnAttach is the migration path. A volume
+// provisioned before the tag existed carries none; the fleet heals one attach at
+// a time rather than needing a migration pass.
+//
+// The legacy volume is built by provisioning normally and then stripping the
+// tag, which is exactly the on-disk state such a volume is in.
+func TestIntegrationLegacyVolumeIsRetaggedOnAttach(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	p, err := New(Options{
+		VolumeGroup: vg,
+		NodeID:      "test-node",
+		Encrypted:   true,
+		KeyProvider: mustStaticKeyIT(t, "integration-test-passphrase"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const requested = 64 << 20
+	vol, err := p.Provision(ctx, common.VolumeSpec{Name: "legacy", SizeBytes: requested, FSType: "ext4"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, vol.ID) })
+
+	run(t, "lvchange", "--deltag", encryptedTagFor(luksHeaderBytes), vg+"/"+vol.ID)
+	if tags := lvTags(t, vg, vol.ID); strings.Contains(tags, encryptedTagPrefix) {
+		t.Fatalf("the tag survived deltag: %q", tags)
+	}
+
+	// Untagged and detached: the documented legacy fallback. It reports the
+	// BACKING size, which OVER-states usable capacity by exactly one header —
+	// pinned here rather than merely described, because this is the deviation
+	// the ruling scoped down to legacy volumes and it should not drift.
+	legacy, err := p.Status(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	backing := deviceSizeBytesOfLV(t, vg, vol.ID)
+	if legacy.SizeBytes != backing {
+		t.Errorf("untagged legacy volume reports %d, want the backing size %d — "+
+			"the documented fallback for a volume provisioned before the tag existed",
+			legacy.SizeBytes, backing)
+	}
+
+	// One attach repairs it.
+	if _, err := p.Attach(ctx, vol.ID, "test-node"); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if tags := lvTags(t, vg, vol.ID); !strings.Contains(tags, encryptedTagPrefix) {
+		t.Fatalf("after Attach lv_tags = %q, want the repair to have written %q", tags, encryptedTagPrefix)
+	}
+	if err := p.Detach(ctx, vol.ID, "test-node"); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+
+	// And having healed, the detached answer is right.
+	healed, err := p.Status(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("Status after the repair: %v", err)
+	}
+	if healed.SizeBytes < requested {
+		t.Errorf("after the repair the detached Status.SizeBytes = %d, below the %d requested",
+			healed.SizeBytes, requested)
+	}
+	// Specifically: it stopped reporting the backing size and started
+	// subtracting the header.
+	if healed.SizeBytes != backing-luksHeaderBytes {
+		t.Errorf("after the repair Status.SizeBytes = %d, want the backing %d less the %d header",
+			healed.SizeBytes, backing, luksHeaderBytes)
+	}
+}
+
+// deviceSizeBytesOfLV reads a logical volume's size from lvs, which works
+// whether or not the volume is active — unlike blockdev, which needs a device
+// node and so cannot be asked about a detached volume at all.
+func deviceSizeBytesOfLV(t *testing.T, vg, lv string) int64 {
+	t.Helper()
+	out := strings.TrimSpace(run(t, "lvs", "--noheadings", "--units", "b", "--nosuffix", "-o", "lv_size", vg+"/"+lv))
+	size, err := strconv.ParseInt(out, 10, 64)
+	if err != nil {
+		t.Fatalf("lvs lv_size for %s/%s returned %q: %v", vg, lv, out, err)
+	}
+	return size
+}
+
+// TestIntegrationDetachedForeignHeaderReportsCorrectly is Codex's finding driven
+// against real LVM and real cryptsetup: a volume restored VERBATIM from a
+// container whose header is not the size this package formats.
+//
+// The restore measures that header to size the volume, so the tag records the
+// measured number. Recording only "encrypted" and assuming 16 MiB would misstate
+// the detached capacity by the difference — and in the direction that matters,
+// since a header larger than the default makes Status over-state what the volume
+// can hold.
+//
+// The foreign container is made by formatting one with cryptsetup directly, at a
+// deliberately non-default offset, and snapshotting it.
+func TestIntegrationDetachedForeignHeaderReportsCorrectly(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	const passphrase = "integration-test-passphrase"
+	p, err := New(Options{
+		VolumeGroup: vg,
+		NodeID:      "test-node",
+		Encrypted:   true,
+		KeyProvider: mustStaticKeyIT(t, passphrase),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// A container this package did NOT format: same key, but an explicit
+	// 4 MiB payload offset instead of the 16 MiB luksFormat pins.
+	const foreignHeader = 4 << 20
+	run(t, "lvcreate", "--yes", "--name", "foreign", "--size", "64M", "--setautoactivation", "n", vg)
+	t.Cleanup(func() { _ = exec.Command("lvremove", "--force", vg+"/foreign").Run() })
+	run(t, "lvchange", "--activate", "y", "--yes", vg+"/foreign")
+
+	keyFile := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(keyFile, []byte(passphrase), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	run(t, "cryptsetup", "luksFormat", "--type", "luks2", "--batch-mode",
+		"--pbkdf", "pbkdf2", "--hash", "sha512", "--cipher", "aes-xts-plain64",
+		"--key-size", "512", "--offset", strconv.FormatInt(foreignHeader/512, 10),
+		"--key-file", keyFile, "/dev/"+vg+"/foreign")
+
+	// Confirm the premise: this really is a non-default header.
+	offset, err := p.luksDataOffset(ctx, p.lvPath("foreign"))
+	if err != nil {
+		t.Fatalf("luksDataOffset: %v", err)
+	}
+	if offset != foreignHeader {
+		t.Fatalf("the foreign container's data offset is %d, wanted %d for this test to mean anything",
+			offset, foreignHeader)
+	}
+	run(t, "lvchange", "--activate", "n", "--yes", vg+"/foreign")
+
+	snapID, err := p.Snapshot(ctx, "foreign", "nightly")
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	t.Cleanup(func() { _ = p.DeleteSnapshot(ctx, snapID) })
+
+	// Restored verbatim: the volume keeps the foreign header.
+	requested := int64(64<<20) - foreignHeader
+	restored, err := p.Provision(ctx, common.VolumeSpec{
+		Name:             "restored",
+		SizeBytes:        requested,
+		SourceSnapshotID: snapID,
+	})
+	if err != nil {
+		t.Fatalf("verbatim restore: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, restored.ID) })
+
+	// The tag records what was MEASURED, not what this package would format.
+	tags := lvTags(t, vg, restored.ID)
+	if !strings.Contains(tags, encryptedTagFor(foreignHeader)) {
+		t.Fatalf("lv_tags = %q, want it to record the source's %d-byte header", tags, foreignHeader)
+	}
+
+	// And detached Status uses it. Assuming the default here would report
+	// 12 MiB MORE than the volume can hold.
+	detached, err := p.Status(ctx, restored.ID)
+	if err != nil {
+		t.Fatalf("Status while detached: %v", err)
+	}
+	if detached.SizeBytes < requested {
+		t.Errorf("detached Status.SizeBytes = %d, below the %d requested", detached.SizeBytes, requested)
+	}
+
+	// The authority agrees: attach it and compare against the real mapping.
+	info, err := p.Attach(ctx, restored.ID, "test-node")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Detach(ctx, restored.ID, "test-node") })
+
+	mapping := deviceSizeBytes(t, info.DevicePath)
+	if detached.SizeBytes != mapping {
+		t.Errorf("detached Status said %d; the mapping is really %d, a %d-byte error — "+
+			"the recorded header size was not used", detached.SizeBytes, mapping, detached.SizeBytes-mapping)
+	}
+}
+
+// TestIntegrationWrongTagIsRefusedThenRepaired drives the whole tag-authority
+// loop against real LVM and real cryptsetup: a tag that disagrees with the
+// container is refused while the volume is up, and an Attach — the one
+// operation holding the lock — re-records it from the header and clears the
+// refusal.
+//
+// The wrong tag is produced the way a real one would go stale: by editing it out
+// of band with lvchange, which is exactly the situation the check exists for.
+func TestIntegrationWrongTagIsRefusedThenRepaired(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	p, err := New(Options{
+		VolumeGroup: vg,
+		NodeID:      "test-node",
+		Encrypted:   true,
+		KeyProvider: mustStaticKeyIT(t, "integration-test-passphrase"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const requested = 64 << 20
+	vol, err := p.Provision(ctx, common.VolumeSpec{Name: "drifted", SizeBytes: requested, FSType: "ext4"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, vol.ID) })
+
+	// Baseline: the volume was tagged correctly at provision, and reports
+	// usable capacity while detached.
+	before, err := p.Status(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if before.SizeBytes < requested {
+		t.Fatalf("baseline detached Status.SizeBytes = %d, below the %d requested", before.SizeBytes, requested)
+	}
+
+	// Drift the tag out of band, to a header size the container does not have.
+	run(t, "lvchange", "--deltag", encryptedTagFor(luksHeaderBytes),
+		"--addtag", encryptedTagFor(4<<20), vg+"/"+vol.ID)
+	if tags := lvTags(t, vg, vol.ID); !strings.Contains(tags, encryptedTagFor(4<<20)) {
+		t.Fatalf("lv_tags = %q, want the drifted tag in place for this test to mean anything", tags)
+	}
+
+	// DETACHED, the lie is believed — there is no probe, and this is exactly
+	// why a wrong tag must not be allowed to survive an attach.
+	drifted, err := p.Status(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("Status while detached with a drifted tag: %v", err)
+	}
+	if drifted.SizeBytes == before.SizeBytes {
+		t.Errorf("the drifted tag changed nothing (%d); the fixture did not take", drifted.SizeBytes)
+	}
+
+	// ACTIVE, it is refused: the container's real header contradicts the tag,
+	// and this is the last moment anything can see that.
+	run(t, "lvchange", "--activate", "y", "--yes", vg+"/"+vol.ID)
+	if _, err := p.Status(ctx, vol.ID); err == nil {
+		t.Error("Status accepted a tag that disagrees with the container's own header")
+	} else if !strings.Contains(err.Error(), "Attach the volume") {
+		t.Errorf("error %q does not point at the repair", err)
+	}
+	run(t, "lvchange", "--activate", "n", "--yes", vg+"/"+vol.ID)
+
+	// Attach repairs it, from the header rather than from an assumption.
+	if _, err := p.Attach(ctx, vol.ID, "test-node"); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if tags := lvTags(t, vg, vol.ID); !strings.Contains(tags, encryptedTagFor(luksHeaderBytes)) {
+		t.Fatalf("after Attach lv_tags = %q, want the tag re-recorded from the container", tags)
+	}
+	if err := p.Detach(ctx, vol.ID, "test-node"); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+
+	// And the refusal is gone, with the detached answer back to the truth.
+	healed, err := p.Status(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("Status after the repair: %v", err)
+	}
+	if healed.SizeBytes != before.SizeBytes {
+		t.Errorf("after the repair Status.SizeBytes = %d, want the original %d", healed.SizeBytes, before.SizeBytes)
+	}
+}

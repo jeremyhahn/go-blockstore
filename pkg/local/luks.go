@@ -15,10 +15,12 @@ package local
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/jeremyhahn/go-enclave"
@@ -60,6 +62,72 @@ const (
 	// than a consequence of a default that has moved before.
 	luksKeySize = "512"
 )
+
+// luksHeaderBytes is the space a LUKS2 container this provider formats reserves
+// in front of the caller's data: 16 MiB, of which two 16 KiB metadata copies
+// and a 16744448-byte keyslots area account for every byte.
+//
+// It is a constant rather than something read back per volume because the
+// provider PINS every parameter that determines it — see luksFormat — so the
+// figure is a property of this package and not of whichever cryptsetup the host
+// happens to ship. It is measured rather than taken from folklore. On
+// cryptsetup 2.7.0 (measured 2026-08-27 on a loopback volume group),
+// formatting with exactly those parameters at 32 MiB, 64 MiB, 128 MiB, 300 MiB
+// and 1200 MiB put the data segment at offset 16777216 every time, and the
+// plaintext mapping came back exactly that much smaller than the logical volume
+// under it. It does not scale with the device.
+//
+// Where cryptsetup DOES depart from it is a device too small to hold a header
+// and any data at all: at 16 MiB and below it shrinks the keyslots area to fit
+// the device and the container ends up with zero usable bytes, so cryptsetup
+// open fails. Sizing here always adds this figure to a capacity that is already
+// positive, so no backing device this provider creates lands in that range.
+//
+// It sizes containers this provider CREATES. What an existing container's
+// header actually costs is read from that header — see luksDataOffset — because
+// a volume restored from a snapshot carries whatever header its source had.
+const luksHeaderBytes = 16 << 20
+
+// encryptedTagPrefix names the LVM tag this provider sets on a volume once it
+// holds a LUKS container, and the tag CARRIES THE HEADER'S SIZE rather than
+// just the fact that there is one: "blockstore.luks-header=16777216".
+//
+// It exists for one question: what is a DETACHED volume's usable capacity?
+// Answering it means knowing what the volume's header costs, and an inactive
+// logical volume has no device node to read one from — measured, blkid answers
+// a path that does not exist with the same "nothing here" status it uses for a
+// device carrying no signature, so probing one reports every encrypted volume
+// as plain. Status holds no lock and must not activate a volume to look.
+//
+// The SIZE is in the tag, and not merely a boolean, because the size is known
+// at every point one is written and is not recoverable later. A volume restored
+// verbatim from an outside snapshot carries THAT snapshot's header, which need
+// not be the 16 MiB this package formats — the restore measured it to size the
+// volume, so recording only "encrypted" would throw away a number already in
+// hand and leave Status subtracting the wrong one. That error does not stay
+// small or stay safe: against a 32 MiB header it OVER-states usable capacity by
+// 16 MiB, and a caller sizing data to the answer would overrun the volume.
+//
+// The name is dot-namespaced and spelled out. A volume group is a shared place
+// — the same reasoning that makes this provider check a device-mapper name's
+// backing device rather than trust the name — so the tag has to be one no
+// operator or neighboring tool would pick by accident, and it has to mean
+// something to a human reading `lvs -o lv_tags` on a group they did not set up.
+// Measured on LVM 2.03.16: every character here is in the set LVM accepts, "="
+// included; the tag round-trips through the JSON report verbatim; --addtag and
+// --deltag are both idempotent; and --deltag and --addtag can be given to one
+// lvchange, which is what lets the value be corrected atomically.
+//
+// Tags are NOT inherited by snapshots — measured: a snapshot of a tagged origin
+// comes back with no tags at all — so nothing here decides anything about a
+// snapshot. A restore reads the source's header off the snapshot device
+// instead, which it has activated anyway.
+const encryptedTagPrefix = "blockstore.luks-header="
+
+// encryptedTagFor renders the tag recording a container's header size.
+func encryptedTagFor(headerBytes int64) string {
+	return encryptedTagPrefix + strconv.FormatInt(headerBytes, 10)
+}
 
 // mappingPrefix namespaces this provider's device-mapper names so an unlocked
 // volume is recognizable on a host that also runs other cryptsetup consumers.
@@ -344,6 +412,84 @@ func (p *Provider) luksResize(ctx context.Context, volID string) error {
 		return fmt.Errorf("go-blockstore/local: resizing %s: %w", p.mappingName(volID), err)
 	}
 	return nil
+}
+
+// luksTestPassphrase checks that the key this provider holds for volID opens
+// the container on device, WITHOUT unlocking it.
+//
+// --test-passphrase is what makes that possible: measured on cryptsetup 2.7.0,
+// it verifies the passphrase against the keyslots and creates no device-mapper
+// mapping at all — exit 0 for a key that opens the container, 2 for one that
+// does not, 1 for a device that is not a LUKS container. So a restore can
+// establish that the volume it is about to produce will be openable before it
+// creates anything, rather than after it has copied the image.
+func (p *Provider) luksTestPassphrase(ctx context.Context, volID, device string) error {
+	return p.runWithKey(ctx, volID, "cryptsetup", "open",
+		"--test-passphrase",
+		"--type", "luks2",
+		"--key-file", "-",
+		device,
+	)
+}
+
+// luksSegments is the shape of `cryptsetup luksDump --dump-json-metadata`, cut
+// down to the one thing this provider reads. LUKS2 renders the offset as a
+// decimal STRING, not a JSON number.
+type luksSegments struct {
+	Segments map[string]struct {
+		Offset string `json:"offset"`
+	} `json:"segments"`
+}
+
+// luksDataOffset reports where a container's data starts — the space its header
+// occupies, and so the difference between the logical volume's size and the
+// usable capacity of the mapping over it.
+//
+// It is read from the header rather than assumed to be luksHeaderBytes because
+// not every container this provider handles was formatted by this provider. A
+// volume restored from an encrypted snapshot carries its SOURCE's header
+// verbatim, and that source may have been made by an older version of this
+// package or by an operator's own cryptsetup with different parameters.
+// Assuming the constant there would misreport such a volume's capacity by
+// however much the two headers differ.
+//
+// No passphrase is involved: measured on cryptsetup 2.7.0, luksDump reads the
+// unencrypted metadata and exits 0 without one. The device has to be active —
+// an inactive logical volume has no device node at all.
+//
+// A container with anything other than exactly one data segment is refused
+// rather than guessed at. More than one means a reencryption is in progress,
+// and picking a segment out of that state would produce a capacity that is true
+// of neither the old layout nor the new one.
+func (p *Provider) luksDataOffset(ctx context.Context, device string) (int64, error) {
+	out, err := p.runner.Run(ctx, nil, "cryptsetup", "luksDump", "--dump-json-metadata", device)
+	if err != nil {
+		return 0, fmt.Errorf("go-blockstore/local: reading the LUKS header on %s: %w", device, err)
+	}
+
+	var meta luksSegments
+	if err := json.Unmarshal(out, &meta); err != nil {
+		return 0, fmt.Errorf("go-blockstore/local: parsing the LUKS header on %s: %w", device, err)
+	}
+	if len(meta.Segments) != 1 {
+		return 0, fmt.Errorf("go-blockstore/local: the LUKS header on %s reports %d data segments, not one; "+
+			"a container mid-reencryption has no single usable capacity", device, len(meta.Segments))
+	}
+
+	for _, segment := range meta.Segments {
+		offset, parseErr := strconv.ParseInt(strings.TrimSpace(segment.Offset), 10, 64)
+		if parseErr != nil {
+			return 0, fmt.Errorf("go-blockstore/local: the LUKS header on %s reports data offset %q: not a number",
+				device, segment.Offset)
+		}
+		if offset <= 0 {
+			return 0, fmt.Errorf("go-blockstore/local: the LUKS header on %s reports data offset %d, which leaves no room for a header",
+				device, offset)
+		}
+		return offset, nil
+	}
+	// Unreachable: the length was checked above.
+	return 0, fmt.Errorf("go-blockstore/local: the LUKS header on %s reports no data segment", device)
 }
 
 // cryptsetupWrongDevice is the status cryptsetup returns from `status` when the

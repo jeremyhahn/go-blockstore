@@ -230,9 +230,16 @@ type resourceMeta struct {
 	// VG is the volume group the backing LV was carved from.
 	VG string `json:"vg"`
 
-	// SizeBytes is the capacity the volume was provisioned or resized to, as
-	// requested. LVM rounds allocation up to the volume group's extent size, so
-	// the device can be larger; Status reports the device's real size.
+	// SizeBytes is the USABLE capacity the volume was provisioned or resized to
+	// — common.VolumeSpec.SizeBytes as the caller gave it, in the units that
+	// field defines. It is NOT the size of the backing logical volume, which is
+	// larger by DRBD's internal metadata (backingBytes) and larger again by
+	// LVM's rounding up to the volume group's extent size.
+	//
+	// Every comparison against this field is therefore in usable bytes and
+	// every comparison against an lv_size is in backing bytes; the two are
+	// converted through backingBytes and never mixed. Status reports the DRBD
+	// device's real size, which is also a usable figure.
 	SizeBytes int64 `json:"size_bytes"`
 
 	// FSType is the filesystem recorded for the volume, or empty for a raw
@@ -543,10 +550,17 @@ const (
 // metadataBytes is the space DRBD 9 reserves for internal metadata on a backing
 // device holding dataBytes of usable data.
 //
-// "meta-disk internal" puts the metadata at the END of the backing device, so a
-// backing volume created at exactly the requested size would export a DRBD
-// device smaller than the caller asked for. Provision therefore adds this on
-// top, and the caller gets the capacity in the spec.
+// It is this backend's half of the contract on common.VolumeSpec.SizeBytes:
+// that field is the capacity the CALLER CAN USE, and a provider with per-volume
+// overhead of its own allocates that overhead ON TOP rather than taking it out
+// of what was asked for. "meta-disk internal" puts the metadata at the END of
+// the backing device, so a backing volume created at exactly the requested size
+// would export a DRBD device smaller than the caller asked for. Provision
+// therefore adds this on top, and the caller gets the capacity in the spec.
+//
+// pkg/local implements the same contract against a LUKS2 header; see
+// luksHeaderBytes there. The two backends differ in what the overhead IS and
+// agree on which side of the request it falls.
 //
 // The size follows DRBD's own formula, in sectors:
 //
@@ -566,7 +580,9 @@ func metadataBytes(dataBytes int64) int64 {
 }
 
 // backingBytes is the backing volume size that yields dataBytes of usable DRBD
-// capacity.
+// capacity — the conversion from the units common.VolumeSpec.SizeBytes is in to
+// the units an lv_size is in. Every size comparison in this package goes
+// through it rather than mixing the two.
 func backingBytes(dataBytes int64) int64 {
 	return dataBytes + metadataBytes(dataBytes)
 }

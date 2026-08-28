@@ -51,6 +51,29 @@ type fakeRunner struct {
 	calls    []fakeCall
 	handlers map[string]responder
 
+	// What blkid reports for a device, shared with the cryptsetup fake so the
+	// two cannot contradict each other: a device blkid calls a LUKS container
+	// is one cryptsetup will dump a header for, which is how a real host
+	// behaves and what stops a test from describing an impossible one.
+	blkidTypes map[string]string
+
+	// The device-mapper names cryptsetup reports as open, each against the
+	// device it is open over.
+	luksBacking map[string]string
+
+	// Data offsets for containers whose header is NOT the one this provider
+	// formats — a volume restored from somebody else's snapshot. A container
+	// absent from here dumps luksHeaderBytes.
+	luksOffsets map[string]int64
+
+	// Devices whose container this provider's key does NOT open, which is what
+	// `open --test-passphrase` is asked about.
+	luksWrongKey map[string]bool
+
+	// Devices whose luksDump fails, which is what a device node that has gone
+	// away underneath a lockless read looks like.
+	luksDumpFails map[string]bool
+
 	// The same fake serves as the Mounter, so a test holds one object and can
 	// assert on the exec'd commands and the mounts together. That half is the
 	// shared recorder from internal/mount, embedded rather than reimplemented,
@@ -77,7 +100,16 @@ func (f *fakeRunner) failUnmount(err error) *fakeRunner {
 }
 
 func newFakeRunner() *fakeRunner {
-	f := &fakeRunner{handlers: map[string]responder{}, Fake: &mount.Fake{}}
+	f := &fakeRunner{
+		handlers:      map[string]responder{},
+		Fake:          &mount.Fake{},
+		blkidTypes:    map[string]string{},
+		luksBacking:   map[string]string{},
+		luksOffsets:   map[string]int64{},
+		luksWrongKey:  map[string]bool{},
+		luksDumpFails: map[string]bool{},
+	}
+	f.handlers["cryptsetup"] = f.cryptsetup
 
 	// An empty volume group, so a provider with no fixtures sees no volumes
 	// rather than a parse failure.
@@ -189,9 +221,18 @@ func (f *fakeRunner) withExtentSize(bytes int64) *fakeRunner {
 // withBlkid maps a device path to the TYPE blkid reports for it. A device
 // absent from the map gets the exit status blkid uses for "no signature here".
 func (f *fakeRunner) withBlkid(types map[string]string) *fakeRunner {
+	f.mu.Lock()
+	f.blkidTypes = map[string]string{}
+	for device, fsType := range types {
+		f.blkidTypes[device] = fsType
+	}
+	f.mu.Unlock()
+
 	return f.on("blkid", func(args []string, _ []byte) ([]byte, error) {
 		device := args[len(args)-1]
-		fsType, ok := types[device]
+		f.mu.Lock()
+		fsType, ok := f.blkidTypes[device]
+		f.mu.Unlock()
 		if !ok {
 			return nil, &ExitError{Name: "blkid", Args: args, Code: blkidNoSignature}
 		}
@@ -214,23 +255,165 @@ func (f *fakeRunner) withOpenMappings(names ...string) *fakeRunner {
 // the case that matters: a mapping under this provider's deterministic name
 // that belongs to something else.
 func (f *fakeRunner) withMappingsBackedBy(backing map[string]string) *fakeRunner {
-	return f.on("cryptsetup", func(args []string, _ []byte) ([]byte, error) {
-		if len(args) == 0 || args[0] != "status" {
-			return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.luksBacking = map[string]string{}
+	for name, device := range backing {
+		f.luksBacking[name] = device
+	}
+	return f
+}
+
+// withLUKSHeader makes cryptsetup dump a data offset other than the one this
+// provider formats with, which is what a container restored from an outside
+// snapshot has.
+func (f *fakeRunner) withLUKSHeader(device string, offset int64) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.luksOffsets[device] = offset
+	return f
+}
+
+// withLUKSDumpFailure makes `cryptsetup luksDump` fail for a device, which is
+// how a device node that vanished under a lockless read behaves.
+func (f *fakeRunner) withLUKSDumpFailure(device string) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.luksDumpFails[device] = true
+	return f
+}
+
+// withLVsThen makes lvs report one set of logical volumes on its first call and
+// another on every call after it, so a test can express the world changing
+// underneath an operation that reads it twice.
+func (f *fakeRunner) withLVsThen(first, rest []lvFixture) *fakeRunner {
+	firstOut, restOut := lvsJSON(first...), lvsJSON(rest...)
+	var calls int
+	var mu sync.Mutex
+	return f.on("lvs", func([]string, []byte) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls == 1 {
+			return firstOut, nil
 		}
-		name := args[len(args)-1]
-		device, ok := backing[name]
+		return restOut, nil
+	})
+}
+
+// withWrongKeyFor makes `cryptsetup open --test-passphrase` refuse these
+// devices, modeling a KeyProvider whose key does not open that container.
+func (f *fakeRunner) withWrongKeyFor(devices ...string) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, device := range devices {
+		f.luksWrongKey[device] = true
+	}
+	return f
+}
+
+// cryptsetupNoKey and cryptsetupNotLUKS are the statuses cryptsetup 2.7.0 was
+// measured to exit with from `open --test-passphrase`: 2 for a passphrase that
+// opens no keyslot, 1 for a device that is not a LUKS container at all.
+const (
+	cryptsetupNoKey   = 2
+	cryptsetupNotLUKS = 1
+)
+
+// cryptsetup answers the subcommands the provider issues, from the fake's own
+// state rather than from a per-test closure.
+//
+// One handler for all of them, because the provider issues several against one
+// volume and a test usually cares about more than one: a Status over an
+// encrypted volume asks for a mapping's status AND dumps its header, so a fake
+// where installing an answer for either replaced the other could not describe
+// that volume at all.
+//
+// Whether a device HAS a header is not tracked separately — it is whatever
+// blkid was told to report for the device. A container cryptsetup dumps but
+// blkid calls ext4 is not a host any test should be able to describe.
+func (f *fakeRunner) cryptsetup(args []string, _ []byte) ([]byte, error) {
+	if len(args) == 0 {
+		return nil, nil
+	}
+	// The trailing argument: a mapping NAME for status, a device PATH for the
+	// header operations.
+	target := args[len(args)-1]
+
+	switch {
+	case args[0] == "status":
+		f.mu.Lock()
+		backing, ok := f.luksBacking[target]
+		f.mu.Unlock()
 		if !ok {
 			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: cryptsetupWrongDevice}
 		}
 		// The shape cryptsetup 2.7.0 actually prints.
-		return []byte("/dev/mapper/" + name + " is active.\n" +
+		return []byte("/dev/mapper/" + target + " is active.\n" +
 			"  type:    LUKS2\n" +
 			"  cipher:  aes-xts-plain64\n" +
 			"  keysize: 512 bits\n" +
-			"  device:  " + device + "\n" +
+			"  device:  " + backing + "\n" +
 			"  mode:    read/write\n"), nil
-	})
+
+	case args[0] == "luksDump":
+		f.mu.Lock()
+		gone := f.luksDumpFails[target]
+		f.mu.Unlock()
+		if gone {
+			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: cryptsetupNotLUKS,
+				Stderr: "Device " + target + " does not exist or access denied."}
+		}
+		offset, ok := f.luksHeaderOf(target)
+		if !ok {
+			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: cryptsetupNotLUKS,
+				Stderr: "Device " + target + " is not a valid LUKS device."}
+		}
+		return luksMetadataJSON(offset), nil
+
+	case args[0] == "open" && contains(args, "--test-passphrase"):
+		if _, ok := f.luksHeaderOf(target); !ok {
+			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: cryptsetupNotLUKS,
+				Stderr: "Device " + target + " is not a valid LUKS device."}
+		}
+		f.mu.Lock()
+		wrong := f.luksWrongKey[target]
+		f.mu.Unlock()
+		if wrong {
+			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: cryptsetupNoKey,
+				Stderr: "No key available with this passphrase."}
+		}
+		return nil, nil
+	}
+	return nil, nil
+}
+
+// luksHeaderOf reports the data offset of the container on a device, and
+// whether it has one at all — which it does exactly when blkid calls it a LUKS
+// container. Absent an explicit override the offset is the one this provider
+// formats with.
+func (f *fakeRunner) luksHeaderOf(device string) (int64, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.blkidTypes[device] != fsTypeLUKS {
+		return 0, false
+	}
+	if offset, ok := f.luksOffsets[device]; ok {
+		return offset, true
+	}
+	return luksHeaderBytes, true
+}
+
+// luksMetadataJSON renders `cryptsetup luksDump --dump-json-metadata` output.
+// The offset is a decimal STRING, which is how LUKS2 renders it and the reason
+// the provider parses rather than unmarshals it as a number.
+func luksMetadataJSON(offset int64) []byte {
+	return []byte(fmt.Sprintf(
+		`{"keyslots":{"0":{"type":"luks2","key_size":64}},"tokens":{},`+
+			`"segments":{"0":{"type":"crypt","offset":"%d","size":"dynamic",`+
+			`"iv_tweak":"0","encryption":"aes-xts-plain64","sector_size":512}},`+
+			`"digests":{"0":{"type":"pbkdf2","hash":"sha512"}},`+
+			`"config":{"json_size":"12288","keyslots_size":"16744448"}}`, offset))
 }
 
 // defaultBackingFor turns a mapping name back into the logical volume this
@@ -344,6 +527,10 @@ type lvFixture struct {
 	// follows the origin's current size, which is the ordinary case; setting it
 	// expresses an origin that has been grown since the snapshot was taken.
 	OriginSizeBytes int64
+
+	// Tags are the LVM tags on the volume. A fixture with none models a volume
+	// provisioned before this provider tagged them.
+	Tags []string
 }
 
 // attr renders an lv_attr string whose state field matches Active. Only the
@@ -366,6 +553,7 @@ func lvsJSON(lvs ...lvFixture) []byte {
 		Time        string `json:"lv_time"`
 		DataPercent string `json:"data_percent"`
 		OriginSize  string `json:"origin_size"`
+		Tags        string `json:"lv_tags"`
 	}
 	type reportJSON struct {
 		Report []struct {
@@ -407,6 +595,13 @@ func lvsJSON(lvs ...lvFixture) []byte {
 			originSize = fmt.Sprintf("%d", lv.SizeBytes)
 		}
 
+		// lv_tags is a comma-separated list, and the EMPTY STRING for a volume
+		// with no tags — measured, including through the JSON report, where it
+		// is "" rather than absent or null. A fake that omitted the field would
+		// let a parser that mishandles the empty case pass.
+		//
+		// Tags are also not inherited by snapshots, measured, so a fixture is
+		// tagged only where it says so.
 		report.Report[0].LV = append(report.Report[0].LV, lvJSON{
 			Name:        lv.Name,
 			Size:        fmt.Sprintf("%d", lv.SizeBytes),
@@ -415,6 +610,7 @@ func lvsJSON(lvs ...lvFixture) []byte {
 			Time:        lv.Time,
 			DataPercent: dataPercent,
 			OriginSize:  originSize,
+			Tags:        strings.Join(lv.Tags, ","),
 		})
 	}
 

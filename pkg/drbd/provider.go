@@ -388,6 +388,11 @@ func (p *Provider) resourceDown(ctx context.Context, res string) error {
 // side authoritative for the first time is not done here; see the package doc
 // on initial sync.
 //
+// spec.SizeBytes is USABLE capacity, per common.VolumeSpec.SizeBytes: the
+// backing logical volume is created at backingBytes(spec.SizeBytes), so DRBD's
+// internal metadata comes out of space added for it rather than out of what the
+// caller asked for. The record keeps the usable figure.
+//
 // spec.Replicas may be left unset: zero means unspecified and resolves to this
 // provider's natural count of two.
 //
@@ -1374,6 +1379,12 @@ func (p *Provider) isMounted(ctx context.Context, dev string) (bool, error) {
 // the same request once the volume is mounted, or promoted, finishes the job.
 // See growFilesystem.
 //
+// newSize is USABLE capacity, in the same units Provision and Status use, so
+// the backing logical volume grows to backingBytes(newSize) — by more than the
+// difference between the two sizes, since the metadata reservation grows with
+// the device. The shrink check compares usable against usable; the "is the
+// device already big enough" check compares backing against backing.
+//
 // The resource must be up. Extending the backing device of a resource that is
 // down leaves DRBD's internal metadata stranded away from the end of the device
 // with no drbdadm resize available to follow it, so this refuses with
@@ -1897,6 +1908,17 @@ func (p *Provider) wipe(ctx context.Context, lv string, wasActive bool) error {
 // the connection to it is established — a connected peer necessarily has the
 // resource up too. A peer that is unreachable is omitted rather than guessed
 // at.
+//
+// SizeBytes is USABLE capacity in both branches, per VolumeStatus.SizeBytes,
+// but they are two different flavors of it and the difference is visible. With
+// the resource DOWN it is the capacity that was REQUESTED, from the record.
+// With it UP it is the capacity DRBD actually exports, which is larger: the
+// backing volume was rounded up to a whole LVM extent and the metadata
+// reservation deliberately over-reserves, and everything left over is usable.
+// So the number rises slightly when a volume is brought up — for a 1 GiB
+// request, by about 4 MiB. It is never below what was requested in either
+// branch, which is the guarantee callers need; a caller diffing Status across
+// an attach should expect the step.
 func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatus, error) {
 	meta, err := p.lookup(volID)
 	if err != nil {

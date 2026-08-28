@@ -124,6 +124,12 @@ func (e *lvEntry) sizeBytes() int64 { return parseLVMInt(e.Size) }
 // originSizeBytes parses origin_size: for a snapshot, the size of the volume it
 // was taken from, which is the size a restore has to accommodate. It is empty
 // for a non-snapshot LV.
+//
+// It is a BACKING size, DRBD's internal metadata included, because the volume
+// it measures is one this provider created at backingBytes(...) and LVM then
+// rounded up. That is what makes it comparable against a restore's own
+// backingBytes figure and NOT against a caller's common.VolumeSpec.SizeBytes,
+// which is usable capacity.
 func (e *lvEntry) originSizeBytes() int64 { return parseLVMInt(e.OriginSize) }
 
 // usedBytes is the space a copy-on-write snapshot currently OCCUPIES: its CoW

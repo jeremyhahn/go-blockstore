@@ -46,11 +46,102 @@
 // attached again. Activation belongs to this provider, not to boot or udev.
 // That flag needs LVM 2.03.12 (2021) or newer, which is the library's floor.
 //
-// Encryption is discovered rather than remembered. Attach probes the logical
-// volume with blkid and reaches for cryptsetup only on a crypto_LUKS
-// signature, so a provider configured without Options.Encrypted still handles
-// volumes that are encrypted, and a host that has no encrypted volumes never
-// invokes cryptsetup at all.
+// Encryption is DISCOVERED, and remembered only where it cannot be discovered.
+// Attach probes the logical volume with blkid and reaches for cryptsetup only
+// on a crypto_LUKS signature, so a provider configured without
+// Options.Encrypted still handles volumes that are encrypted, and a host that
+// has no encrypted volumes never invokes cryptsetup at all. Discovery is the
+// authority wherever it can run, and no cached answer overrides it.
+//
+// It cannot run on a DETACHED volume: an inactive logical volume has no device
+// node, so there is nothing to probe. That is the one case where the fact is
+// remembered instead — an LVM tag written when the volume becomes a container,
+// read back from the volume listing, and used only by Status, only while
+// detached, and only to report capacity. It is a fallback for a blind spot, not
+// a cache in front of the probe: on an active volume the probe decides, and a
+// tag that contradicts it is an error rather than a tiebreak — both about
+// whether the volume is a container at all AND about how large its header is,
+// since the header size is the part the tag carries and the part a detached
+// read depends on. A tag can therefore only stay wrong for as long as the
+// volume stays detached.
+//
+// That holds because every operation which both holds the volume's lock and
+// looks at the volume with a device node in front of it reconciles the tag with
+// what it found: Attach, Resize, and — the one that matters most — Detach,
+// which is the transition INTO the state where the tag starts being believed
+// and the last moment the container is readable. A container gets its measured
+// header recorded; a volume that turns out not to be one has the tag removed.
+// Mount and Unmount probe too but leave the volume ACTIVE, where the tag is not
+// consulted and Status refuses a contradiction outright, so there is nothing
+// there for a stale tag to mislead. Delete is exempt on purpose: it is removing
+// the volume, and refusing to destroy something because a note about it could
+// not be rewritten would be obstruction.
+//
+// The tag records the header's SIZE, not just that there is one, because the
+// size is known wherever a tag is written and is not recoverable afterwards. A
+// volume restored verbatim from an outside snapshot carries that snapshot's
+// header, which need not be the 16 MiB this package formats. See
+// encryptedTagPrefix.
+//
+// # Capacity
+//
+// VolumeSpec.SizeBytes is the capacity the CALLER CAN USE, and this provider
+// puts its overhead on top of it. An encrypted volume asked for at a gibibyte
+// gets a logical volume a LUKS header larger, so the plaintext mapping Attach
+// hands back holds the gibibyte that was asked for; a plain volume has no
+// overhead and the two figures coincide. Resize follows the same rule, and
+// VolumeStatus.SizeBytes reports the usable figure rather than the backing
+// device's.
+//
+// The header is 16 MiB. It is a constant because every parameter that
+// determines it is pinned at format time rather than left to cryptsetup, and it
+// is a MEASURED constant: see luksHeaderBytes for the derivation and
+// TestIntegrationEncryptedVolumeDeliversTheRequestedCapacity for the assertion
+// that re-derives it from a real container on every integration run.
+//
+// What an EXISTING container costs is read from that container's own header
+// instead of assumed, because a volume restored from an encrypted snapshot
+// carries its source's header and that header need not be one this package
+// wrote. The constant sizes what this provider creates; measurement describes
+// what it finds.
+//
+// A detached volume reports usable capacity too, from the tag described above,
+// which carries the header size that was measured when the volume became a
+// container — so a volume with a foreign header is reported correctly whether
+// it is attached or not, and Status agrees with itself across an attach without
+// ever taking a lock.
+//
+// One residual: a volume provisioned before the tag existed carries none, and
+// reports its backing size while detached. Its next Attach records one, from a
+// header read off the container rather than assumed, so a fleet heals one
+// attach at a time.
+//
+// # What a restore preserves
+//
+// A restore preserves DATA lineage, not header lineage. Which of the two a
+// given restore also preserves depends on what the snapshot holds:
+//
+//   - A PLAINTEXT snapshot restored by a provider configured to encrypt is
+//     re-encrypted on the way in. The destination is formatted as a LUKS2
+//     container under this provider's key and the image is copied THROUGH the
+//     plaintext mapping, so dm-crypt encrypts it in flight and no plaintext is
+//     ever written to an extent. The restored volume has a different header
+//     from its source — its source had none — and opens with the key
+//     KeyProvider returns for the restored volume's own ID.
+//
+//   - An ENCRYPTED snapshot is ciphertext at the logical-volume level and is
+//     copied verbatim, header included, without being reformatted. Reformatting
+//     would be destructive rather than merely different: a fresh header carries
+//     a fresh master key and the ciphertext copied over it would decrypt to
+//     nothing, silently. So the restored volume shares its source's header,
+//     master key and UUID, and opens with the SOURCE's passphrase.
+//
+//     KeyProvider is called with the volume's own ID, so an implementation
+//     holding a distinct key per volume has to answer for the restored volume's
+//     name with the source's key. That is CHECKED against the snapshot's header
+//     before anything is created, rather than discovered at the first Attach —
+//     a volume that restores cleanly and cannot be opened is the one outcome
+//     this path must not produce.
 //
 // # Keys
 //
