@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -585,6 +586,82 @@ func metadataBytes(dataBytes int64) int64 {
 // through it rather than mixing the two.
 func backingBytes(dataBytes int64) int64 {
 	return dataBytes + metadataBytes(dataBytes)
+}
+
+// backingBytesChecked is backingBytes with its intermediate arithmetic guarded
+// against int64 overflow: ok is false when a step would wrap. A signed overflow
+// in Go wraps rather than trapping, so an unchecked backingBytes near
+// math.MaxInt64 comes back NEGATIVE — a backing size smaller than the data it is
+// supposed to hold, which then reads as a SHRINK everywhere a size is compared.
+//
+// It is the predicate the size bounds below binary-search and the check the
+// validators call before committing to a caller-controlled size. The unchecked
+// backingBytes stays for the hot path, once a size is known representable.
+func backingBytesChecked(dataBytes int64) (int64, bool) {
+	if dataBytes < 0 {
+		return 0, false
+	}
+	// metadataBytes rounds the data area up to a whole sector first, and that
+	// addition is the earliest step that can wrap. Once it is safe, everything
+	// downstream of it is: the bitmap math divides down before it multiplies
+	// back up, so metadataBytes itself cannot overflow for any dataBytes this
+	// far below the ceiling.
+	if dataBytes > math.MaxInt64-(sectorBytes-1) {
+		return 0, false
+	}
+	meta := metadataBytes(dataBytes)
+	if dataBytes > math.MaxInt64-meta {
+		return 0, false
+	}
+	return dataBytes + meta, true
+}
+
+// maxRoundableBytes is the largest byte count roundUpTo can take for a given
+// extent without the addition inside it overflowing. It mirrors the bound the
+// local provider guards against; a value past it wraps NEGATIVE. An extent of
+// one or less rounds nothing, so the whole range is roundable.
+func maxRoundableBytes(extent int64) int64 {
+	if extent <= 1 {
+		return math.MaxInt64
+	}
+	return math.MaxInt64 - (extent - 1)
+}
+
+// maxDataBytes is the largest USABLE capacity whose backing size stays
+// representable as an int64: the data area, plus DRBD's internal metadata, then
+// rounded up to a whole extent of the volume group. Past it, backingBytes — or
+// the extent rounding layered on top of it — wraps NEGATIVE, and a negative
+// backing target reads as a SHRINK: resizeLocked then finds the backing volume
+// already "larger" than the target, skips lvextend and the drbdadm resize that
+// follows it, and records the fabricated size as reached. The next legitimate
+// grow is refused against that recorded size. A caller that asks for more than
+// this bound gets common.ErrInvalidArgument naming it, because a size that has
+// no representable backing is malformed input, not an operation some other
+// backend could serve.
+//
+// Pass extent <= 0 where the caller does no rounding of its own — lvcreate
+// rounds internally, so only the metadata addition is bounded there.
+//
+// backingBytes and roundUpTo are both monotonic non-decreasing, so the
+// representable capacities form a prefix [0, max] and a binary search finds its
+// top exactly, without inverting metadataBytes's nested ceilings by hand.
+func maxDataBytes(extent int64) int64 {
+	limit := maxRoundableBytes(extent)
+	lo, hi := int64(0), int64(math.MaxInt64)
+	for lo < hi {
+		// Bias the midpoint upward so the search converges on the last value that
+		// satisfies the predicate. Written as hi-(hi-lo)/2 rather than
+		// lo+(hi-lo+1)/2 because the +1 there overflows when the range is the
+		// whole int64 axis (lo 0, hi math.MaxInt64), which is exactly the extent
+		// <= 0 case.
+		mid := hi - (hi-lo)/2
+		if b, ok := backingBytesChecked(mid); ok && b <= limit {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return lo
 }
 
 // devicePath is the block device a resource's volume appears at.

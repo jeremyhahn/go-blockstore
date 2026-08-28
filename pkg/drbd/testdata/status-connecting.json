@@ -12,7 +12,7 @@
         "disk-state": "Outdated",
         "client": false,
         "quorum": false,
-        "size": 1048572,
+        "size": 1052600,
         "read": 0,
         "written": 0,
         "al-writes": 0,

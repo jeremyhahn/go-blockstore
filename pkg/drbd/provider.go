@@ -414,11 +414,10 @@ func (p *Provider) resourceDown(ctx context.Context, res string) error {
 // where it can be, which on a freshly provisioned Secondary is nowhere: the
 // device is the requested size and the filesystem is the source's until the
 // volume is promoted and resized. That is the Resize contract, reached by the
-// same route. The copy is a
-// full one, so the restored volume has no continuing dependency on the snapshot
-// and the snapshot can be deleted afterwards. spec.SizeBytes must match the
-// size the snapshot was taken at; growing the restored volume is Resize's job,
-// for the reason given in restoreSource.
+// same route. The copy is a full one, so the restored volume has no continuing
+// dependency on the snapshot and the snapshot can be deleted afterwards.
+// spec.SizeBytes must match the size the snapshot was taken at; growing the
+// restored volume is Resize's job, for the reason given in restoreSource.
 //
 // The VolumeSpec is taken by value because common.VolumeProvider says so; a
 // provider that took a pointer would not implement the interface. The linter's
@@ -430,6 +429,18 @@ func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (commo
 	}
 	if spec.SizeBytes <= 0 {
 		return common.Volume{}, fmt.Errorf("%w: size must be positive, got %d", common.ErrInvalidArgument, spec.SizeBytes)
+	}
+	// The backing volume is created at backingBytes(spec.SizeBytes), and that
+	// addition has to be representable. A signed overflow in Go wraps rather than
+	// trapping, so without this a size near math.MaxInt64 would reach lvcreate as
+	// a NEGATIVE byte count. It is malformed input rather than an unsupported
+	// operation: no backend could back it, and the caller has to change the
+	// number rather than choose another provider. Extent rounding is lvcreate's
+	// here, so the bound is the metadata addition alone; the restore and resize
+	// paths, which round in Go, bound that too.
+	if limit := maxDataBytes(0); spec.SizeBytes > limit {
+		return common.Volume{}, fmt.Errorf("%w: size %d exceeds the largest usable capacity this provider can back, %d (a larger request overflows the backing size once DRBD's internal metadata is added)",
+			common.ErrInvalidArgument, spec.SizeBytes, limit)
 	}
 	if err := validateFSType(spec.FSType); err != nil {
 		return common.Volume{}, err
@@ -873,6 +884,16 @@ func (p *Provider) restoreSource(ctx context.Context, spec *common.VolumeSpec) (
 			spec.SourceSnapshotID, entry.Name, common.ErrUnsupported)
 	}
 
+	// The destination's backing size — data plus DRBD metadata, rounded up to a
+	// whole extent — has to be representable before it is computed. Past the
+	// bound, backingBytes or the rounding on top of it wraps NEGATIVE, and the
+	// src > dst comparison below would read a wrapped-negative destination as a
+	// shrink the caller never asked for. Malformed input rather than an
+	// unsupported restore: no volume group could hold it.
+	if limit := maxDataBytes(entry.extentSizeBytes()); spec.SizeBytes > limit {
+		return nil, fmt.Errorf("%w: size %d exceeds the largest usable capacity representable on this volume group, %d (extents are %d bytes and DRBD's internal metadata is added on top)",
+			common.ErrInvalidArgument, spec.SizeBytes, limit, entry.extentSizeBytes())
+	}
 	// Both are logical volumes, whose sizes LVM rounds up to the volume group's
 	// extent, so the comparison is against the size lvcreate would give the
 	// destination rather than the unrounded request — comparing a rounded
@@ -880,8 +901,8 @@ func (p *Provider) restoreSource(ctx context.Context, spec *common.VolumeSpec) (
 	// original size as a shrink.
 	dst := roundUpTo(backingBytes(spec.SizeBytes), entry.extentSizeBytes())
 	if src > dst {
-		return nil, fmt.Errorf("%w: restoring snapshot %q needs a %d-byte backing volume, %d requested (%d usable): this provider does not shrink during restore",
-			common.ErrUnsupported, spec.SourceSnapshotID, src, dst, spec.SizeBytes)
+		return nil, fmt.Errorf("%w: restoring snapshot %q needs a %d-byte backing volume, but %d usable (%d backing) was requested: this provider does not shrink during restore",
+			common.ErrUnsupported, spec.SourceSnapshotID, src, spec.SizeBytes, dst)
 	}
 
 	return &restorePlan{
@@ -1466,6 +1487,18 @@ func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newS
 	entry, ok := findLV(lvs, meta.LV)
 	if !ok {
 		return fmt.Errorf("volume %q: backing logical volume %q is missing", meta.Name, p.lvRef(meta.LV))
+	}
+	// The target below is backingBytes(newSize) rounded up to a whole extent, and
+	// that has to be representable BEFORE it is computed. Past the bound it wraps
+	// NEGATIVE: entry.sizeBytes() < target is then false, so lvextend and the
+	// drbdadm resize after it are SKIPPED, the filesystem is never grown, and yet
+	// meta.SizeBytes is written as the fabricated size and nil returned — silent
+	// success over a device that never moved, after which every legitimate Resize
+	// is refused as a shrink against the recorded size. A size with no
+	// representable backing is malformed input, not a supported grow.
+	if limit := maxDataBytes(entry.extentSizeBytes()); newSize > limit {
+		return fmt.Errorf("%w: newSize %d exceeds the largest usable capacity representable on this volume, %d (this volume group's extents are %d bytes and DRBD's internal metadata is added on top)",
+			common.ErrInvalidArgument, newSize, limit, entry.extentSizeBytes())
 	}
 	if target := roundUpTo(backingBytes(newSize), entry.extentSizeBytes()); entry.sizeBytes() < target {
 		if err := p.lvExtend(ctx, meta.LV, backingBytes(newSize)); err != nil {

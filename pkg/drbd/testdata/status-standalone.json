@@ -12,7 +12,7 @@
         "disk-state": "UpToDate",
         "client": false,
         "quorum": false,
-        "size": 1048572,
+        "size": 1052600,
         "read": 0,
         "written": 131072,
         "al-writes": 12,

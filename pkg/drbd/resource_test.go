@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -581,6 +582,65 @@ func TestMetadataGrowsWithTheDevice(t *testing.T) {
 	large := metadataBytes(1 << 40)
 	if large <= small {
 		t.Errorf("metadataBytes(1TiB) = %d is not above metadataBytes(1GiB) = %d", large, small)
+	}
+}
+
+// TestBackingBytesCheckedDetectsOverflow pins the guard the resize and provision
+// paths lean on: backingBytes wraps NEGATIVE near the top of the int64 range,
+// and the checked form has to report that rather than pass the wrapped value on.
+func TestBackingBytesCheckedDetectsOverflow(t *testing.T) {
+	if _, ok := backingBytesChecked(math.MaxInt64); ok {
+		t.Errorf("backingBytesChecked(math.MaxInt64) = ok, want the overflow detected")
+	}
+	if _, ok := backingBytesChecked(-1); ok {
+		t.Errorf("backingBytesChecked(-1) = ok, want a negative size rejected")
+	}
+	// With no extent rounding, the largest representable usable size is the one
+	// whose backing exactly fills the int64 range — anything above it wraps.
+	max := maxDataBytes(0)
+	backing, ok := backingBytesChecked(max)
+	if !ok {
+		t.Fatalf("backingBytesChecked(maxDataBytes(0)=%d) = not ok, want representable", max)
+	}
+	if backing != math.MaxInt64 {
+		t.Errorf("backing at the extent-free maximum = %d, want math.MaxInt64 = %d", backing, int64(math.MaxInt64))
+	}
+	if _, ok := backingBytesChecked(max + 1); ok {
+		t.Errorf("backingBytesChecked(maxDataBytes(0)+1) = ok, want the overflow detected")
+	}
+}
+
+// TestMaxDataBytesIsTheOverflowBoundary checks maxDataBytes lands exactly on the
+// last representable size: the maximum itself has a representable backing (so the
+// providers must ATTEMPT it), and one past it does not (so they must refuse it).
+// The extent-aware bound only tightens as the extent grows, never loosens.
+func TestMaxDataBytesIsTheOverflowBoundary(t *testing.T) {
+	for _, extent := range []int64{0, 1, 512, 4 << 20} {
+		t.Run(strconv.FormatInt(extent, 10), func(t *testing.T) {
+			max := maxDataBytes(extent)
+
+			// The maximum is representable: its backing computes without wrapping,
+			// and rounding that up to an extent stays positive and no smaller than
+			// the backing it rounded.
+			backing, ok := backingBytesChecked(max)
+			if !ok {
+				t.Fatalf("backingBytesChecked(maxDataBytes(%d)=%d) = not ok, want representable", extent, max)
+			}
+			if rounded := roundUpTo(backing, extent); rounded < 0 || rounded < backing {
+				t.Errorf("roundUpTo(%d, %d) = %d, want a positive value no smaller than the backing", backing, extent, rounded)
+			}
+
+			// One past it is not: either the backing addition wraps, or the extent
+			// rounding layered on top of it would.
+			if b, ok := backingBytesChecked(max + 1); ok && b <= maxRoundableBytes(extent) {
+				t.Errorf("maxDataBytes(%d) = %d, but %d is still representable (backing %d, roundable ceiling %d): the bound is too low",
+					extent, max, max+1, b, maxRoundableBytes(extent))
+			}
+		})
+	}
+
+	if withExtent, without := maxDataBytes(4<<20), maxDataBytes(0); withExtent > without {
+		t.Errorf("maxDataBytes(4MiB) = %d exceeds maxDataBytes(0) = %d; extent rounding must only tighten the bound", withExtent, without)
 	}
 }
 

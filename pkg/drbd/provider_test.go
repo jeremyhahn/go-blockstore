@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -42,7 +43,7 @@ func statusJSON(name string, minor int, role, conn, repl, disk string) string {
   "role": %q,
   "suspended": false,
   "write-ordering": "flush",
-  "devices": [{"volume": 0, "minor": %d, "disk-state": %q, "client": false, "quorum": true, "size": 1048572}],
+  "devices": [{"volume": 0, "minor": %d, "disk-state": %q, "client": false, "quorum": true, "size": 1052600}],
   "connections": [{
     "peer-node-id": 1,
     "name": %q,
@@ -173,6 +174,13 @@ func TestProvisionValidation(t *testing.T) {
 		{"hostile name", common.VolumeSpec{Name: "vol1; rm -rf /", SizeBytes: testSize}, common.ErrInvalidArgument},
 		{"zero size", common.VolumeSpec{Name: testVolume}, common.ErrInvalidArgument},
 		{"negative size", common.VolumeSpec{Name: testVolume, SizeBytes: -1}, common.ErrInvalidArgument},
+		// A size whose backing (data plus DRBD metadata) does not fit in an
+		// int64 is malformed input: unguarded it would reach lvcreate as a
+		// wrapped-negative byte count. maxDataBytes(0) is the largest that fits
+		// when lvcreate does the extent rounding, so one past it is the first
+		// that does not.
+		{"size at math.MaxInt64", common.VolumeSpec{Name: testVolume, SizeBytes: math.MaxInt64, Replicas: 2}, common.ErrInvalidArgument},
+		{"size one past the representable backing", common.VolumeSpec{Name: testVolume, SizeBytes: maxDataBytes(0) + 1, Replicas: 2}, common.ErrInvalidArgument},
 		{"unsupported filesystem", common.VolumeSpec{Name: testVolume, SizeBytes: testSize, FSType: "btrfs"}, common.ErrInvalidArgument},
 		// A count this provider cannot honor is well-formed and served by the
 		// local provider, so it is ErrUnsupported — "choose another backend" —
@@ -200,6 +208,26 @@ func TestProvisionValidation(t *testing.T) {
 func TestProvisionAcceptsTwoReplicas(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, &common.VolumeSpec{Name: testVolume, SizeBytes: testSize, Replicas: 2})
+}
+
+// TestProvisionAcceptsTheLargestRepresentableSize is the boundary the refusals
+// in TestProvisionValidation must not overshoot: the largest usable capacity
+// whose backing still fits in an int64 has to be ATTEMPTED, not refused. Its
+// backing is created at backingBytes(maxDataBytes(0)), which is exactly
+// math.MaxInt64.
+func TestProvisionAcceptsTheLargestRepresentableSize(t *testing.T) {
+	p, r := newTestProvider(t)
+	limit := maxDataBytes(0)
+	r.scriptProvisionAt(testVolume, backingBytes(limit))
+
+	vol, err := p.Provision(context.Background(), common.VolumeSpec{Name: testVolume, SizeBytes: limit, Replicas: 2})
+	if err != nil {
+		t.Fatalf("Provision at the representable maximum = %v, want it attempted", err)
+	}
+	if vol.Spec.SizeBytes != limit {
+		t.Errorf("Volume.Spec.SizeBytes = %d, want the representable maximum %d", vol.Spec.SizeBytes, limit)
+	}
+	r.assertRan(t, fmt.Sprintf("lvcreate --yes --name vol1 --size %db vg0", backingBytes(limit)))
 }
 
 func TestProvisionRollback(t *testing.T) {
@@ -1151,6 +1179,101 @@ func TestResizeRepeatFinishesTheFilesystem(t *testing.T) {
 	r.assertRan(t, "resize2fs /dev/drbd0")
 }
 
+// TestResizeRefusesASizeWhoseBackingOverflows is the regression test for #18.
+//
+// A newSize whose backing — data plus DRBD metadata, rounded up to an extent —
+// exceeds int64 makes backingBytes wrap NEGATIVE. Unguarded, resizeLocked then
+// finds entry.sizeBytes() < target false (target is negative), skips lvextend
+// and the drbdadm resize after it, grows no filesystem, and STILL writes
+// meta.SizeBytes = newSize and returns nil: silent success over a device that
+// never moved. Every later legitimate Resize is then refused as a shrink
+// against that fabricated recorded size — the volume is bricked through this
+// API. The guard turns the malformed size into ErrInvalidArgument before any of
+// that. Removing it reproduces the skipped-extend-with-recorded-size failure
+// this asserts against.
+func TestResizeRefusesASizeWhoseBackingOverflows(t *testing.T) {
+	p, r := newTestProvider(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	// Resize refuses a resource that is down, so keep one up throughout.
+	r.scriptStatus(primaryStatus(testVolume, 0))
+	r.scriptLVS(lvsJSON(lvEntry{
+		Name: testVolume, VG: testVG,
+		Size:       strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+		ExtentSize: strconv.FormatInt(testExtentSize, 10),
+	}))
+
+	limit := maxDataBytes(testExtentSize)
+	for _, tc := range []struct {
+		name string
+		size int64
+	}{
+		{"math.MaxInt64", math.MaxInt64},
+		// The exact value at which backingBytes stops being representable once
+		// the extent rounding is layered on: the largest representable size plus
+		// one. A naive guard that bounded only the raw request, not its backing,
+		// would let this through.
+		{"one past the representable maximum", limit + 1},
+	} {
+		err := p.Resize(context.Background(), testVolume, tc.size)
+		if !errors.Is(err, common.ErrInvalidArgument) {
+			t.Errorf("Resize(%s) = %v, want ErrInvalidArgument", tc.name, err)
+		}
+	}
+
+	// Nothing was extended or resized, and — the crux of the bug — the record
+	// was NOT advanced to a size the device never reached.
+	r.assertNotRan(t, "lvextend")
+	r.assertNotRan(t, "drbdadm resize")
+	meta, err := p.loadMeta(testVolume)
+	if err != nil {
+		t.Fatalf("loadMeta: %v", err)
+	}
+	if meta.SizeBytes != testSize {
+		t.Errorf("recorded size = %d after refused resizes, want the unchanged %d", meta.SizeBytes, testSize)
+	}
+}
+
+// TestResizeAttemptsTheLargestRepresentableSize is the boundary a naive guard
+// gets wrong from the other side: the largest size whose backing is still
+// representable must be ATTEMPTED, not refused. An off-by-one that rejected it
+// would deny a request the provider can actually serve.
+func TestResizeAttemptsTheLargestRepresentableSize(t *testing.T) {
+	p, r := newTestProvider(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	limit := maxDataBytes(testExtentSize)
+
+	r.scriptStatus(primaryStatus(testVolume, 0))
+	r.scriptLVS(lvsJSON(lvEntry{
+		Name: testVolume, VG: testVG,
+		Size:       strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+		ExtentSize: strconv.FormatInt(testExtentSize, 10),
+	}))
+	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(limit), 10)+"b", "vg0/vol1").returns("")
+	r.on(binDRBDAdm, "resize", testVolume).returns("")
+	r.scriptFindmntSource("/dev/drbd0", "")
+	r.on(binE2fsck, "-f", "-p", "/dev/drbd0").returns("")
+	r.on(binResize2fs, "/dev/drbd0").returns("")
+
+	if err := p.Resize(context.Background(), testVolume, limit); err != nil {
+		t.Fatalf("Resize to the representable maximum = %v, want it attempted", err)
+	}
+	// It reached the device rather than being turned away at the guard.
+	r.assertRan(t, fmt.Sprintf("lvextend --size %db vg0/vol1", backingBytes(limit)))
+	r.assertRan(t, "drbdadm resize vol1")
+
+	meta, err := p.loadMeta(testVolume)
+	if err != nil {
+		t.Fatalf("loadMeta: %v", err)
+	}
+	if meta.SizeBytes != limit {
+		t.Errorf("recorded size = %d, want the representable maximum %d", meta.SizeBytes, limit)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Snapshots
 // -----------------------------------------------------------------------------
@@ -1872,10 +1995,17 @@ func TestDeleteWhenResourceIsDown(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func TestStatus(t *testing.T) {
-	// The DRBD device is smaller than the backing volume, which also carries
-	// the internal metadata. This is the "size" the status fixtures report, in
-	// KiB, and it is the capacity a caller can actually write to.
-	const deviceSize = int64(1048572) * statusSizeUnit
+	// The DRBD device presents the usable capacity, which under the
+	// usable-capacity contract is AT LEAST what the caller asked for: the backing
+	// volume is created at backingBytes(testSize), rounded up to a whole extent,
+	// and only DRBD's internal metadata is carved off the end of that. This is
+	// the "size" the status fixtures report, in KiB, and it must match the
+	// literal in the fixtures. It works out to
+	//   roundUpTo(backingBytes(testSize), testExtentSize) - metadataBytes(...),
+	// which for a 1 GiB volume on 4 MiB extents is 1052600 KiB — comfortably
+	// above testSize, where the pre-#11a fixtures pinned a value 4 KiB SHORT of
+	// it, a device no volume this provider sizes could ever present.
+	const deviceSize = int64(1052600) * statusSizeUnit
 
 	tests := []struct {
 		name       string
@@ -1948,6 +2078,15 @@ func TestStatus(t *testing.T) {
 			}
 			if st.SizeBytes != tc.wantSize {
 				t.Errorf("SizeBytes = %d, want %d", st.SizeBytes, tc.wantSize)
+			}
+			// The usable-capacity contract: a measured device never presents
+			// LESS than the caller asked for. The up rows report the device
+			// (deviceSize); assert that against the provisioned size directly, so
+			// a fixture that regresses below it — as the pre-#11a ones did, a full
+			// extent short — fails right here rather than only where deviceSize is
+			// spelled out.
+			if tc.wantSize == deviceSize && st.SizeBytes < testSize {
+				t.Errorf("Status(up).SizeBytes = %d, want >= the provisioned %d", st.SizeBytes, testSize)
 			}
 			if st.Replication.Conn != tc.wantConn {
 				t.Errorf("Replication.Conn = %q, want %q", st.Replication.Conn, tc.wantConn)
@@ -2230,7 +2369,7 @@ func TestReplicationState(t *testing.T) {
 // is the only shape that means "not replicated".
 const fixtureNoPeer = `[{
   "name": "vol1", "node-id": 0, "role": "Secondary", "suspended": false, "write-ordering": "flush",
-  "devices": [{"volume": 0, "minor": 0, "disk-state": "UpToDate", "client": false, "quorum": true, "size": 1048572}],
+  "devices": [{"volume": 0, "minor": 0, "disk-state": "UpToDate", "client": false, "quorum": true, "size": 1052600}],
   "connections": []
 }]`
 
@@ -2375,6 +2514,12 @@ func TestRestoreSizeBoundary(t *testing.T) {
 		{"exactly the original size", originBacking(), testSize, nil},
 		{"one byte past the destination", originBacking() + 1, testSize, common.ErrUnsupported},
 		{"half the original", originBacking(), testSize / 2, common.ErrUnsupported},
+		// One past the largest size whose rounded backing is representable on
+		// this extent. It clears Provision's own metadata-addition guard (that
+		// bound is looser, without the extent rounding) and is caught in the
+		// restore's own sizing, before dst wraps negative and reads the restore
+		// as a shrink. Malformed input, not an unsupported shrink.
+		{"a size whose rounded backing overflows", originBacking(), maxDataBytes(testExtentSize) + 1, common.ErrInvalidArgument},
 	}
 
 	for _, tc := range tests {

@@ -12,7 +12,7 @@
         "disk-state": "Inconsistent",
         "client": false,
         "quorum": true,
-        "size": 1048572,
+        "size": 1052600,
         "read": 0,
         "written": 262144,
         "al-writes": 0,
