@@ -306,7 +306,7 @@ jobs:
             -covermode=atomic -coverprofile=coverage.out ./...
           COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
           echo "Total coverage: ${COVERAGE}%"
-          if [ $(echo "${COVERAGE} < ${{ env.COVERAGE_THRESHOLD }}" | bc -l) -eq 1 ]; then
+          if [ "$(echo "${COVERAGE} < ${{ env.COVERAGE_THRESHOLD }}" | bc -l)" -eq 1 ]; then
             echo "FAIL: coverage ${COVERAGE}% is below minimum ${{ env.COVERAGE_THRESHOLD }}%"
             exit 1
           fi
