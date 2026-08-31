@@ -14,8 +14,8 @@
 //go:build local_integration
 
 // These tests drive the provider against real LVM, LUKS and filesystems. They
-// need root, a loop device, and the lvm2, cryptsetup, e2fsprogs and util-linux
-// tooling, so they are selected by a build tag rather than skipped at run time,
+// need root, a loop device, and the lvm2, e2fsprogs and util-linux tooling, so
+// they are selected by a build tag rather than skipped at run time,
 // and they additionally require GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 to
 // acknowledge that they create and destroy storage on the host:
 //
@@ -29,7 +29,13 @@
 // deliberate. A testing.Short guard, or a skip on "not root", turns a suite
 // that never runs into a suite that always passes, and the whole reason these
 // exist is to catch the things a fake CommandRunner cannot: an lvs column that
-// changed name, a cryptsetup flag that moved, an option mount(8) rejects.
+// changed name, a device-mapper ioctl the kernel refuses, an option mount(8)
+// rejects.
+//
+// cryptsetup is NOT among the tooling. Nothing here shells out to it — the
+// containers are formatted, unlocked and inspected in-process by go-luks2, the
+// same way the provider does it — so this suite runs on a host that does not
+// have it installed.
 
 package local
 
@@ -46,6 +52,7 @@ import (
 	"testing"
 
 	"github.com/jeremyhahn/go-enclave"
+	"github.com/jeremyhahn/go-luks2/pkg/luks2"
 
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
@@ -75,12 +82,15 @@ func testVG(t *testing.T) string {
 
 	run(t, "truncate", "-s", fmt.Sprintf("%dM", backingSizeMB), backing)
 
-	out := run(t, "losetup", "--find", "--show", backing)
-	loop := strings.TrimSpace(out)
-	if loop == "" {
-		t.Fatal("losetup produced no device")
+	// The loop device is attached with the LOOP_CTL_GET_FREE / LOOP_SET_FD
+	// ioctls rather than by forking losetup(8), which is the same rule the
+	// provider itself now follows for LUKS: pure Go unless there is no other
+	// way. go-luks2 owns that code because it needs it for its own tests.
+	loop, err := luks2.SetupLoopDevice(backing)
+	if err != nil {
+		t.Fatalf("attaching a loop device to %s: %v", backing, err)
 	}
-	t.Cleanup(func() { _ = exec.Command("losetup", "--detach", loop).Run() })
+	t.Cleanup(func() { _ = luks2.DetachLoopDevice(loop) })
 
 	run(t, "pvcreate", "--force", "--yes", loop)
 	run(t, "vgcreate", vg, loop)
@@ -105,50 +115,110 @@ func mustStaticKeyIT(t *testing.T, passphrase string) KeyProvider {
 	return kp
 }
 
+// luksUUID reads a container's UUID out of its binary header. It is the
+// identity that tells a verbatim copy from a reformat, and it is read in
+// process rather than by shelling out to `cryptsetup luksUUID`.
+func luksUUID(t *testing.T, device string) string {
+	t.Helper()
+	hdr, _, err := luks2.ReadHeader(device)
+	if err != nil {
+		t.Fatalf("reading the LUKS header on %s: %v", device, err)
+	}
+	return strings.TrimSpace(string(luks2.TrimRight(hdr.UUID[:], "\x00")))
+}
+
+// moveDataOffset rewrites a container's data segment to start at offset,
+// producing a container this package did not and could not have formatted.
+//
+// It exists because go-luks2 offers no offset option: every container it writes
+// puts its data at 16 MiB, so a test about a FOREIGN header has no way to ask
+// for one. The header is read, the one field is changed, and go-luks2 writes it
+// back — which recomputes both copies' checksums, so the result is a valid
+// container rather than a corrupted one. The keyslot area ends at 290816 bytes,
+// far below any offset a caller of this would choose, so nothing is overwritten
+// and the container still opens with its original passphrase.
+func moveDataOffset(t *testing.T, device string, offset int64) {
+	t.Helper()
+
+	hdr, metadata, err := luks2.ReadHeader(device)
+	if err != nil {
+		t.Fatalf("reading the LUKS header on %s: %v", device, err)
+	}
+	segment, ok := metadata.Segments["0"]
+	if !ok {
+		t.Fatalf("the container on %s has no data segment 0", device)
+	}
+	segment.Offset = strconv.FormatInt(offset, 10)
+	// The keyslots area is declared as everything before the data, so it has to
+	// move with it or the header contradicts itself.
+	metadata.Config.KeyslotsSize = strconv.FormatInt(offset, 10)
+
+	if err := luks2.WriteHeader(device, hdr, metadata); err != nil {
+		t.Fatalf("rewriting the LUKS header on %s: %v", device, err)
+	}
+}
+
 // assertFIPSHeader reads a real LUKS2 header and checks the parameters that
-// make the container FIPS-deployable. cryptsetup's defaults are not approved
-// and have moved between versions, so these are pinned at format time and
-// verified here rather than trusted.
+// make the container FIPS-deployable. The library's defaults are not approved —
+// an unset KDF is argon2id and an unset hash is SHA-256 — so these are pinned at
+// format time and verified here rather than trusted.
+//
+// The unit suite makes the same assertions against a container formatted onto a
+// file (TestNativeFormatPinsFIPSParameters); this one makes them against one
+// formatted onto a real logical volume, through the provider, which is the only
+// place a parameter can be lost between Options and the disk.
 func assertFIPSHeader(t *testing.T, device string) {
 	t.Helper()
-	dump := run(t, "cryptsetup", "luksDump", device)
-	t.Logf("luksDump %s:\n%s", device, dump)
 
-	// One "Iterations:" line per keyslot and digest, so the checks below are on
-	// the fields that are single-valued or must hold everywhere they appear.
-	for _, want := range []string{
-		"PBKDF:      pbkdf2",
-		"Hash:       sha512",
-		"cipher: aes-xts-plain64",
-		"Cipher:     aes-xts-plain64",
-		"Key:        512 bits",
-		"Cipher key: 512 bits",
-		"AF hash:    sha512",
-	} {
-		if !strings.Contains(dump, want) {
-			t.Errorf("luksDump does not report %q", want)
+	_, metadata, err := luks2.ReadHeader(device)
+	if err != nil {
+		t.Fatalf("reading the LUKS header on %s: %v", device, err)
+	}
+
+	wantCipher := luksCipher + "-" + luksCipherMode
+	for id, keyslot := range metadata.Keyslots {
+		if keyslot.KDF.Type != luksPBKDF {
+			t.Errorf("keyslot %s KDF = %q, want %q", id, keyslot.KDF.Type, luksPBKDF)
+		}
+		if keyslot.KDF.Hash != luksHash {
+			t.Errorf("keyslot %s KDF hash = %q, want %q", id, keyslot.KDF.Hash, luksHash)
+		}
+		if keyslot.AF.Hash != luksHash {
+			t.Errorf("keyslot %s AF hash = %q, want %q", id, keyslot.AF.Hash, luksHash)
+		}
+		if want := luksKeySizeBits / 8; keyslot.KeySize != want {
+			t.Errorf("keyslot %s key size = %d bytes, want %d", id, keyslot.KeySize, want)
+		}
+		if keyslot.Area.Encryption != wantCipher {
+			t.Errorf("keyslot %s area encryption = %q, want %q", id, keyslot.Area.Encryption, wantCipher)
+		}
+		if strings.Contains(strings.ToLower(keyslot.KDF.Type), "argon2") {
+			t.Errorf("keyslot %s uses %q; argon2 is not FIPS-approved", id, keyslot.KDF.Type)
+		}
+		// Every iteration count in the header has to clear the SP 800-132 floor.
+		if keyslot.KDF.Iterations == nil {
+			t.Errorf("keyslot %s records no iteration count", id)
+		} else if *keyslot.KDF.Iterations < 1000 {
+			t.Errorf("keyslot %s has %d iterations, below the PBKDF2 minimum of 1000",
+				id, *keyslot.KDF.Iterations)
 		}
 	}
 
-	// argon2 must appear nowhere: it is cryptsetup's LUKS2 default and is not
-	// FIPS-approved, so its presence would mean a parameter did not take.
-	if strings.Contains(strings.ToLower(dump), "argon2") {
-		t.Error("luksDump mentions argon2; a pinned PBKDF did not take effect")
+	for id, segment := range metadata.Segments {
+		if segment.Encryption != wantCipher {
+			t.Errorf("segment %s encryption = %q, want %q", id, segment.Encryption, wantCipher)
+		}
+		if segment.SectorSize != luksSectorSize {
+			t.Errorf("segment %s sector size = %d, want %d", id, segment.SectorSize, luksSectorSize)
+		}
 	}
 
-	// Every iteration count in the header has to clear the SP 800-132 floor.
-	for _, line := range strings.Split(dump, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "Iterations:") {
-			continue
+	for id, digest := range metadata.Digests {
+		if strings.Contains(strings.ToLower(digest.Type), "argon2") {
+			t.Errorf("digest %s uses %q; argon2 is not FIPS-approved", id, digest.Type)
 		}
-		n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(trimmed, "Iterations:")))
-		if err != nil {
-			t.Errorf("could not read %q", trimmed)
-			continue
-		}
-		if n < 1000 {
-			t.Errorf("%q is below the PBKDF2 minimum of 1000", trimmed)
+		if digest.Iterations < 1000 {
+			t.Errorf("digest %s has %d iterations, below the PBKDF2 minimum of 1000", id, digest.Iterations)
 		}
 	}
 }
@@ -908,10 +978,10 @@ func TestIntegrationEncryptedVolume(t *testing.T) {
 		t.Fatalf("the provisioned volume is %q, want %q", fsType, fsTypeLUKS)
 	}
 
-	// What the header actually says, read off the real container. The unit test
-	// asserts the argv; this asserts that cryptsetup did with it what the argv
-	// was meant to achieve — the two fail for different reasons, and only this
-	// one would catch cryptsetup reinterpreting a flag.
+	// What the header actually says, read off the real container on a real
+	// logical volume. The unit suite asserts the same parameters against a
+	// container formatted onto a file; this one is the only place that catches
+	// a parameter lost between Options and a block device.
 	assertFIPSHeader(t, p.lvPath(vol.ID))
 	if info.DevicePath != p.cryptPath(vol.ID) {
 		t.Errorf("DevicePath = %q, want the plaintext mapping %q", info.DevicePath, p.cryptPath(vol.ID))
@@ -928,10 +998,14 @@ func TestIntegrationEncryptedVolume(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	// Growing an unlocked encrypted volume grows the container, the mapping
-	// and the filesystem in that order.
-	if err := p.Resize(ctx, vol.ID, 96<<20); err != nil {
-		t.Fatalf("Resize: %v", err)
+	// An attached encrypted volume is REFUSED rather than resized, and the
+	// mapping the mount is sitting on is untouched by the refusal — which is
+	// checked below by continuing to use it.
+	if err := p.Resize(ctx, vol.ID, 96<<20); !errors.Is(err, ErrResizeWhileAttached) {
+		t.Fatalf("Resize while attached = %v, want ErrResizeWhileAttached", err)
+	}
+	if _, err := os.ReadFile(filepath.Join(target, "payload")); err != nil {
+		t.Fatalf("the mount did not survive the refused resize: %v", err)
 	}
 
 	if err := p.Unmount(ctx, vol.ID, target); err != nil {
@@ -939,6 +1013,12 @@ func TestIntegrationEncryptedVolume(t *testing.T) {
 	}
 	if err := p.Detach(ctx, vol.ID, "test-node"); err != nil {
 		t.Fatalf("Detach: %v", err)
+	}
+
+	// Detached, the same resize is served: the provider unlocks the container
+	// itself, grows the filesystem inside it and locks it again.
+	if err := p.Resize(ctx, vol.ID, 96<<20); err != nil {
+		t.Fatalf("Resize while detached: %v", err)
 	}
 
 	// Locked again, the volume is not attached and cannot be mounted.
@@ -1070,8 +1150,8 @@ func mountedFSBytes(t *testing.T, ctx context.Context, p *Provider, volID, targe
 
 // TestIntegrationForeignMappingIsRefused builds the hazard for real: a mapping
 // opened by hand under this provider's deterministic name, over a DIFFERENT
-// volume. cryptsetup reports it active under that name, so a provider trusting
-// the name would return somebody else's decrypted device from Attach.
+// volume. device-mapper reports it active under that name, so a provider
+// trusting the name would return somebody else's decrypted device from Attach.
 func TestIntegrationForeignMappingIsRefused(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -1101,23 +1181,18 @@ func TestIntegrationForeignMappingIsRefused(t *testing.T) {
 	// Open "theirs" by hand under the name the provider reserves for "ours".
 	run(t, "lvchange", "--activate", "y", "--yes", p.lvRef(theirs.ID))
 	stolen := p.mappingName(ours.ID)
-	openCmd := exec.Command("cryptsetup", "open", "--type", "luks2", "--key-file", "-",
-		p.lvPath(theirs.ID), stolen)
-	openCmd.Stdin = strings.NewReader("foreign-mapping-passphrase")
-	if out, openErr := openCmd.CombinedOutput(); openErr != nil {
-		t.Fatalf("setting up the foreign mapping: %v\n%s", openErr, out)
+	if err := luks2.Unlock(p.lvPath(theirs.ID), []byte("foreign-mapping-passphrase"), stolen); err != nil {
+		t.Fatalf("setting up the foreign mapping: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = exec.Command("cryptsetup", "close", stolen).Run()
+		_ = luks2.Lock(stolen)
 		_ = exec.Command("lvchange", "--activate", "n", "--yes", p.lvRef(theirs.ID)).Run()
 	})
 
-	// cryptsetup really does report it active under our name — the hazard is
-	// present, not hypothetical.
-	status := run(t, "cryptsetup", "status", stolen)
-	t.Logf("cryptsetup status %s:\n%s", stolen, status)
-	if !strings.Contains(status, "is active") {
-		t.Fatalf("the foreign mapping is not active; this test proves nothing")
+	// The mapping really is live under our name — the hazard is present, not
+	// hypothetical.
+	if !luks2.IsUnlocked(stolen) {
+		t.Fatalf("the foreign mapping %q is not active; this test proves nothing", stolen)
 	}
 
 	// The provider must refuse it rather than hand it back as "ours".
@@ -1207,8 +1282,9 @@ func deviceSizeBytes(t *testing.T, device string) int64 {
 // large. Before the rule it was a LUKS header SHORT of it, and nothing said so.
 //
 // It also pins the constant the sizing arithmetic is built on. luksHeaderBytes
-// is a measurement — 16 MiB, taken from cryptsetup 2.7.0 with the parameters
-// this provider formats with — and a measurement in a comment rots. Here the
+// is a measurement — 16 MiB, taken from cryptsetup 2.7.0 and re-taken from
+// go-luks2 with the parameters this provider formats with — and a measurement
+// in a comment rots. Here the
 // same figure is derived from a real container: the logical volume's size less
 // the mapping's, which is by definition what the header cost.
 func TestIntegrationEncryptedVolumeDeliversTheRequestedCapacity(t *testing.T) {
@@ -1250,8 +1326,8 @@ func TestIntegrationEncryptedVolumeDeliversTheRequestedCapacity(t *testing.T) {
 	backing := deviceSizeBytes(t, p.lvPath(vol.ID))
 	if overhead := backing - mapping; overhead != luksHeaderBytes {
 		t.Errorf("this container's header cost %d bytes; luksHeaderBytes says %d. "+
-			"The constant was measured on cryptsetup 2.7.0 with the parameters luksFormat pins; "+
-			"if cryptsetup has changed its layout, re-measure it rather than adjusting this test",
+			"The constant was measured on cryptsetup 2.7.0 and again on go-luks2 with the parameters "+
+			"luksFormat pins; if the layout has changed, re-measure it rather than adjusting this test",
 			overhead, luksHeaderBytes)
 	}
 
@@ -1269,12 +1345,21 @@ func TestIntegrationEncryptedVolumeDeliversTheRequestedCapacity(t *testing.T) {
 	}
 
 	// The rule holds across a resize too, which is the other place the
-	// arithmetic lives.
+	// arithmetic lives. It has to be done detached — an attached encrypted
+	// volume is refused, see ErrResizeWhileAttached — so the volume goes down
+	// and comes back up around it, which is also what a caller has to do.
 	const grown = 128 << 20
+	if err := p.Detach(ctx, vol.ID, "test-node"); err != nil {
+		t.Fatalf("Detach before resize: %v", err)
+	}
 	if err := p.Resize(ctx, vol.ID, grown); err != nil {
 		t.Fatalf("Resize: %v", err)
 	}
-	if got := deviceSizeBytes(t, info.DevicePath); got < grown {
+	regrown, err := p.Attach(ctx, vol.ID, "test-node")
+	if err != nil {
+		t.Fatalf("re-Attach after resize: %v", err)
+	}
+	if got := deviceSizeBytes(t, regrown.DevicePath); got < grown {
 		t.Errorf("after Resize the mapping is %d bytes, below the %d requested", got, grown)
 	}
 }
@@ -1450,9 +1535,9 @@ func TestIntegrationEncryptedSourceRestorePreservesTheHeader(t *testing.T) {
 	}
 
 	// The source's header identity, read before the copy.
-	srcUUID := strings.TrimSpace(run(t, "cryptsetup", "luksUUID", p.lvPath(src.ID)))
+	srcUUID := luksUUID(t, p.lvPath(src.ID))
 	if srcUUID == "" {
-		t.Fatal("cryptsetup luksUUID reported nothing for the source")
+		t.Fatal("the source container's header reports no UUID")
 	}
 
 	if err := p.Unmount(ctx, src.ID, target); err != nil {
@@ -1491,7 +1576,7 @@ func TestIntegrationEncryptedSourceRestorePreservesTheHeader(t *testing.T) {
 
 	// Same header, which is what "copied verbatim" means and what makes the
 	// source's passphrase the one that opens it.
-	restoredUUID := strings.TrimSpace(run(t, "cryptsetup", "luksUUID", p.lvPath(restored.ID)))
+	restoredUUID := luksUUID(t, p.lvPath(restored.ID))
 	if restoredUUID != srcUUID {
 		t.Errorf("the restored volume's LUKS UUID is %q, want the source's %q; the container was reformatted",
 			restoredUUID, srcUUID)
@@ -1519,7 +1604,7 @@ func TestIntegrationEncryptedSourceRestorePreservesTheHeader(t *testing.T) {
 }
 
 // TestIntegrationEncryptedRestoreRefusesAKeyThatWouldNotOpenIt drives the
-// key check against real cryptsetup rather than a fake exit status.
+// key check against a real LUKS header rather than a fake error.
 //
 // The KeyProvider here holds a distinct key per volume, which the interface
 // explicitly allows — and which is exactly what makes a verbatim restore
@@ -1737,7 +1822,7 @@ func deviceSizeBytesOfLV(t *testing.T, vg, lv string) int64 {
 }
 
 // TestIntegrationDetachedForeignHeaderReportsCorrectly is Codex's finding driven
-// against real LVM and real cryptsetup: a volume restored VERBATIM from a
+// against real LVM and a real container: a volume restored VERBATIM from a
 // container whose header is not the size this package formats.
 //
 // The restore measures that header to size the volume, so the tag records the
@@ -1746,8 +1831,15 @@ func deviceSizeBytesOfLV(t *testing.T, vg, lv string) int64 {
 // since a header larger than the default makes Status over-state what the volume
 // can hold.
 //
-// The foreign container is made by formatting one with cryptsetup directly, at a
-// deliberately non-default offset, and snapshotting it.
+// The foreign container is made by formatting one with this package's own
+// parameters and then MOVING its data segment to a deliberately non-default
+// offset, and snapshotting it. Rewriting the header is how a foreign container
+// gets built without a foreign tool: go-luks2 has no offset option, and every
+// container it formats lands at 16 MiB, so there is no way to ask it for one
+// that differs. The rewrite is honest — the header is re-checksummed and the
+// container still opens with the same passphrase, since the keyslot area ends
+// well before 4 MiB — and it is what a container written by an older release,
+// or by an operator's own cryptsetup --offset, looks like to this provider.
 func TestIntegrationDetachedForeignHeaderReportsCorrectly(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -1770,14 +1862,10 @@ func TestIntegrationDetachedForeignHeaderReportsCorrectly(t *testing.T) {
 	t.Cleanup(func() { _ = exec.Command("lvremove", "--force", vg+"/foreign").Run() })
 	run(t, "lvchange", "--activate", "y", "--yes", vg+"/foreign")
 
-	keyFile := filepath.Join(t.TempDir(), "key")
-	if err := os.WriteFile(keyFile, []byte(passphrase), 0o600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
+	if err := (nativeLUKS{}).Format(ctx, "/dev/"+vg+"/foreign", []byte(passphrase)); err != nil {
+		t.Fatalf("formatting the foreign container: %v", err)
 	}
-	run(t, "cryptsetup", "luksFormat", "--type", "luks2", "--batch-mode",
-		"--pbkdf", "pbkdf2", "--hash", "sha512", "--cipher", "aes-xts-plain64",
-		"--key-size", "512", "--offset", strconv.FormatInt(foreignHeader/512, 10),
-		"--key-file", keyFile, "/dev/"+vg+"/foreign")
+	moveDataOffset(t, "/dev/"+vg+"/foreign", foreignHeader)
 
 	// Confirm the premise: this really is a non-default header.
 	offset, err := p.luksDataOffset(ctx, p.lvPath("foreign"))
@@ -1839,7 +1927,7 @@ func TestIntegrationDetachedForeignHeaderReportsCorrectly(t *testing.T) {
 }
 
 // TestIntegrationWrongTagIsRefusedThenRepaired drives the whole tag-authority
-// loop against real LVM and real cryptsetup: a tag that disagrees with the
+// loop against real LVM and a real container: a tag that disagrees with the
 // container is refused while the volume is up, and an Attach — the one
 // operation holding the lock — re-records it from the header and clears the
 // refusal.
@@ -1922,5 +2010,193 @@ func TestIntegrationWrongTagIsRefusedThenRepaired(t *testing.T) {
 	}
 	if healed.SizeBytes != before.SizeBytes {
 		t.Errorf("after the repair Status.SizeBytes = %d, want the original %d", healed.SizeBytes, before.SizeBytes)
+	}
+}
+
+// TestIntegrationVolumeFormattedByCryptsetupStillOpens is the MIGRATION GATE
+// for the move to go-luks2, and it is the test that decides whether this change
+// can be deployed onto a host that already has encrypted volumes.
+//
+// Every encrypted volume this package provisioned before 2026-08-29 was
+// formatted by `cryptsetup luksFormat` with the parameters spelled out below —
+// that is the exact argv the previous implementation issued. Those volumes are
+// on disk, they hold data, and nothing about this refactor is allowed to make
+// them unopenable. So the fixture is not a container this package wrote: it is
+// one the PREVIOUS IMPLEMENTATION wrote, reproduced byte-for-byte by running
+// the same command.
+//
+// This is the one place in this suite that legitimately needs cryptsetup, and
+// the reason is the thing being tested. A pure-Go fixture is impossible here:
+// producing a container "as the old implementation would have" means producing
+// a spec-conformant sha512 digest, and go-luks2 cannot — that is precisely the
+// defect this test exists to catch (see TestNativeFormatWritesASpecLengthDigest
+// and go-luks2 #73). Substituting a go-luks2-formatted container would replace
+// the fixture with one that shares the bug, and the test would pass while the
+// fleet stayed broken. It skips rather than fails where cryptsetup is absent,
+// because a host without it cannot answer the question either way.
+//
+// EXPECTED TO FAIL against go-luks2 v0.1.7-alpha: Attach reports "incorrect
+// passphrase" for the correct passphrase, because go-luks2 derives a 32-byte
+// digest and compares it against the 64 bytes cryptsetup stored.
+func TestIntegrationVolumeFormattedByCryptsetupStillOpens(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	if _, err := exec.LookPath("cryptsetup"); err != nil {
+		t.Skip("cryptsetup is not installed; it is needed only to reproduce a container " +
+			"the PREVIOUS implementation wrote, which is what this test migrates from")
+	}
+
+	const passphrase = "integration-test-passphrase"
+	p, err := New(Options{
+		VolumeGroup: vg,
+		NodeID:      "test-node",
+		Encrypted:   true,
+		KeyProvider: mustStaticKeyIT(t, passphrase),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// A volume as the pre-go-luks2 code left it: the logical volume sized usable
+	// capacity plus a header, and the container formatted by the exact argv
+	// luksFormat used to issue.
+	run(t, "lvcreate", "--yes", "--name", "legacy",
+		"--size", strconv.FormatInt(int64(64<<20)+luksHeaderBytes, 10)+"b",
+		"--setautoactivation", "n", vg)
+	t.Cleanup(func() { _ = exec.Command("lvremove", "--force", vg+"/legacy").Run() })
+	run(t, "lvchange", "--activate", "y", "--yes", vg+"/legacy")
+
+	keyFile := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(keyFile, []byte(passphrase), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	run(t, "cryptsetup", "luksFormat", "--type", "luks2", "--batch-mode",
+		"--pbkdf", "pbkdf2", "--hash", "sha512", "--cipher", "aes-xts-plain64",
+		"--key-size", "512", "--key-file", keyFile, p.lvPath("legacy"))
+	run(t, "lvchange", "--activate", "n", "--yes", vg+"/legacy")
+
+	// THE assertion. Nothing else in this test matters if this fails.
+	info, err := p.Attach(ctx, "legacy", "test-node")
+	if err != nil {
+		t.Fatalf("Attach could not open a volume the previous implementation formatted: %v\n"+
+			"This is the migration break: the passphrase is correct and the container is "+
+			"a valid LUKS2 sha512 volume. go-luks2 derives a 32-byte digest and compares it "+
+			"against the 64 bytes cryptsetup stored, so it can never match. Every encrypted "+
+			"volume already on a host running this library is affected. Upstream: go-luks2 #73.", err)
+	}
+	t.Cleanup(func() { _ = p.Detach(ctx, "legacy", "test-node") })
+
+	if info.DevicePath != p.cryptPath("legacy") {
+		t.Errorf("DevicePath = %q, want the plaintext mapping %q", info.DevicePath, p.cryptPath("legacy"))
+	}
+
+	// And the capacity arithmetic still holds over a container this package did
+	// not format, which is the other half of "the fleet keeps working".
+	status, err := p.Status(ctx, "legacy")
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.SizeBytes < 64<<20 {
+		t.Errorf("Status.SizeBytes = %d, below the %d the volume was sized for", status.SizeBytes, 64<<20)
+	}
+}
+
+// TestIntegrationResizeDoesNotDestroyTheMappingItCannotGrow is the scenario
+// that motivated ErrResizeWhileAttached, run against a real dm-crypt mapping.
+//
+// The hazard it rules out: a resize implemented as "remove the mapping, unlock
+// again" is fine until the second half fails, and then the caller — who asked
+// for a bigger volume and got an error — no longer has a plaintext device at
+// all. The volume is not corrupt, but nothing can read it until somebody
+// notices and re-attaches, and whatever was using the device is holding a
+// dangling path. That is strictly worse than the resize simply not happening,
+// and the cryptsetup implementation this package migrated from did not have it,
+// so shipping it would have been a regression the migration introduced.
+//
+// The trigger staged here is the realistic one rather than a contrived fault: a
+// KeyProvider ROTATED since the volume was attached. The mapping is live and
+// working — it was opened with the old key and dm-crypt does not care what the
+// KeyProvider says afterwards — while the key the provider would have to unlock
+// with no longer opens the container. A teardown-and-rebuild resize succeeds at
+// the teardown and fails at the rebuild, every time.
+//
+// The assertion is not that Resize fails. It is that AFTER it fails, the
+// mapping is still there and still usable.
+func TestIntegrationResizeDoesNotDestroyTheMappingItCannotGrow(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	// The key the volume is created and attached with, and the one it is
+	// rotated to. Only the first opens the container.
+	rotated := false
+	p, err := New(Options{
+		VolumeGroup: vg,
+		NodeID:      "test-node",
+		Encrypted:   true,
+		KeyProvider: func(_ context.Context, _ string) (*enclave.MemoryEnclave, error) {
+			passphrase := "the-original-passphrase"
+			if rotated {
+				passphrase = "a-passphrase-that-opens-nothing"
+			}
+			return enclave.NewMemoryEnclave([]byte(passphrase))
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	vol, err := p.Provision(ctx, common.VolumeSpec{Name: "live", SizeBytes: 64 << 20, FSType: "ext4"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, vol.ID) })
+
+	info, err := p.Attach(ctx, vol.ID, "test-node")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Detach(ctx, vol.ID, "test-node") })
+
+	target := filepath.Join(t.TempDir(), "mnt")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := p.Mount(ctx, vol.ID, target, common.MountOptions{}); err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Unmount(ctx, vol.ID, target) })
+	if err := os.WriteFile(filepath.Join(target, "payload"), []byte("still here"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// The key moves out from under the live attachment.
+	rotated = true
+
+	if err := p.Resize(ctx, vol.ID, 128<<20); !errors.Is(err, ErrResizeWhileAttached) {
+		t.Fatalf("Resize while attached = %v, want ErrResizeWhileAttached", err)
+	}
+
+	// THE assertion. Everything below this line would fail against a resize
+	// that tore the mapping down before finding out it could not rebuild it.
+	if !luks2.IsUnlocked(p.mappingName(vol.ID)) {
+		t.Fatal("the plaintext mapping is gone after a refused resize; the resize destroyed " +
+			"a working mapping it was never able to replace")
+	}
+	if _, err := os.Stat(info.DevicePath); err != nil {
+		t.Fatalf("the plaintext device %s is gone after a refused resize: %v", info.DevicePath, err)
+	}
+	got, err := os.ReadFile(filepath.Join(target, "payload"))
+	if err != nil {
+		t.Fatalf("the mounted filesystem did not survive a refused resize: %v", err)
+	}
+	if string(got) != "still here" {
+		t.Errorf("contents = %q, want them untouched by a refused resize", got)
+	}
+
+	// And the volume is still fully usable: the mapping was never disturbed, so
+	// writing to it works exactly as it did before.
+	if err := os.WriteFile(filepath.Join(target, "after"), []byte("written after"), 0o600); err != nil {
+		t.Fatalf("writing after a refused resize: %v", err)
 	}
 }

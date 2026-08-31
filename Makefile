@@ -193,7 +193,7 @@ race:
 # developer assume otherwise. Each is operator-run and needs root:
 #
 #     make integration-test-drbd     # needs a configured two-node pair
-#     make integration-test-local    # needs loopback (losetup)
+#     make integration-test-local    # needs loop devices and root
 #
 integration-test:
 	@echo "$(CYAN)$(BOLD)→ Running integration tests...$(RESET)"
@@ -232,7 +232,8 @@ integration-test-drbd:
 # environment is scrubbed and the in-test guard fails as designed.
 #
 # NOT wired into `make ci` or the CI unit lane, same as the drbd suite: it needs
-# root and losetup, which the shared runner does not grant. It is operator-run.
+# root, loop devices and device-mapper, which the shared runner does not grant.
+# It is operator-run.
 integration-test-local:
 	@echo "$(CYAN)$(BOLD)→ Running the local provider real LVM/LUKS suite...$(RESET)"
 	@echo "$(YELLOW)  DESTRUCTIVE: creates and destroys loop devices, VGs and LUKS volumes on this host$(RESET)"

@@ -31,15 +31,18 @@ The library is built from three pieces:
   so callers get a mountable device path either way. It keeps no state of its
   own — every answer is read back from `lvs`, `blkid` and `findmnt` — and every
   system command goes through an injectable `CommandRunner`, which is what makes
-  the backend unit-testable without root or a block device. LUKS passphrases
-  arrive through a `KeyProvider` callback as a
+  the backend unit-testable without root or a block device. LUKS is done in
+  pure Go by [go-luks2](https://github.com/jeremyhahn/go-luks2) — headers are
+  written and parsed in-process and the plaintext mapping is created with
+  device-mapper ioctls — so **no `cryptsetup` binary is forked or needs to be
+  installed**. LUKS passphrases arrive through a `KeyProvider` callback as a
   [go-enclave](https://github.com/jeremyhahn/go-enclave) `MemoryEnclave` — mlock'd,
   guard-paged, wiped on release — and become a `[]byte` only inside the borrow
-  that writes them to `cryptsetup`'s stdin, never on a command line. If the
-  kernel will not lock memory the operation fails naming `RLIMIT_MEMLOCK`
-  rather than falling back to unprotected memory. Where the key came from (a
-  file, an operator, a TPM-sealed blob) is the caller's business. Needs LVM 2.03.12+, and `cryptsetup` only when
-  encryption is in use.
+  that hands them to go-luks2 for one call; they never leave the process, and
+  never appear on a command line. If the kernel will not lock memory the
+  operation fails naming `RLIMIT_MEMLOCK` rather than falling back to
+  unprotected memory. Where the key came from (a file, an operator, a
+  TPM-sealed blob) is the caller's business. Needs LVM 2.03.12+.
 - **Serialization** — every state-changing operation holds a per-volume `flock`
   under `lock_dir` for its whole read-decide-act sequence, so two operations
   cannot interleave and act on a world that moved. Because it is a file lock
@@ -148,5 +151,7 @@ sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 go test -tags local_integration 
 ```
 
 They build their own volume group on a loopback file and tear it down again.
-They need root and the `lvm2`, `cryptsetup`, `e2fsprogs` and `util-linux`
-tooling.
+They need root and the `lvm2`, `e2fsprogs` and `util-linux` tooling.
+`cryptsetup` is not required: the containers are formatted, unlocked and
+inspected in-process by go-luks2, and the loop device is attached with the loop
+ioctls rather than by forking `losetup`.

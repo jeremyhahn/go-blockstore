@@ -16,6 +16,7 @@ package local
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -389,21 +390,42 @@ func TestProbeFSTypeOnlyAcceptsTheNotFoundStatus(t *testing.T) {
 	}
 }
 
-// TestLUKSIsOpenOnlyAcceptsTheWrongDeviceStatus keeps a cryptsetup that could
-// not answer from being read as "the mapping is not open".
-func TestLUKSIsOpenOnlyAcceptsTheWrongDeviceStatus(t *testing.T) {
-	for _, code := range []int{1, 2, 3, 5} {
-		runner := newFakeRunner()
-		runner.fail("cryptsetup", code, "cryptsetup trouble")
-		p := newTestProvider(t, runner, withKey)
+// TestLUKSIsOpenOnlyAcceptsAnAbsentMapping keeps a lookup that could not answer
+// from being read as "the mapping is not open".
+//
+// The negative answer is exactly one thing: the mapping lookup succeeded and
+// found no mapping under the name. Everything else — a device-mapper that
+// cannot be reached, a mapping whose backing device sysfs will not name, a
+// permission problem — is reported, because guessing "not open" would make
+// Attach try to unlock a volume that is already unlocked and Detach skip a
+// mapping it should have closed.
+func TestLUKSIsOpenOnlyAcceptsAnAbsentMapping(t *testing.T) {
+	failures := map[string]error{
+		"device-mapper unreachable": errors.New("open /dev/mapper/control: permission denied"),
+		"backing device unnamed":    fmt.Errorf("%w: /sys/dev/block/253:3/slaves lists 0", errNoBackingDevice),
+	}
+	for name, sentinel := range failures {
+		t.Run(name, func(t *testing.T) {
+			runner := newFakeRunner().on(luksBinary, func(args []string, _ []byte) ([]byte, error) {
+				if len(args) > 0 && args[0] == "mapping" {
+					return nil, sentinel
+				}
+				return nil, nil
+			})
+			p := newTestProvider(t, runner, withKey)
 
-		if _, err := p.luksIsOpen(context.Background(), "data"); err == nil {
-			t.Errorf("luksIsOpen read cryptsetup exit %d as not open", code)
-		}
+			open, err := p.luksIsOpen(context.Background(), "data")
+			if err == nil {
+				t.Fatalf("luksIsOpen = (%v, nil); an unanswerable lookup must not read as not open", open)
+			}
+			if !errors.Is(err, sentinel) {
+				t.Errorf("luksIsOpen = %v, want it to carry %v", err, sentinel)
+			}
+		})
 	}
 
-	runner := newFakeRunner()
-	runner.fail("cryptsetup", cryptsetupWrongDevice, "")
+	// The one negative answer: no mapping under the name.
+	runner := newFakeRunner().withOpenMappings()
 	p := newTestProvider(t, runner, withKey)
 	open, err := p.luksIsOpen(context.Background(), "data")
 	if err != nil || open {

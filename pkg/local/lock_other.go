@@ -22,8 +22,8 @@ import (
 
 // tryLockFile has no implementation off unix.
 //
-// The provider cannot run there anyway — it drives LVM, device-mapper and
-// cryptsetup — but the package still COMPILES for other platforms, and it should
+// The provider cannot run there anyway — it drives LVM and device-mapper — but
+// the package still COMPILES for other platforms, and it should
 // keep doing so rather than break a cross-build. Refusing here is what keeps the
 // serialization guarantee honest: a platform without flock gets an error, never
 // an unlocked operation that looks locked.

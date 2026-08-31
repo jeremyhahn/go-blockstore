@@ -30,13 +30,13 @@
 //
 // The state a volume moves through maps onto LVM and device-mapper directly:
 //
-//	Provision  lvcreate, optional cryptsetup luksFormat, optional mkfs;
+//	Provision  lvcreate, optional LUKS2 format, optional mkfs;
 //	           the volume is left deactivated and reports as available
-//	Attach     lvchange -ay, and cryptsetup open when the volume is a LUKS
-//	           container; reports the plaintext device either way
+//	Attach     lvchange -ay, and a LUKS unlock when the volume is a container;
+//	           reports the plaintext device either way
 //	Mount      mount(8) against the attached device
 //	Unmount    umount(8), converging when the volume is not mounted there
-//	Detach     cryptsetup close, lvchange -an
+//	Detach     LUKS close, lvchange -an
 //	Delete     unmount, lock, lvremove
 //
 // Volumes are created with LVM autoactivation switched off, which is what makes
@@ -47,11 +47,11 @@
 // That flag needs LVM 2.03.12 (2021) or newer, which is the library's floor.
 //
 // Encryption is DISCOVERED, and remembered only where it cannot be discovered.
-// Attach probes the logical volume with blkid and reaches for cryptsetup only
-// on a crypto_LUKS signature, so a provider configured without
-// Options.Encrypted still handles volumes that are encrypted, and a host that
-// has no encrypted volumes never invokes cryptsetup at all. Discovery is the
-// authority wherever it can run, and no cached answer overrides it.
+// Attach probes the logical volume with blkid and reaches for LUKS only on a
+// crypto_LUKS signature, so a provider configured without Options.Encrypted
+// still handles volumes that are encrypted, and a host that has no encrypted
+// volumes never touches device-mapper at all. Discovery is the authority
+// wherever it can run, and no cached answer overrides it.
 //
 // It cannot run on a DETACHED volume: an inactive logical volume has no device
 // node, so there is nothing to probe. That is the one case where the fact is
@@ -94,10 +94,13 @@
 // device's.
 //
 // The header is 16 MiB. It is a constant because every parameter that
-// determines it is pinned at format time rather than left to cryptsetup, and it
-// is a MEASURED constant: see luksHeaderBytes for the derivation and
-// TestIntegrationEncryptedVolumeDeliversTheRequestedCapacity for the assertion
-// that re-derives it from a real container on every integration run.
+// determines it is pinned at format time rather than left to the library, and
+// it is a MEASURED constant: see luksHeaderBytes for the derivation, against
+// cryptsetup 2.7.0 and again against go-luks2. Two tests re-derive it from a
+// real container rather than trusting the comment —
+// TestNativeFormatProducesTheHeaderTheSizingConstantAssumes on every `go test`,
+// and TestIntegrationEncryptedVolumeDeliversTheRequestedCapacity on every
+// integration run.
 //
 // What an EXISTING container costs is read from that container's own header
 // instead of assumed, because a volume restored from an encrypted snapshot
@@ -148,8 +151,10 @@
 // A passphrase never exists as an ordinary []byte. It arrives through a
 // KeyProvider callback as a go-enclave MemoryEnclave — mlock'd pages, fenced by
 // guard pages, kept out of core dumps and wiped on release — and becomes a
-// []byte only inside the WithBytes borrow that writes it to cryptsetup's
-// standard input, which the provider then destroys. A []byte would have been
+// []byte only inside the WithBytes borrow that hands it to go-luks2 for one
+// call, which the provider then destroys. It does not leave the process at all:
+// before 2026-08-29 that borrow wrote it to a cryptsetup child's standard
+// input, and now there is no child. A []byte would have been
 // unfixable: zeroing the slice a caller holds reaches neither the copies the
 // garbage collector may have made nor the pages the kernel may have swapped,
 // and the material would be in any core dump taken meanwhile.
@@ -291,7 +296,11 @@
 //
 // # Testing
 //
-// Every system command goes through CommandRunner, so the unit tests drive the
-// whole provider against a fake and need no root, no LVM and no block device.
-// Tests that do need real ones live behind the local_integration build tag.
+// Every system command goes through CommandRunner and every LUKS operation
+// through luksBackend, so the unit tests drive the whole provider against a
+// fake and need no root, no LVM and no block device. The LUKS backend is also
+// exercised for real without root, by formatting containers onto sparse files
+// and reading the headers back — which is where the FIPS parameters and the
+// 16 MiB data offset are pinned. Tests that need a real volume group or a real
+// plaintext mapping live behind the local_integration build tag.
 package local

@@ -150,15 +150,15 @@ func TestOverlappingAttachesDoNotStealEachOthersRollback(t *testing.T) {
 	// The first unlock fails and gates there; later ones succeed.
 	var opens int
 	var mu sync.Mutex
-	runner.on("cryptsetup", func(args []string, stdin []byte) ([]byte, error) {
+	runner.on(luksBinary, func(args []string, stdin []byte) ([]byte, error) {
 		// Everything this test does not specifically stage goes to the fake's
-		// own cryptsetup, so the subcommands Attach issues around the unlock —
-		// status, and the header read that records the volume's encryption —
-		// behave the way they do everywhere else. Answering them ad hoc here
-		// silently changed what this test exercises the moment Attach grew
-		// another cryptsetup call.
+		// own LUKS backend, so the operations Attach issues around the unlock —
+		// the mapping lookup, and the header read that records the volume's
+		// encryption — behave the way they do everywhere else. Answering them
+		// ad hoc here silently changed what this test exercises the moment
+		// Attach grew another LUKS call.
 		if len(args) == 0 || args[0] != "open" {
-			return runner.cryptsetup(args, stdin)
+			return runner.luks(args, stdin)
 		}
 		mu.Lock()
 		opens++
@@ -166,7 +166,7 @@ func TestOverlappingAttachesDoNotStealEachOthersRollback(t *testing.T) {
 		mu.Unlock()
 		if first {
 			g.wait()
-			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: 2, Stderr: "no key available"}
+			return nil, errors.New("no key available with this passphrase")
 		}
 		return nil, nil
 	})

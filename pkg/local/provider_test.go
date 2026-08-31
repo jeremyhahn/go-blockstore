@@ -214,13 +214,13 @@ func TestProvisionEncrypted(t *testing.T) {
 		t.Fatalf("Provision: %v", err)
 	}
 
-	assertLine(t, runner, "cryptsetup luksFormat --type luks2 --batch-mode --pbkdf pbkdf2 --hash sha512 --cipher aes-xts-plain64 --key-size 512 --key-file - /dev/vg0/data")
-	assertLine(t, runner, "cryptsetup open --type luks2 --key-file - /dev/vg0/data bs-vg0_data")
+	assertLine(t, runner, "luks format /dev/vg0/data")
+	assertLine(t, runner, "luks open /dev/vg0/data bs-vg0_data")
 	// The filesystem goes on the plaintext mapping, never on the container.
 	assertLine(t, runner, "mkfs.ext4 -F /dev/mapper/bs-vg0_data")
-	assertLine(t, runner, "cryptsetup close bs-vg0_data")
+	assertLine(t, runner, "luks close bs-vg0_data")
 
-	format := runner.mustFind(t, "cryptsetup")
+	format := runner.mustFind(t, luksBinary)
 	if !bytes.Equal(format.Stdin, []byte(testKey)) {
 		t.Errorf("luksFormat stdin = %q, want the passphrase", format.Stdin)
 	}
@@ -285,14 +285,14 @@ func TestProvisionRollsBackAnEncryptedVolumeThroughItsMapping(t *testing.T) {
 	closeAt, removeAt := -1, -1
 	for i, line := range lines {
 		switch line {
-		case "cryptsetup close bs-vg0_data":
+		case "luks close bs-vg0_data":
 			closeAt = i
 		case "lvremove --force vg0/data":
 			removeAt = i
 		}
 	}
 	if closeAt < 0 || removeAt < 0 {
-		t.Fatalf("expected both a cryptsetup close and an lvremove; got:\n  %s", strings.Join(lines, "\n  "))
+		t.Fatalf("expected both a LUKS close and an lvremove; got:\n  %s", strings.Join(lines, "\n  "))
 	}
 	if closeAt > removeAt {
 		t.Errorf("lvremove ran while the mapping was still open:\n  %s", strings.Join(lines, "\n  "))
@@ -306,15 +306,17 @@ func TestProvisionRollsBackAnEncryptedVolumeThroughItsMapping(t *testing.T) {
 func TestProvisionRollsBackWhenTheLUKSCloseFails(t *testing.T) {
 	closeAttempts := 0
 	runner := newFakeRunner()
-	runner.on("cryptsetup", func(args []string, _ []byte) ([]byte, error) {
+	runner.on(luksBinary, func(args []string, _ []byte) ([]byte, error) {
 		switch {
-		case len(args) > 0 && args[0] == "status":
+		case len(args) > 0 && args[0] == "mapping":
 			// Ours, and still open — which is what makes the rollback try again.
-			return []byte("/dev/mapper/bs-vg0_data is active.\n  device:  /dev/mapper/vg0-data\n"), nil
+			return []byte(defaultBackingFor("bs-vg0_data")), nil
+		case len(args) > 0 && args[0] == "identity":
+			return []byte(fakeDeviceIdentity(args[len(args)-1])), nil
 		case len(args) > 0 && args[0] == "close":
 			closeAttempts++
 			if closeAttempts == 1 {
-				return nil, &ExitError{Name: "cryptsetup", Args: args, Code: 5, Stderr: "device busy"}
+				return nil, errors.New("device-mapper remove: device or resource busy")
 			}
 		}
 		return nil, nil
@@ -323,7 +325,7 @@ func TestProvisionRollsBackWhenTheLUKSCloseFails(t *testing.T) {
 
 	_, err := p.Provision(context.Background(), common.VolumeSpec{Name: "data", SizeBytes: gib, FSType: "ext4"})
 	if err == nil {
-		t.Fatal("Provision succeeded, want the cryptsetup close failure")
+		t.Fatal("Provision succeeded, want the LUKS close failure")
 	}
 	if closeAttempts < 2 {
 		t.Errorf("the rollback did not retry the close; attempts = %d", closeAttempts)
@@ -343,15 +345,17 @@ func TestProvisionRollsBackWhenTheLUKSCloseFails(t *testing.T) {
 // mapping this provision never opened.
 func TestRollbackDoesNotCloseAForeignMapping(t *testing.T) {
 	// A foreign mapping already holds the name, so the open FAILS the way
-	// cryptsetup really fails when a name is in use — and the rollback then
+	// go-luks2 really fails when a name is in use — and the rollback then
 	// reaches for that name.
 	runner := newFakeRunner()
-	runner.on("cryptsetup", func(args []string, _ []byte) ([]byte, error) {
+	runner.on(luksBinary, func(args []string, _ []byte) ([]byte, error) {
 		switch {
-		case len(args) > 0 && args[0] == "status":
-			return []byte("/dev/mapper/bs-vg0_data is active.\n  device:  /dev/mapper/vg0-somebodyelse\n"), nil
+		case len(args) > 0 && args[0] == "mapping":
+			return []byte("/dev/mapper/vg0-somebodyelse"), nil
+		case len(args) > 0 && args[0] == "identity":
+			return []byte(fakeDeviceIdentity(args[len(args)-1])), nil
 		case len(args) > 0 && args[0] == "open":
-			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: 5, Stderr: "Device bs-vg0_data already exists."}
+			return nil, errors.New("device mapper 'bs-vg0_data' already exists")
 		}
 		return nil, nil
 	})
@@ -361,7 +365,7 @@ func TestRollbackDoesNotCloseAForeignMapping(t *testing.T) {
 	if err == nil {
 		t.Fatal("Provision succeeded, want the failed unlock")
 	}
-	assertNoLine(t, runner, "cryptsetup close bs-vg0_data")
+	assertNoLine(t, runner, "luks close bs-vg0_data")
 	// The volume it did create is still removed.
 	assertLine(t, runner, "lvremove --force vg0/data")
 }
@@ -377,7 +381,7 @@ func TestRollbackClosesItsOwnMapping(t *testing.T) {
 	if err == nil {
 		t.Fatal("Provision succeeded, want the mkfs failure")
 	}
-	assertLine(t, runner, "cryptsetup close bs-vg0_data")
+	assertLine(t, runner, "luks close bs-vg0_data")
 	assertLine(t, runner, "lvremove --force vg0/data")
 }
 
@@ -499,13 +503,13 @@ func TestEncryptedProviderReencryptsAPlaintextRestore(t *testing.T) {
 	// Sized for the caller's capacity plus the header the provider is about to
 	// write, so the mapping holds the gibibyte that was asked for.
 	assertLine(t, runner, "lvcreate --yes --name restored --size 1090519040b --setautoactivation n vg0")
-	assertLine(t, runner, "cryptsetup luksFormat --type luks2 --batch-mode --pbkdf pbkdf2 --hash sha512 --cipher aes-xts-plain64 --key-size 512 --key-file - /dev/vg0/restored")
-	assertLine(t, runner, "cryptsetup open --type luks2 --key-file - /dev/vg0/restored bs-vg0_restored")
+	assertLine(t, runner, "luks format /dev/vg0/restored")
+	assertLine(t, runner, "luks open /dev/vg0/restored bs-vg0_restored")
 	// Through the mapping. This is the whole point.
 	assertLine(t, runner, "dd if=/dev/vg0/data_snap_nightly of=/dev/mapper/bs-vg0_restored bs=4M conv=fsync status=none")
 	assertNoLine(t, runner, "dd if=/dev/vg0/data_snap_nightly of=/dev/vg0/restored bs=4M conv=fsync status=none")
 	// And left locked, the way Attach expects to find a volume.
-	assertLine(t, runner, "cryptsetup close bs-vg0_restored")
+	assertLine(t, runner, "luks close bs-vg0_restored")
 	assertKeyNeverOnArgv(t, runner)
 }
 
@@ -528,7 +532,7 @@ func TestReencryptingRestoreRemovesThePartialVolumeOnFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("Provision succeeded over a failed copy")
 	}
-	assertLine(t, runner, "cryptsetup close bs-vg0_restored")
+	assertLine(t, runner, "luks close bs-vg0_restored")
 	assertLine(t, runner, "lvremove --force vg0/restored")
 }
 
@@ -559,10 +563,10 @@ func TestEncryptedProviderRestoresAnEncryptedSnapshot(t *testing.T) {
 	// The image is copied as it stands; it is not reformatted under a new
 	// header, and no mapping is opened over it.
 	for _, line := range runner.lines() {
-		if strings.HasPrefix(line, "cryptsetup luksFormat") {
+		if strings.HasPrefix(line, "luks format ") {
 			t.Errorf("the restore reformatted the copied container: %q", line)
 		}
-		if strings.HasPrefix(line, "cryptsetup open ") && !strings.Contains(line, "--test-passphrase") {
+		if strings.HasPrefix(line, "luks open ") {
 			t.Errorf("the restore unlocked the copied container: %q", line)
 		}
 	}
@@ -572,7 +576,7 @@ func TestEncryptedProviderRestoresAnEncryptedSnapshot(t *testing.T) {
 	assertLine(t, runner, "lvcreate --yes --name restored --size 1090519040b --setautoactivation n vg0")
 	// And the key it will need was checked against the source's header before
 	// anything was created.
-	assertLine(t, runner, "cryptsetup open --test-passphrase --type luks2 --key-file - /dev/vg0/data_snap_nightly")
+	assertLine(t, runner, "luks test-key /dev/vg0/data_snap_nightly")
 	assertKeyNeverOnArgv(t, runner)
 }
 
@@ -838,8 +842,8 @@ func TestAttachPlain(t *testing.T) {
 		t.Errorf("Node = %q, want node-a", info.Node)
 	}
 	assertLine(t, runner, "lvchange --activate y --yes vg0/data")
-	// Nothing about a plain volume should require cryptsetup on the host.
-	runner.mustNotRun(t, "cryptsetup")
+	// Nothing about a plain volume should reach the LUKS backend at all.
+	runner.mustNotRun(t, luksBinary)
 }
 
 func TestAttachUnlocksEncryptedVolume(t *testing.T) {
@@ -855,12 +859,12 @@ func TestAttachUnlocksEncryptedVolume(t *testing.T) {
 	if info.DevicePath != "/dev/mapper/bs-vg0_data" {
 		t.Errorf("DevicePath = %q, want the plaintext mapping", info.DevicePath)
 	}
-	assertLine(t, runner, "cryptsetup open --type luks2 --key-file - /dev/vg0/data bs-vg0_data")
+	assertLine(t, runner, "luks open /dev/vg0/data bs-vg0_data")
 	assertKeyNeverOnArgv(t, runner)
 }
 
 // TestAttachIsIdempotentOverAnUnlockedVolume checks that re-attaching does not
-// try to unlock a container that is already open, which cryptsetup rejects.
+// try to unlock a container that is already open, which go-luks2 rejects.
 func TestAttachIsIdempotentOverAnUnlockedVolume(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
@@ -875,7 +879,7 @@ func TestAttachIsIdempotentOverAnUnlockedVolume(t *testing.T) {
 	if info.DevicePath != "/dev/mapper/bs-vg0_data" {
 		t.Errorf("DevicePath = %q, want the plaintext mapping", info.DevicePath)
 	}
-	assertNoLine(t, runner, "cryptsetup open --type luks2 --key-file - /dev/vg0/data bs-vg0_data")
+	assertNoLine(t, runner, "luks open /dev/vg0/data bs-vg0_data")
 }
 
 func TestAttachEncryptedWithoutKeyProvider(t *testing.T) {
@@ -896,16 +900,16 @@ func TestAttachRollsBackActivationOnFailure(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: false}).
 		withBlkid(map[string]string{"/dev/vg0/data": fsTypeLUKS})
-	runner.on("cryptsetup", func(args []string, _ []byte) ([]byte, error) {
+	runner.on(luksBinary, func(args []string, _ []byte) ([]byte, error) {
 		if len(args) > 0 && args[0] == "open" {
-			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: 2, Stderr: "no key available"}
+			return nil, errors.New("no key available with this passphrase")
 		}
-		return nil, &ExitError{Name: "cryptsetup", Args: args, Code: 4}
+		return nil, nil
 	})
 	p := newTestProvider(t, runner, withKey)
 
 	if _, err := p.Attach(context.Background(), "data", "node-a"); err == nil {
-		t.Fatal("Attach succeeded despite a failing cryptsetup open")
+		t.Fatal("Attach succeeded despite a failing unlock")
 	}
 	assertLine(t, runner, "lvchange --activate n --yes vg0/data")
 }
@@ -917,16 +921,16 @@ func TestAttachLeavesAnAlreadyActiveVolumeAlone(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
 		withBlkid(map[string]string{"/dev/vg0/data": fsTypeLUKS})
-	runner.on("cryptsetup", func(args []string, _ []byte) ([]byte, error) {
+	runner.on(luksBinary, func(args []string, _ []byte) ([]byte, error) {
 		if len(args) > 0 && args[0] == "open" {
-			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: 2, Stderr: "no key available"}
+			return nil, errors.New("no key available with this passphrase")
 		}
-		return nil, &ExitError{Name: "cryptsetup", Args: args, Code: 4}
+		return nil, nil
 	})
 	p := newTestProvider(t, runner, withKey)
 
 	if _, err := p.Attach(context.Background(), "data", "node-a"); err == nil {
-		t.Fatal("Attach succeeded despite a failing cryptsetup open")
+		t.Fatal("Attach succeeded despite a failing unlock")
 	}
 	assertNoLine(t, runner, "lvchange --activate n --yes vg0/data")
 }
@@ -974,7 +978,7 @@ func TestDetachInactiveVolumeIsANoop(t *testing.T) {
 		t.Fatalf("Detach: %v", err)
 	}
 	runner.mustNotRun(t, "lvchange")
-	runner.mustNotRun(t, "cryptsetup")
+	runner.mustNotRun(t, luksBinary)
 }
 
 func TestDetachLocksAndDeactivates(t *testing.T) {
@@ -987,7 +991,7 @@ func TestDetachLocksAndDeactivates(t *testing.T) {
 	if err := p.Detach(context.Background(), "data", "node-a"); err != nil {
 		t.Fatalf("Detach: %v", err)
 	}
-	assertLine(t, runner, "cryptsetup close bs-vg0_data")
+	assertLine(t, runner, "luks close bs-vg0_data")
 	assertLine(t, runner, "lvchange --activate n --yes vg0/data")
 }
 
@@ -1333,9 +1337,9 @@ func TestResizeGrowsADetachedEncryptedFilesystem(t *testing.T) {
 		// up the 2 GiB that was asked for rather than 16 MiB short of it.
 		"lvextend --size 2164260864b vg0/data",
 		"lvchange --activate y --yes vg0/data",
-		"cryptsetup open --type luks2 --key-file - /dev/vg0/data bs-vg0_data",
+		"luks open /dev/vg0/data bs-vg0_data",
 		"resize2fs /dev/mapper/bs-vg0_data",
-		"cryptsetup close bs-vg0_data",
+		"luks close bs-vg0_data",
 		"lvchange --activate n --yes vg0/data",
 	}
 	lines := runner.lines()
@@ -1354,16 +1358,19 @@ func TestResizeGrowsADetachedEncryptedFilesystem(t *testing.T) {
 		at = found
 	}
 
-	// The passphrase reached cryptsetup on stdin, as everywhere else.
+	// The passphrase reached the LUKS backend as a borrowed slice, as
+	// everywhere else — never as an argument.
 	assertKeyNeverOnArgv(t, runner)
 }
 
 // TestDetachedEncryptedResizeDoesNotResizeTheMapping records a deliberate
-// omission. The mapping is opened AFTER the logical volume grew, and cryptsetup
-// sizes a mapping to the device it finds — measured on 2.7.0, re-opening a
-// grown volume took the mapping from 50331648 to 117440512 bytes with no resize
-// asked for. Issuing one would borrow the passphrase a second time to achieve
-// nothing, and every borrow is an exposure.
+// omission. The mapping is opened AFTER the logical volume grew, and the
+// container's data segment is "dynamic", so whoever opens it sizes the mapping
+// to the device it finds — measured on cryptsetup 2.7.0, re-opening a grown
+// volume took the mapping from 50331648 to 117440512 bytes with no resize asked
+// for, and go-luks2 computes the same length the same way. Issuing a resize
+// would borrow the passphrase a second time to achieve nothing, and every
+// borrow is an exposure.
 func TestDetachedEncryptedResizeDoesNotResizeTheMapping(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: false}).
@@ -1376,7 +1383,7 @@ func TestDetachedEncryptedResizeDoesNotResizeTheMapping(t *testing.T) {
 	if err := p.Resize(context.Background(), "data", 2*gib); err != nil {
 		t.Fatalf("Resize: %v", err)
 	}
-	assertNoLine(t, runner, "cryptsetup resize --key-file - bs-vg0_data")
+	assertNoLine(t, runner, "luks resize /dev/vg0/data bs-vg0_data")
 }
 
 // TestDetachedEncryptedResizeFailsWithoutAKey is the typed failure that replaced
@@ -1528,7 +1535,26 @@ func TestResizeGrowsExt4(t *testing.T) {
 	assertLine(t, runner, "resize2fs /dev/vg0/data")
 }
 
-func TestResizeGrowsTheLUKSMappingBeforeTheFilesystem(t *testing.T) {
+// TestResizeRefusesAnAttachedEncryptedVolumeWithoutTouchingTheMapping is the
+// regression test for the close-then-hope resize.
+//
+// Growing a dm-crypt mapping in place needs the device-mapper table reloaded
+// underneath the live device, which needs the container's master key.
+// go-luks2 v0.1.8-alpha exposes neither, so the only way to make the mapping
+// bigger through it is to REMOVE the mapping and unlock again — and if the
+// second half fails, the caller is left with no plaintext device at all. It is
+// not hypothetical: a KeyProvider mis-rotated since the volume was attached
+// makes the teardown succeed and the rebuild fail, which is exactly what this
+// test stages. The previous cryptsetup implementation resized the live mapping
+// and had no such failure mode, so this would be a regression introduced by the
+// migration.
+//
+// So the operation is refused instead, and refused BEFORE anything moves: no
+// lvextend, and nothing at all issued against the mapping. A caller that means
+// it detaches and resizes again, which is the path
+// TestResizeGrowsADetachedEncryptedFilesystem covers and which cannot lose a
+// mapping because there is none to lose.
+func TestResizeRefusesAnAttachedEncryptedVolumeWithoutTouchingTheMapping(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
 		withBlkid(map[string]string{
@@ -1536,30 +1562,45 @@ func TestResizeGrowsTheLUKSMappingBeforeTheFilesystem(t *testing.T) {
 			"/dev/mapper/bs-vg0_data": "ext4",
 		}).
 		withOpenMappings("bs-vg0_data")
+	// The key has been rotated out from under the attachment: whatever the
+	// provider holds now will not re-open the container it is already using.
+	runner.on(luksBinary, func(args []string, stdin []byte) ([]byte, error) {
+		if len(args) > 0 && args[0] == "open" {
+			return nil, errors.New("failed to unlock any keyslot: incorrect passphrase")
+		}
+		return runner.luks(args, stdin)
+	})
 	p := newTestProvider(t, runner, withKey)
 
-	if err := p.Resize(context.Background(), "data", 2*gib); err != nil {
-		t.Fatalf("Resize: %v", err)
+	err := p.Resize(context.Background(), "data", 2*gib)
+	if err == nil {
+		t.Fatal("Resize grew an attached encrypted volume; it cannot do that without risking the mapping")
+	}
+	if !errors.Is(err, ErrResizeWhileAttached) {
+		t.Errorf("Resize = %v, want ErrResizeWhileAttached so a caller knows to detach and retry", err)
+	}
+	if !strings.Contains(err.Error(), "Detach") {
+		t.Errorf("error = %q, want it to name the remedy", err)
 	}
 
-	lines := runner.lines()
-	luksAt, fsAt := -1, -1
-	for i, line := range lines {
-		switch line {
-		case "cryptsetup resize --key-file - bs-vg0_data":
-			luksAt = i
-		case "resize2fs /dev/mapper/bs-vg0_data":
-			fsAt = i
-		}
+	// THE assertion: the mapping the caller is using is untouched. Not closed,
+	// not re-opened, not resized.
+	for _, forbidden := range []string{
+		"luks close bs-vg0_data",
+		"luks open /dev/vg0/data bs-vg0_data",
+		"luks resize /dev/vg0/data bs-vg0_data",
+	} {
+		assertNoLine(t, runner, forbidden)
 	}
-	if luksAt < 0 || fsAt < 0 {
-		t.Fatalf("expected both a cryptsetup resize and a resize2fs; got:\n  %s", strings.Join(lines, "\n  "))
+	open, openErr := p.luksIsOpen(context.Background(), "data")
+	if openErr != nil || !open {
+		t.Fatalf("the mapping is gone after a failed Resize: luksIsOpen = (%v, %v)", open, openErr)
 	}
-	// Growing the filesystem first would extend it past the mapping.
-	if luksAt > fsAt {
-		t.Errorf("cryptsetup resize ran after resize2fs:\n  %s", strings.Join(lines, "\n  "))
-	}
-	assertKeyNeverOnArgv(t, runner)
+
+	// And nothing partial was left behind either: the refusal comes before the
+	// logical volume is grown, so a re-run after a Detach starts from a clean
+	// state rather than from a volume whose backing device already moved.
+	runner.mustNotRun(t, "lvextend")
 }
 
 func TestResizeGrowsMountedXFS(t *testing.T) {
@@ -1899,7 +1940,7 @@ func TestDeleteTearsDownFirst(t *testing.T) {
 	closeAt, removeAt := -1, -1
 	for i, line := range lines {
 		switch line {
-		case "cryptsetup close bs-vg0_data":
+		case "luks close bs-vg0_data":
 			closeAt = i
 		case "lvremove --force vg0/data":
 			removeAt = i
@@ -2009,7 +2050,7 @@ func TestDeleteRefusesAVolumeWithSnapshots(t *testing.T) {
 			runner.mustNotRun(t, "lvremove")
 			runner.mustNotRun(t, "blkdiscard")
 			runner.mustNotRun(t, "umount")
-			runner.mustNotRun(t, "cryptsetup")
+			runner.mustNotRun(t, luksBinary)
 		})
 	}
 }
@@ -2587,8 +2628,10 @@ func TestResizeGrowsAPreRulingEncryptedVolume(t *testing.T) {
 		withBlkid(map[string]string{
 			"/dev/vg0/data":           fsTypeLUKS,
 			"/dev/mapper/bs-vg0_data": "ext4",
-		}).
-		withOpenMappings("bs-vg0_data")
+		})
+	// The container is locked. It is the arithmetic that is under test here,
+	// and an unlocked one would be refused before reaching it — see
+	// TestResizeRefusesAnAttachedEncryptedVolumeWithoutTouchingTheMapping.
 	p := newTestProvider(t, runner, withKey)
 
 	if err := p.Resize(context.Background(), "data", gib); err != nil {
@@ -2707,8 +2750,8 @@ func TestReencryptingRestoreZeroesPastTheHeader(t *testing.T) {
 // or deleted by somebody else — and reading the header of a device that is no
 // longer there fails.
 //
-// Before the header read existed, both races degraded quietly: blkid and
-// cryptsetup status report a vanished device as "nothing here" rather than as a
+// Before the header read existed, both races degraded quietly: blkid and the
+// mapping lookup report a vanished device as "nothing here" rather than as a
 // failure. Turning them into a hard error would make Status unreliable in
 // exactly the concurrent use it exists for, so a failed read is re-checked
 // against the volume group rather than believed on its own.
@@ -2791,7 +2834,7 @@ func TestProvisionTagsAnEncryptedVolume(t *testing.T) {
 	lines := runner.lines()
 	format, tag := -1, -1
 	for i, line := range lines {
-		if strings.HasPrefix(line, "cryptsetup luksFormat") {
+		if strings.HasPrefix(line, "luks format ") {
 			format = i
 		}
 		if strings.Contains(line, "--addtag") {
@@ -3455,6 +3498,10 @@ func TestAttachClearsAHeaderTagFromAPlainVolume(t *testing.T) {
 // which is only ever resized, never attached, would keep a lying tag forever,
 // and the contract says a tag can only stay wrong for as long as the volume
 // stays detached.
+//
+// The encrypted fixtures here are LOCKED containers, which is what a volume
+// being resized looks like: an unlocked one is refused before the reconciliation
+// would matter.
 func TestResizeReconcilesTheHeaderTag(t *testing.T) {
 	t.Run("a drifted tag on an encrypted volume is re-recorded", func(t *testing.T) {
 		runner := newFakeRunner().
@@ -3465,8 +3512,7 @@ func TestResizeReconcilesTheHeaderTag(t *testing.T) {
 			withBlkid(map[string]string{
 				"/dev/vg0/data":           fsTypeLUKS,
 				"/dev/mapper/bs-vg0_data": "ext4",
-			}).
-			withOpenMappings("bs-vg0_data")
+			})
 		p := newTestProvider(t, runner, withKey)
 
 		if err := p.Resize(context.Background(), "data", 2*gib); err != nil {
@@ -3499,8 +3545,7 @@ func TestResizeReconcilesTheHeaderTag(t *testing.T) {
 			withBlkid(map[string]string{
 				"/dev/vg0/data":           fsTypeLUKS,
 				"/dev/mapper/bs-vg0_data": "ext4",
-			}).
-			withOpenMappings("bs-vg0_data")
+			})
 		p := newTestProvider(t, runner, withKey)
 
 		if err := p.Resize(context.Background(), "data", 2*gib); err != nil {

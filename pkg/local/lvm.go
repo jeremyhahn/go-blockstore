@@ -608,39 +608,6 @@ func (p *Provider) probeFSType(ctx context.Context, device string) (string, erro
 	}
 }
 
-// deviceIdentity returns a device's major:minor, which is the same for every
-// path that leads to it.
-//
-// Device-mapper devices are reachable under several names — /dev/<vg>/<lv>,
-// /dev/mapper/<vg>-<lv>, /dev/dm-N — and the first two are symlinks to the
-// third, so comparing the strings tools print says nothing about whether two
-// paths are the same device. -L follows the symlink; without it stat describes
-// the link and reports 0:0.
-func (p *Provider) deviceIdentity(ctx context.Context, path string) (string, error) {
-	out, err := p.runner.Run(ctx, nil, "stat", "-L", "-c", "%t:%T", path)
-	if err != nil {
-		return "", fmt.Errorf("go-blockstore/local: identifying %s: %w", path, err)
-	}
-	id := strings.TrimSpace(string(out))
-	if id == "" || id == "0:0" {
-		return "", fmt.Errorf("go-blockstore/local: %s has no device number; it is not a block device", path)
-	}
-	return id, nil
-}
-
-// sameDevice reports whether two paths lead to the same device.
-func (p *Provider) sameDevice(ctx context.Context, a, b string) (bool, error) {
-	idA, err := p.deviceIdentity(ctx, a)
-	if err != nil {
-		return false, err
-	}
-	idB, err := p.deviceIdentity(ctx, b)
-	if err != nil {
-		return false, err
-	}
-	return idA == idB, nil
-}
-
 // findmntReport is the shape of `findmnt --list --json`.
 type findmntReport struct {
 	Filesystems []struct {

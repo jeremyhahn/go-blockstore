@@ -51,6 +51,7 @@ type Provider struct {
 	wipeOnDelete       bool
 	lockDir            string
 	mounter            Mounter
+	luks               luksBackend
 }
 
 // Ensure the provider satisfies the contract at compile time.
@@ -96,12 +97,15 @@ type Options struct {
 	// mounts an encrypted volume as long as KeyProvider is set.
 	//
 	// The container is LUKS2 with every cryptographic parameter pinned:
-	// PBKDF2-SHA-512, AES-256-XTS, and a 512-bit key. Nothing is left to
-	// cryptsetup's compiled-in defaults, which are neither stable across
-	// versions nor FIPS-approved — cryptsetup 2.7.0 defaults LUKS2 to argon2id
-	// and to a 256-bit key that XTS halves to AES-128. Every volume this
-	// provider creates is therefore identical whatever the host prefers, and
-	// deployable where FIPS 140-3 is required.
+	// PBKDF2-SHA-512, AES-256-XTS, and a 512-bit key. Nothing is left to the
+	// library's defaults, which are not FIPS-approved — go-luks2 formats with
+	// argon2id and derives with SHA-256 when it is not told otherwise. Every
+	// volume this provider creates is therefore identical on every host and in
+	// every build, and deployable where FIPS 140-3 is required.
+	//
+	// No cryptsetup binary is involved, and none needs to be installed: the
+	// header is written and parsed in this process by go-luks2, and the
+	// plaintext mapping is created with device-mapper ioctls.
 	//
 	// PBKDF2 rather than argon2id is the one choice that looks like a
 	// downgrade and is not. Argon2's memory-hardness defends a LOW-ENTROPY
@@ -183,6 +187,17 @@ type Options struct {
 	// It defaults to false, matching LVM's own behavior rather than imposing a
 	// full-volume zero-fill on every deletion in every deployment.
 	WipeOnDelete bool
+
+	// luks performs the LUKS2 operations. It defaults to nativeLUKS, which does
+	// them in this process with go-luks2; tests substitute a fake.
+	//
+	// It is unexported, unlike Runner and Mounter, because it is not a seam a
+	// caller has any business filling. Those two exist for callers as much as
+	// for tests — a deployment can legitimately want its own exec or mount
+	// implementation — while an outside implementation of this one would be an
+	// outside implementation of the encryption, which is exactly the thing this
+	// package pins rather than delegates.
+	luks luksBackend
 }
 
 // New creates a Provider from opts.
@@ -220,6 +235,11 @@ func New(opts Options) (*Provider, error) {
 		mounter = mount.System()
 	}
 
+	luks := opts.luks
+	if luks == nil {
+		luks = nativeLUKS{}
+	}
+
 	node := opts.NodeID
 	if node == "" {
 		hostname, err := os.Hostname()
@@ -239,6 +259,7 @@ func New(opts Options) (*Provider, error) {
 		wipeOnDelete:       opts.WipeOnDelete,
 		lockDir:            lockDir,
 		mounter:            mounter,
+		luks:               luks,
 	}, nil
 }
 
@@ -465,7 +486,7 @@ func (p *Provider) buildVolume(ctx context.Context, spec common.VolumeSpec) erro
 // An encrypted volume has its mapping torn down first. lvremove refuses a
 // logical volume with an open dm-crypt mapping over it, so a rollback that went
 // straight to lvremove would fail silently over exactly the case that needs it —
-// a cryptsetup close that did not work — and leave behind the half-built volume
+// a LUKS close that did not work — and leave behind the half-built volume
 // whose whole purpose here is to disappear.
 func (p *Provider) abandon(ctx context.Context, name string) error {
 	var closeErr error
@@ -997,7 +1018,8 @@ func (p *Provider) Attach(ctx context.Context, volID string, node common.NodeID)
 	device, err := p.unlockForAttach(ctx, volID, lv)
 	if err != nil {
 		// A failed Attach leaves nothing behind. Unlocking can fail after
-		// activation succeeded — a wrong key, a cryptsetup that will not run —
+		// activation succeeded — a wrong key, a device-mapper that will not
+		// take the mapping —
 		// and a volume left active after an error the caller saw as a failure
 		// is state nobody knows to clean up. The rollback is skipped when the
 		// volume was already active on the way in, since that activation
@@ -1165,9 +1187,9 @@ func (p *Provider) Detach(ctx context.Context, volID string, node common.NodeID)
 
 // closeIfEncrypted tears down the volume's LUKS mapping when it has one.
 //
-// Whether to involve cryptsetup at all is decided by probing the logical
-// volume, not by the Encrypted option: a host that runs only plain volumes
-// never invokes cryptsetup and so does not need it installed.
+// Whether to involve LUKS at all is decided by probing the logical volume, not
+// by the Encrypted option: a host that runs only plain volumes never touches
+// device-mapper.
 func (p *Provider) closeIfEncrypted(ctx context.Context, volID string) error {
 	fsType, err := p.probeFSType(ctx, p.lvPath(volID))
 	if err != nil {
@@ -1303,10 +1325,18 @@ func (p *Provider) umount(ctx context.Context, target string) error {
 	return p.mounter.Unmount(ctx, target)
 }
 
-// Resize grows the volume to newSize bytes and, where it can, grows what sits
-// on top of it: the LUKS mapping when the volume is unlocked, and the
-// filesystem when one is present and its tooling can grow it in the volume's
-// current state.
+// Resize grows the volume to newSize bytes and, where it can, grows the
+// filesystem on top of it — when one is present and its tooling can grow it in
+// the volume's current state.
+//
+// AN ENCRYPTED VOLUME THAT IS ATTACHED IS REFUSED, with ErrResizeWhileAttached,
+// and refused before anything moves. Growing its plaintext mapping would mean
+// removing that mapping and unlocking again, and a failure between the two
+// leaves the caller with no device at all rather than with an unresized one.
+// Detaching first costs one call and removes the hazard entirely: a detached
+// resize opens the container itself, grows the filesystem inside it and locks
+// it again, so there is no mapping belonging to anyone else to lose. See
+// ErrResizeWhileAttached for why this is not ErrUnsupported.
 //
 // Shrinking returns ErrUnsupported. LVM can shrink a logical volume, but doing
 // so under a filesystem that has not been shrunk first destroys data, and a
@@ -1381,6 +1411,24 @@ func (p *Provider) Resize(ctx context.Context, volID string, newSize int64) erro
 			volID, usableBytes(lv.SizeBytes, overhead), newSize)
 	}
 
+	// Resolved BEFORE anything is grown, so that the one case this provider
+	// will not serve is refused while the volume is still exactly as the caller
+	// left it. Reading it here rather than after the lvextend costs nothing —
+	// it is a probe, the lock is held, and growing a logical volume changes
+	// neither its activation nor what it holds.
+	device, err := p.attachedDevice(ctx, volID, lv)
+	if err != nil {
+		return err
+	}
+	if device == p.cryptPath(volID) {
+		return fmt.Errorf("%w: %q is unlocked as %s, and growing that mapping in place would mean "+
+			"tearing it down and unlocking again — which loses the caller's plaintext device outright "+
+			"if the second half fails. Detach the volume and resize it again; a detached resize grows "+
+			"the filesystem inside the container and cannot lose a mapping, because it opens and closes "+
+			"its own",
+			ErrResizeWhileAttached, volID, device)
+	}
+
 	if target > lv.SizeBytes {
 		_, err = p.runner.Run(ctx, nil, "lvextend", "--size", strconv.FormatInt(backing, 10)+"b", p.lvRef(volID))
 		if err != nil {
@@ -1388,17 +1436,8 @@ func (p *Provider) Resize(ctx context.Context, volID string, newSize int64) erro
 		}
 	}
 
-	device, err := p.attachedDevice(ctx, volID, lv)
-	if err != nil {
-		return err
-	}
 	if device == "" {
 		return p.growDetachedFilesystem(ctx, volID)
-	}
-	if device == p.cryptPath(volID) {
-		if err := p.luksResize(ctx, volID); err != nil {
-			return err
-		}
 	}
 	return p.growFilesystem(ctx, volID, device)
 }
@@ -1438,12 +1477,16 @@ func (p *Provider) growDetachedFilesystem(ctx context.Context, volID string) (er
 // growDetachedEncryptedFilesystem opens a locked container just long enough to
 // grow the filesystem inside it, and locks it again on the way out.
 //
-// The mapping needs no cryptsetup resize. It is opened here, after the logical
-// volume has already grown, and cryptsetup sizes a mapping to the device it
-// finds — measured on cryptsetup 2.7.0, growing a 64 MiB volume to 128 MiB and
-// re-opening took the mapping from 50331648 to 117440512 bytes with no resize
-// asked for. Issuing one anyway would borrow the passphrase a second time to
-// achieve nothing, and every borrow is an exposure this package works to avoid.
+// The mapping needs no resize, and this is the reason an attached volume is
+// refused while a detached one is not. It is opened HERE, after the logical
+// volume has already grown, and the container's data segment is "dynamic", so
+// whoever opens it sizes the mapping to the device it finds — measured on
+// cryptsetup 2.7.0, growing a 64 MiB volume to 128 MiB and re-opening took the
+// mapping from 50331648 to 117440512 bytes with no resize asked for, and
+// go-luks2 computes the length the same way. Nothing is torn down to achieve
+// that: the mapping this function closes on the way out is the one it opened on
+// the way in, so a failure anywhere leaves the volume as detached as it started
+// and costs the caller nothing it was using.
 //
 // This is also the one path that unlocks a volume the caller had locked. It is
 // justified by the alternative, which is reporting success over a filesystem
@@ -2001,8 +2044,8 @@ func describeFSType(fsType string) string {
 // the probe that said "LUKS container" and the read of the header: a concurrent
 // Detach takes the device node away, a concurrent Delete takes the volume
 // itself, and the header read fails either way. Before this, both of those
-// races degraded quietly — blkid and cryptsetup status report a vanished device
-// as "nothing here" rather than as a failure — and turning them into a hard
+// races degraded quietly — blkid and the mapping lookup report a vanished
+// device as "nothing here" rather than as a failure — and turning them into a hard
 // Status error would make the method unreliable in exactly the concurrent use
 // it exists for.
 //

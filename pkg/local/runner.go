@@ -24,9 +24,13 @@ import (
 )
 
 // CommandRunner executes an external command. Every system tool this provider
-// drives — lvm, cryptsetup, mkfs, mount, umount, findmnt, blkid, dd — goes
-// through this one interface, so tests exercise the whole provider against a
-// fake and never need root, LVM or a block device.
+// drives — lvm, mkfs, findmnt, blkid, dd — goes through this one interface, so
+// tests exercise the whole provider against a fake and never need root, LVM or
+// a block device.
+//
+// LUKS is NOT among them and has not been since 2026-08-29: formatting,
+// unlocking and header reads happen in this process through luksBackend, which
+// is a separate seam for a reason — there is no command to run.
 //
 // name is the binary and args are its arguments, already split: an
 // implementation passes them as individual argv elements and must not hand the
@@ -34,22 +38,23 @@ import (
 // consumption, so a runner that builds a command line out of them reintroduces
 // exactly the injection the provider's validation exists to prevent.
 //
-// stdin, when non-nil, is written to the command's standard input. That is how
-// key material reaches cryptsetup: a passphrase in args would be readable by
-// any process on the host from /proc/<pid>/cmdline for as long as the command
-// runs.
+// stdin, when non-nil, is written to the command's standard input. No command
+// this provider runs uses it any more — the one that did was the cryptsetup
+// that consumed a passphrase there — and it is kept because the interface is
+// exported and callers implement it, and because a tool added later may need
+// it.
 //
 // AN IMPLEMENTATION MUST NOT RETAIN stdin, or copy it anywhere that outlives
-// the call. The provider passes a slice borrowed from locked, mlock'd memory
-// for exactly the length of one command; a copy kept beyond that is an
-// unprotected, swappable, core-dumpable duplicate of a passphrase, which is the
-// whole thing the enclave exists to prevent.
+// the call. That rule stands whether or not the bytes are a secret today: the
+// provider passes a slice it borrowed for exactly the length of one command,
+// and a runner that keeps one has changed the caller's lifetime guarantees
+// without saying so.
 //
 // Run returns the command's standard output. When the command starts and exits
 // non-zero it returns *ExitError, which the provider distinguishes from a
-// failure to start at all — several tools (blkid, findmnt, cryptsetup status)
-// report "no such thing" as a non-zero exit, and treating a missing binary the
-// same way would silently turn a broken host into an empty answer.
+// failure to start at all — several tools (blkid, findmnt) report "no such
+// thing" as a non-zero exit, and treating a missing binary the same way would
+// silently turn a broken host into an empty answer.
 type CommandRunner interface {
 	Run(ctx context.Context, stdin []byte, name string, args ...string) ([]byte, error)
 }

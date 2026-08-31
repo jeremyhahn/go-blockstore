@@ -38,8 +38,8 @@ const DefaultLockDir = "/run/lock/go-blockstore"
 // lock is by returning it.
 //
 // 25ms is immaterial against what these operations do. The cheapest of them
-// forks lvs; the expensive ones run cryptsetup's key derivation, which is
-// seconds.
+// forks lvs; the expensive ones run a LUKS key derivation, which is a hundred
+// thousand PBKDF2 rounds.
 const lockRetryInterval = 25 * time.Millisecond
 
 // lockVolumes takes the per-volume lock for each named volume and returns the

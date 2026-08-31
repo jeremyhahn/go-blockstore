@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,9 +130,9 @@ func TestDestroyedEnclaveCannotBeBorrowed(t *testing.T) {
 }
 
 // TestProviderDestroysTheKeyAfterUse pins the ownership half of the contract:
-// the provider takes what the KeyProvider hands over and destroys it once
-// cryptsetup has consumed it, so locked pages are not left holding a passphrase
-// after the operation that needed it.
+// the provider takes what the KeyProvider hands over and destroys it once the
+// LUKS operation has consumed it, so locked pages are not left holding a
+// passphrase after the operation that needed it.
 func TestProviderDestroysTheKeyAfterUse(t *testing.T) {
 	var handedOut []*enclave.MemoryEnclave
 
@@ -162,18 +163,19 @@ func TestProviderDestroysTheKeyAfterUse(t *testing.T) {
 	}
 }
 
-// TestKeyIsBorrowedOnlyForTheCommand checks the narrowness of the window: the
-// passphrase is a []byte while cryptsetup is being fed and at no other time.
-func TestKeyIsBorrowedOnlyForTheCommand(t *testing.T) {
+// TestKeyIsBorrowedOnlyForTheOperation checks the narrowness of the window: the
+// passphrase is a []byte while the LUKS backend is being handed it and at no
+// other time.
+func TestKeyIsBorrowedOnlyForTheOperation(t *testing.T) {
 	var aliveDuringRun bool
 	var enc *enclave.MemoryEnclave
 
 	runner := newFakeRunner()
-	runner.on("cryptsetup", func(_ []string, stdin []byte) ([]byte, error) {
-		// Only the commands actually fed a passphrase say anything here; the
-		// closing `cryptsetup close` carries no stdin at all.
-		if stdin != nil {
-			aliveDuringRun = aliveDuringRun || (enc != nil && enc.IsAlive() && string(stdin) == testKey)
+	runner.on(luksBinary, func(_ []string, key []byte) ([]byte, error) {
+		// Only the operations actually given a passphrase say anything here;
+		// the closing close carries none at all.
+		if key != nil {
+			aliveDuringRun = aliveDuringRun || (enc != nil && enc.IsAlive() && string(key) == testKey)
 		}
 		return nil, nil
 	})
@@ -190,19 +192,25 @@ func TestKeyIsBorrowedOnlyForTheCommand(t *testing.T) {
 		t.Fatalf("Provision: %v", err)
 	}
 	if !aliveDuringRun {
-		t.Error("the passphrase was not available to the command that needed it")
+		t.Error("the passphrase was not available to the operation that needed it")
 	}
 	if enc.IsAlive() {
-		t.Error("the enclave outlived the command it was borrowed for")
+		t.Error("the enclave outlived the operation it was borrowed for")
 	}
 }
 
-// TestLUKSFormatPinsFIPSParameters asserts the exact argv. cryptsetup's
-// defaults are not FIPS-approved and have moved between versions, so a volume
-// formatted by this provider must state every parameter rather than inherit
-// one: dropping any of these silently produces a container that is weaker, or
-// non-compliant, or both, and nothing about the resulting volume says so.
-func TestLUKSFormatPinsFIPSParameters(t *testing.T) {
+// TestLUKSFormatBorrowsTheKeyAndKeepsItOffArgv is what is left of the old argv
+// assertion once there is no argv.
+//
+// The parameters used to be checkable by reading the cryptsetup command line;
+// they are now arguments to a function call inside this process, so what a fake
+// can still observe is the BORROW: the format operation is issued against the
+// right device with the passphrase handed to it as a slice, and that slice
+// never appears anywhere a command line would have exposed it. The parameters
+// themselves are pinned against the header they actually produce — see
+// TestNativeFormatPinsFIPSParameters, which formats a container and reads them
+// back rather than trusting a fake to have been asked for them.
+func TestLUKSFormatBorrowsTheKeyAndKeepsItOffArgv(t *testing.T) {
 	runner := newFakeRunner()
 	p := newTestProvider(t, runner, encrypted)
 
@@ -210,40 +218,14 @@ func TestLUKSFormatPinsFIPSParameters(t *testing.T) {
 		t.Fatalf("luksFormat: %v", err)
 	}
 
-	call := runner.mustFind(t, "cryptsetup")
-	want := "cryptsetup luksFormat --type luks2 --batch-mode " +
-		"--pbkdf pbkdf2 --hash sha512 --cipher aes-xts-plain64 --key-size 512 " +
-		"--key-file - /dev/vg0/data"
-	if call.line() != want {
-		t.Errorf("luksFormat ran:\n  %s\nwant:\n  %s", call.line(), want)
+	call := runner.mustFind(t, luksBinary)
+	if want := "luks format /dev/vg0/data"; call.line() != want {
+		t.Errorf("luksFormat issued:\n  %s\nwant:\n  %s", call.line(), want)
 	}
-
-	// The passphrase still goes in on stdin, never argv.
 	if !bytes.Equal(call.Stdin, []byte(testKey)) {
-		t.Errorf("stdin = %q, want the passphrase", call.Stdin)
+		t.Errorf("the borrowed key = %q, want the passphrase", call.Stdin)
 	}
 	assertKeyNeverOnArgv(t, runner)
-}
-
-// TestLUKSFormatDoesNotPinIterations records the one parameter deliberately
-// left to cryptsetup. Measured on 2.7.0, it enforces a hard PBKDF2 minimum of
-// 1000 — the floor NIST SP 800-132 asks for — and refuses to go below it, so
-// benchmarking cannot undershoot compliance. A fixed count could not rise on
-// faster hardware and would undershoot the benchmark everywhere it mattered.
-func TestLUKSFormatDoesNotPinIterations(t *testing.T) {
-	runner := newFakeRunner()
-	p := newTestProvider(t, runner, encrypted)
-
-	if err := p.luksFormat(context.Background(), "data", "/dev/vg0/data"); err != nil {
-		t.Fatalf("luksFormat: %v", err)
-	}
-
-	call := runner.mustFind(t, "cryptsetup")
-	for _, unwanted := range []string{"--pbkdf-force-iterations", "--iter-time"} {
-		if contains(call.Args, unwanted) {
-			t.Errorf("luksFormat pinned %s; the benchmark adapts to hardware and cannot go below cryptsetup's floor", unwanted)
-		}
-	}
 }
 
 func TestFileKeyProvider(t *testing.T) {
@@ -368,7 +350,7 @@ func TestLUKSIsOpenRefusesAForeignMapping(t *testing.T) {
 }
 
 // TestLUKSIsOpenAcceptsOurOwnMapping checks the identity comparison is by
-// device rather than by path text: cryptsetup reports the dm-canonical
+// device rather than by path text: sysfs leads to the dm-canonical
 // /dev/mapper/<vg>-<lv>, which is a different string from the /dev/<vg>/<lv>
 // this provider opened, and the same device.
 func TestLUKSIsOpenAcceptsOurOwnMapping(t *testing.T) {
@@ -384,31 +366,31 @@ func TestLUKSIsOpenAcceptsOurOwnMapping(t *testing.T) {
 	}
 }
 
-// TestLUKSIsOpenFailsClosedOnUnreadableIdentity covers a status that cannot be
-// tied to a device at all. The point of reading it is to refuse what cannot be
-// established, so a missing or repeated device line is a failure, not a pass.
+// TestLUKSIsOpenFailsClosedOnUnreadableIdentity covers a mapping that cannot be
+// tied to a device at all. The point of reading the backing device is to refuse
+// what cannot be established, so an unreadable answer is a failure, not a pass.
+//
+// The shapes that produce one are properties of sysfs rather than of this
+// package, so they are covered where they arise —
+// TestBackingDeviceRequiresExactlyOneSlave builds each of them out of a
+// directory a test owns. This checks that luksIsOpen propagates rather than
+// swallowing, which is the half that belongs here.
 func TestLUKSIsOpenFailsClosedOnUnreadableIdentity(t *testing.T) {
-	cases := map[string]string{
-		"no device line":   "/dev/mapper/bs-vg0_data is active.\n  type:    LUKS2\n",
-		"empty device":     "/dev/mapper/bs-vg0_data is active.\n  device:  \n",
-		"two device lines": "/dev/mapper/bs-vg0_data is active.\n  device:  /dev/mapper/vg0-data\n  device:  /dev/mapper/vg0-other\n",
+	sentinel := fmt.Errorf("%w: /sys/dev/block/253:3/slaves lists 2", errNoBackingDevice)
+	runner := newFakeRunner().on(luksBinary, func(args []string, _ []byte) ([]byte, error) {
+		if len(args) > 0 && args[0] == "mapping" {
+			return nil, sentinel
+		}
+		return nil, nil
+	})
+	p := newTestProvider(t, runner, withKey)
+
+	open, err := p.luksIsOpen(context.Background(), "data")
+	if err == nil {
+		t.Fatalf("luksIsOpen returned %v and no error for a mapping with no single backing device", open)
 	}
-
-	for name, body := range cases {
-		t.Run(name, func(t *testing.T) {
-			out := body
-			runner := newFakeRunner().on("cryptsetup", func(args []string, _ []byte) ([]byte, error) {
-				if len(args) > 0 && args[0] == "status" {
-					return []byte(out), nil
-				}
-				return nil, nil
-			})
-			p := newTestProvider(t, runner, withKey)
-
-			if open, err := p.luksIsOpen(context.Background(), "data"); err == nil {
-				t.Fatalf("luksIsOpen returned %v and no error for %s", open, name)
-			}
-		})
+	if !errors.Is(err, errNoBackingDevice) {
+		t.Errorf("luksIsOpen = %v, want it to carry errNoBackingDevice", err)
 	}
 }
 
@@ -462,7 +444,7 @@ func TestKeyProviderFailurePropagates(t *testing.T) {
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("Attach = %v, want the KeyProvider error", err)
 	}
-	assertNoLine(t, runner, "cryptsetup open --type luks2 --key-file - /dev/vg0/data bs-vg0_data")
+	assertNoLine(t, runner, "luks open /dev/vg0/data bs-vg0_data")
 }
 
 func TestEmptyKeyIsRejected(t *testing.T) {
@@ -500,19 +482,24 @@ func TestKeyProviderReceivesTheVolumeID(t *testing.T) {
 	}
 }
 
-// TestCryptsetupFailuresPropagate walks the LUKS commands the provider issues
-// and checks each one's failure reaches the caller instead of being swallowed.
-func TestCryptsetupFailuresPropagate(t *testing.T) {
+// TestLUKSFailuresPropagate walks the LUKS operations the provider issues and
+// checks each one's failure reaches the caller instead of being swallowed.
+func TestLUKSFailuresPropagate(t *testing.T) {
 	ctx := context.Background()
 
 	cases := map[string]struct {
 		setup func() *fakeRunner
 		call  func(*Provider) error
 	}{
-		"luksFormat": {
+		"format": {
 			setup: func() *fakeRunner {
 				r := newFakeRunner()
-				r.fail("cryptsetup", 1, "not a valid device")
+				r.on(luksBinary, func(args []string, _ []byte) ([]byte, error) {
+					if len(args) > 0 && args[0] == "format" {
+						return nil, errors.New("not a valid device")
+					}
+					return nil, nil
+				})
 				return r
 			},
 			call: func(p *Provider) error {
@@ -520,16 +507,16 @@ func TestCryptsetupFailuresPropagate(t *testing.T) {
 				return err
 			},
 		},
-		"luksOpen": {
+		"open": {
 			setup: func() *fakeRunner {
 				r := newFakeRunner().
 					withLVs(lvFixture{Name: "data", SizeBytes: gib}).
 					withBlkid(map[string]string{"/dev/vg0/data": fsTypeLUKS})
-				r.on("cryptsetup", func(args []string, _ []byte) ([]byte, error) {
+				r.on(luksBinary, func(args []string, _ []byte) ([]byte, error) {
 					if len(args) > 0 && args[0] == "open" {
-						return nil, &ExitError{Name: "cryptsetup", Args: args, Code: 2, Stderr: "no key available"}
+						return nil, errors.New("failed to unlock any keyslot: incorrect passphrase")
 					}
-					return nil, &ExitError{Name: "cryptsetup", Args: args, Code: 4}
+					return r.luks(args, nil)
 				})
 				return r
 			},
@@ -538,30 +525,34 @@ func TestCryptsetupFailuresPropagate(t *testing.T) {
 				return err
 			},
 		},
-		"luksClose": {
+		"close": {
 			setup: func() *fakeRunner {
 				r := newFakeRunner().
 					withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
-					withBlkid(map[string]string{"/dev/vg0/data": fsTypeLUKS})
-				r.on("cryptsetup", func(args []string, _ []byte) ([]byte, error) {
-					if len(args) > 0 && args[0] == "status" {
-						return []byte("active"), nil
+					withBlkid(map[string]string{"/dev/vg0/data": fsTypeLUKS}).
+					withOpenMappings("bs-vg0_data")
+				r.on(luksBinary, func(args []string, _ []byte) ([]byte, error) {
+					if len(args) > 0 && args[0] == "close" {
+						return nil, errors.New("failed to remove device-mapper: device or resource busy")
 					}
-					return nil, &ExitError{Name: "cryptsetup", Args: args, Code: 5, Stderr: "device busy"}
+					return r.luks(args, nil)
 				})
 				return r
 			},
 			call: func(p *Provider) error { return p.Detach(ctx, "data", "node-a") },
 		},
-		"status": {
+		"mapping lookup": {
 			setup: func() *fakeRunner {
 				r := newFakeRunner().
 					withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
 					withBlkid(map[string]string{"/dev/vg0/data": fsTypeLUKS})
-				// A cryptsetup that is not installed at all: not an *ExitError,
-				// so it must not be read as "the mapping is not open".
-				r.on("cryptsetup", func([]string, []byte) ([]byte, error) {
-					return nil, errors.New("exec: cryptsetup: executable file not found in $PATH")
+				// A device-mapper that cannot be reached at all. It must not be
+				// read as "the mapping is not open".
+				r.on(luksBinary, func(args []string, _ []byte) ([]byte, error) {
+					if len(args) > 0 && args[0] == "mapping" {
+						return nil, errors.New("open /dev/mapper/control: permission denied")
+					}
+					return r.luks(args, nil)
 				})
 				return r
 			},
@@ -570,13 +561,41 @@ func TestCryptsetupFailuresPropagate(t *testing.T) {
 				return err
 			},
 		},
+		"mapping identity": {
+			setup: func() *fakeRunner {
+				r := newFakeRunner().
+					withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
+					withBlkid(map[string]string{"/dev/vg0/data": fsTypeLUKS}).
+					withOpenMappings("bs-vg0_data")
+				// The mapping is there, but the volume it should be over cannot
+				// be identified. Ownership is then unestablished, which is a
+				// refusal rather than an adoption.
+				r.on(luksBinary, func(args []string, _ []byte) ([]byte, error) {
+					if len(args) > 0 && args[0] == "identity" {
+						return nil, errors.New("/dev/vg0/data has no device number; it is not a block device")
+					}
+					return r.luks(args, nil)
+				})
+				return r
+			},
+			call: func(p *Provider) error { return p.Detach(ctx, "data", "node-a") },
+		},
+		"header read": {
+			setup: func() *fakeRunner {
+				return newFakeRunner().
+					withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
+					withBlkid(map[string]string{"/dev/vg0/data": fsTypeLUKS}).
+					withLUKSDumpFailure("/dev/vg0/data")
+			},
+			call: func(p *Provider) error { return p.Resize(ctx, "data", 2*gib) },
+		},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			p := newTestProvider(t, tc.setup(), encrypted)
 			if err := tc.call(p); err == nil {
-				t.Fatal("the operation succeeded despite a cryptsetup failure")
+				t.Fatal("the operation succeeded despite a LUKS failure")
 			}
 		})
 	}

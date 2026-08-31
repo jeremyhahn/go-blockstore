@@ -15,13 +15,11 @@ package local
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
-	"strings"
 
 	"github.com/jeremyhahn/go-enclave"
 )
@@ -30,12 +28,14 @@ import (
 const fsTypeLUKS = "crypto_LUKS"
 
 // The LUKS2 parameters every container this provider creates is formatted with.
-// They are pinned rather than left to cryptsetup because cryptsetup's defaults
-// are not FIPS-approved and its compiled-in defaults vary by host and version:
-// on cryptsetup 2.7.0 the default LUKS2 PBKDF is argon2id.
+// They are pinned rather than left to the library because go-luks2's defaults
+// are not FIPS-approved: FormatOptions with an empty KDFType formats with
+// argon2id, and an empty HashAlgo derives with SHA-256.
 const (
-	// luksPBKDF is PBKDF2, the only key-derivation function among cryptsetup's
-	// choices that is FIPS-approved. Argon2id, cryptsetup's default, is not.
+	// luksPBKDF is PBKDF2, the only key-derivation function among go-luks2's
+	// choices that is FIPS-approved. Argon2id, its default, is not — and cannot
+	// become so by accident, because argon2 is implemented in pure Go by
+	// golang.org/x/crypto and never enters the Go Cryptographic Module at all.
 	//
 	// Its memory-hardness is what argon2 is chosen for, and it is not
 	// load-bearing here: the KDF is stretching KeyProvider material, which is a
@@ -47,20 +47,25 @@ const (
 	luksPBKDF = "pbkdf2"
 
 	// luksHash is SHA-512: FIPS 180-4 approved, and faster per byte than
-	// SHA-256 on 64-bit hardware, so the same wall-clock benchmark buys more
-	// iterations of real work. It also matches the 256-bit security level of
-	// the cipher below, and is what cryptsetup then uses for the anti-forensic
+	// SHA-256 on 64-bit hardware. It also matches the 256-bit security level of
+	// the cipher below, and is what go-luks2 then uses for the anti-forensic
 	// stripes and the keyslot digest, keeping one hash across the header.
 	luksHash = "sha512"
 
-	// luksCipher is AES in XTS mode, the block-device standard and FIPS-approved.
-	luksCipher = "aes-xts-plain64"
+	// luksCipher and luksCipherMode are AES in XTS mode, the block-device
+	// standard and FIPS-approved. They are two constants because go-luks2 takes
+	// them separately and joins them for the header, where they appear as the
+	// familiar "aes-xts-plain64".
+	luksCipher     = "aes"
+	luksCipherMode = "xts-plain64"
 
-	// luksKeySize is in bits, and XTS splits it into two internal keys — so 512
-	// here is AES-256-XTS, not AES-512. cryptsetup's default is 256, which XTS
-	// halves to AES-128; pinning 512 is what makes the strength explicit rather
-	// than a consequence of a default that has moved before.
-	luksKeySize = "512"
+	// luksKeySizeBits is in bits, and XTS splits it into two internal keys — so
+	// 512 here is AES-256-XTS, not AES-512. go-luks2's default is also 512, and
+	// stating it is what makes the strength a property of this package rather
+	// than a consequence of a default that has moved before: cryptsetup, which
+	// wrote every container this package created before 2026-08-29, defaults to
+	// 256, which XTS halves to AES-128.
+	luksKeySizeBits = 512
 )
 
 // luksHeaderBytes is the space a LUKS2 container this provider formats reserves
@@ -69,19 +74,35 @@ const (
 //
 // It is a constant rather than something read back per volume because the
 // provider PINS every parameter that determines it — see luksFormat — so the
-// figure is a property of this package and not of whichever cryptsetup the host
-// happens to ship. It is measured rather than taken from folklore. On
-// cryptsetup 2.7.0 (measured 2026-08-27 on a loopback volume group),
-// formatting with exactly those parameters at 32 MiB, 64 MiB, 128 MiB, 300 MiB
-// and 1200 MiB put the data segment at offset 16777216 every time, and the
-// plaintext mapping came back exactly that much smaller than the logical volume
-// under it. It does not scale with the device.
+// figure is a property of this package and of go-luks2's layout, not of
+// whatever a host happens to ship. It is measured rather than taken from
+// folklore, and it has now been measured against two independent formatters
+// that agree to the byte:
 //
-// Where cryptsetup DOES depart from it is a device too small to hold a header
-// and any data at all: at 16 MiB and below it shrinks the keyslots area to fit
-// the device and the container ends up with zero usable bytes, so cryptsetup
-// open fails. Sizing here always adds this figure to a capacity that is already
-// positive, so no backing device this provider creates lands in that range.
+//   - cryptsetup 2.7.0 (measured 2026-08-27 on a loopback volume group).
+//     Formatting with exactly these parameters at 32 MiB, 64 MiB, 128 MiB,
+//     300 MiB and 1200 MiB put the data segment at offset 16777216 every time,
+//     and the plaintext mapping came back exactly that much smaller than the
+//     logical volume under it.
+//   - go-luks2 v0.1.7-alpha (measured 2026-08-29, formatting sparse files at
+//     the same five sizes and reading the segment offset back out of the header
+//     it wrote). Offset 16777216 at every size, keyslot area at 32768 with
+//     258048 bytes used.
+//
+// It does not scale with the device, and the arithmetic behind it is not a
+// coincidence of two implementations: go-luks2 computes the offset as the
+// keyslots area start plus the keyslots area size (pkg/luks2/format.go), the
+// area starts at 0x8000 = 32768 because two 16 KiB metadata copies precede it,
+// and the area is the cryptsetup-compatible LUKS2DefaultKeyslotsSize of
+// 16 MiB - 2*16 KiB = 16744448, which is larger than the 258048 bytes a single
+// 512-bit keyslot needs. 32768 + 16744448 = 16777216.
+//
+// Where go-luks2 and cryptsetup DIVERGE is a device too small to hold a header
+// and any data at all. cryptsetup shrinks the keyslots area to fit; go-luks2
+// does not, and writes a segment offset past the end of the device, which then
+// fails to open. Sizing here always adds this figure to a capacity that is
+// already positive, so no backing device this provider creates lands in that
+// range either way.
 //
 // It sizes containers this provider CREATES. What an existing container's
 // header actually costs is read from that header — see luksDataOffset — because
@@ -129,8 +150,37 @@ func encryptedTagFor(headerBytes int64) string {
 	return encryptedTagPrefix + strconv.FormatInt(headerBytes, 10)
 }
 
+// ErrResizeWhileAttached is returned by Resize for an encrypted volume whose
+// plaintext mapping is open on this node. Detach it and resize again.
+//
+// It exists because growing a dm-crypt mapping in place means reloading the
+// device-mapper table underneath the live device, and that needs the
+// container's master key. go-luks2 v0.1.8-alpha exposes neither a resize nor
+// any way to obtain that key (getMasterKey and unlockKeyslot are unexported),
+// so the only mechanism available through it is to REMOVE the mapping and
+// unlock again. That is a destructive shape wearing a resize's name: the
+// teardown is unconditional and the rebuild can fail — a KeyProvider rotated
+// since the volume was attached, a damaged header, any device-mapper refusal —
+// and what the caller is left with is not an unresized volume but no plaintext
+// device at all. Validating the key first narrows the window and does not close
+// it, so the operation is refused rather than attempted.
+//
+// It is NOT wrapped around common.ErrUnsupported, and the difference is the
+// whole value of the sentinel. ErrUnsupported tells a caller this backend
+// cannot serve the request and that retrying or reconfiguring is pointless;
+// this request is served perfectly well one Detach later, which is the opposite
+// advice. A caller holding the attachment acts on that distinction — it is the
+// same shape as common.ErrNotPrimary, "the request is fine, the volume is in
+// the wrong state at the moment" — so the sentinel says so in its own right.
+//
+// The detached path has no such hazard and is not restricted: Resize over a
+// detached volume unlocks the container itself, grows the filesystem and locks
+// it again, and a failure anywhere in that leaves the volume exactly as
+// detached as it started. See growDetachedEncryptedFilesystem.
+var ErrResizeWhileAttached = errors.New("cannot resize an encrypted volume while it is attached")
+
 // mappingPrefix namespaces this provider's device-mapper names so an unlocked
-// volume is recognizable on a host that also runs other cryptsetup consumers.
+// volume is recognizable on a host that also runs other LUKS consumers.
 const mappingPrefix = "bs-"
 
 // KeyProvider supplies the passphrase that unlocks a volume's LUKS container,
@@ -141,11 +191,13 @@ const mappingPrefix = "bs-"
 // key per volume.
 //
 // THE PROVIDER TAKES OWNERSHIP of what it is handed and destroys the enclave as
-// soon as cryptsetup has consumed the passphrase, so every call returns a fresh
-// enclave rather than one the implementation intends to reuse. Between those two
-// points the passphrase is borrowed for exactly one command: it exists as a
-// []byte only inside a MemoryEnclave.WithBytes callback that does nothing but
-// write it to that process's standard input.
+// soon as the LUKS operation has consumed the passphrase, so every call returns
+// a fresh enclave rather than one the implementation intends to reuse. Between
+// those two points the passphrase is borrowed for exactly one operation: it
+// exists as a []byte only inside a MemoryEnclave.WithBytes callback, which hands
+// it to go-luks2 for the length of one call and nothing longer. That borrow is
+// narrower than it used to be — the bytes no longer leave the process at all,
+// where they were once written to a cryptsetup child's standard input.
 //
 // The type is an enclave and not a []byte because a []byte cannot be taken back.
 // Go's garbage collector may copy a heap slice while it lives, and zeroing the
@@ -154,6 +206,13 @@ const mappingPrefix = "bs-"
 // An enclave's pages are mlock'd, guarded, kept out of core dumps and wiped on
 // release, which is the guarantee this package needs and the reason go-enclave
 // is a portfolio-wide primitive rather than something restated here.
+//
+// THE PASSPHRASE MUST BE AT LEAST 8 BYTES AND AT MOST 512. That is go-luks2's
+// bound, checked on every format and every unlock, and it is stated here because
+// a KeyProvider that returns something shorter fails at the operation rather
+// than at configuration time. It is not a constraint on real key material —
+// anything a TPM unseals or a key file holds is far longer — but it does reject
+// a toy passphrase that a cryptsetup-backed build would have accepted.
 //
 // This is the whole of the provider's involvement with key management. Where
 // the key comes from — a file, an operator prompt, a TPM-sealed blob unsealed
@@ -166,8 +225,8 @@ type KeyProvider func(ctx context.Context, volID string) (*enclave.MemoryEnclave
 // FileKeyProvider returns a KeyProvider that reads the passphrase from a file,
 // re-reading it on each call so a rotated key file takes effect without
 // restarting the process. Trailing newlines are not stripped: the file's bytes
-// are the passphrase, which is what `cryptsetup --key-file` does with a file of
-// its own.
+// are the passphrase, which is what `cryptsetup --key-file` did with a file of
+// its own and what any container already formatted that way expects.
 //
 // The bytes go from the file descriptor into the enclave's locked pages
 // directly. There is no intermediate slice to wipe, and therefore none for the
@@ -324,59 +383,60 @@ func (p *Provider) key(ctx context.Context, volID string) (*enclave.MemoryEnclav
 	return enc, nil
 }
 
-// runWithKey borrows the volume's passphrase for exactly one command.
+// withKey borrows the volume's passphrase for exactly one LUKS operation.
 //
 // The borrow window is this function and nothing else: the passphrase becomes a
-// []byte when WithBytes hands one over, is written to the command's standard
-// input, and stops being one when the callback returns. The enclave is
-// destroyed on the way out whatever happened, so a failed command does not
-// leave locked pages holding a key behind.
-func (p *Provider) runWithKey(ctx context.Context, volID, name string, args ...string) error {
+// []byte when WithBytes hands one over, is passed to op, and stops being one
+// when the callback returns. The enclave is destroyed on the way out whatever
+// happened, so a failed operation does not leave locked pages holding a key
+// behind.
+//
+// op MUST NOT retain the slice. Every implementation of luksBackend is bound by
+// the same rule, and the native one keeps to it by handing the bytes straight
+// to go-luks2, which derives from them and holds nothing.
+func (p *Provider) withKey(ctx context.Context, volID string, op func(key []byte) error) error {
 	enc, err := p.key(ctx, volID)
 	if err != nil {
 		return err
 	}
 	defer enc.Destroy()
 
-	return enc.WithBytes(func(key []byte) error {
-		_, runErr := p.runner.Run(ctx, key, name, args...)
-		return runErr
-	})
+	return enc.WithBytes(op)
 }
 
 // luksFormat writes a LUKS2 header onto the device.
 //
 // Every cryptographic parameter is stated rather than defaulted. A container
-// formatted by this provider is the same on every host, whatever cryptsetup was
-// compiled to prefer there — which matters because the defaults are neither
-// stable nor FIPS-approved: cryptsetup 2.7.0 picks argon2id for LUKS2 and a
-// 256-bit key that XTS halves to AES-128.
+// formatted by this provider is the same on every host and in every build,
+// which matters because the library's defaults are not FIPS-approved:
+// go-luks2 formats with argon2id and derives with SHA-256 when it is not told
+// otherwise. Nothing here depends on a cryptsetup binary being installed, being
+// a particular version, or being compiled with a particular set of defaults —
+// there is no cryptsetup involved at all.
 //
-// The iteration count is left to cryptsetup's benchmark on purpose. Measured on
-// cryptsetup 2.7.0, it enforces a hard PBKDF2 minimum of 1000 — it refuses
-// --pbkdf-force-iterations 999 outright — which is also the floor NIST SP
-// 800-132 asks for, so the compliance floor holds without this provider pinning
-// anything. Even --iter-time 1, the most degenerate benchmark available, came
-// back with 1688 iterations, and the default produced 3,344,740 on this
-// hardware. A fixed count would be strictly worse: it cannot rise on faster
-// hardware, so it would undershoot the benchmark everywhere it mattered.
+// The iteration count is left to go-luks2's benchmark rather than pinned, for
+// the reason a pinned count is worse: a fixed number cannot rise on faster
+// hardware. Measured on go-luks2 v0.1.7-alpha, that benchmark does not in fact
+// adapt — it times 1000 PBKDF2-SHA-512 iterations at millisecond resolution,
+// that derivation takes under a millisecond, and it falls through to a
+// hard-coded 100000 — so every container formatted here gets 100000 iterations
+// where cryptsetup 2.7.0 chose 3,344,740 on the same hardware. That is above
+// the 1000-iteration floor NIST SP 800-132 asks for, so compliance holds, and
+// it is not load-bearing for the material this provider stretches: KeyProvider
+// returns machine-generated high-entropy key material, not a human passphrase,
+// so there is no low-entropy secret for the iteration count to be defending.
+// The behavior is recorded at luksPBKDFIterTime and filed against go-luks2
+// rather than compensated for here.
 //
-// The passphrase goes to cryptsetup on standard input via "--key-file -", never
-// as an argument: an argument would be readable from /proc/<pid>/cmdline by any
-// process on the host while the format runs. --batch-mode suppresses the
-// interactive "this will overwrite data" confirmation, which has no answer in a
-// library call.
+// The passphrase never leaves the process. It was written to a cryptsetup
+// child's standard input before 2026-08-29 — never as an argument, which any
+// process on the host could have read out of /proc/<pid>/cmdline — and now it
+// is borrowed out of locked memory for one function call and no file descriptor
+// at all.
 func (p *Provider) luksFormat(ctx context.Context, volID, device string) error {
-	err := p.runWithKey(ctx, volID, "cryptsetup", "luksFormat",
-		"--type", "luks2",
-		"--batch-mode",
-		"--pbkdf", luksPBKDF,
-		"--hash", luksHash,
-		"--cipher", luksCipher,
-		"--key-size", luksKeySize,
-		"--key-file", "-",
-		device,
-	)
+	err := p.withKey(ctx, volID, func(key []byte) error {
+		return p.luks.Format(ctx, device, key)
+	})
 	if err != nil {
 		return fmt.Errorf("go-blockstore/local: formatting LUKS container on %s: %w", device, err)
 	}
@@ -385,12 +445,9 @@ func (p *Provider) luksFormat(ctx context.Context, volID, device string) error {
 
 // luksOpen unlocks the container and exposes its plaintext mapping.
 func (p *Provider) luksOpen(ctx context.Context, volID, device string) error {
-	err := p.runWithKey(ctx, volID, "cryptsetup", "open",
-		"--type", "luks2",
-		"--key-file", "-",
-		device,
-		p.mappingName(volID),
-	)
+	err := p.withKey(ctx, volID, func(key []byte) error {
+		return p.luks.Open(ctx, device, p.mappingName(volID), key)
+	})
 	if err != nil {
 		return fmt.Errorf("go-blockstore/local: unlocking %s: %w", device, err)
 	}
@@ -399,17 +456,8 @@ func (p *Provider) luksOpen(ctx context.Context, volID, device string) error {
 
 // luksClose tears down the plaintext mapping.
 func (p *Provider) luksClose(ctx context.Context, volID string) error {
-	if _, err := p.runner.Run(ctx, nil, "cryptsetup", "close", p.mappingName(volID)); err != nil {
+	if err := p.luks.Close(ctx, p.mappingName(volID)); err != nil {
 		return fmt.Errorf("go-blockstore/local: locking %s: %w", p.mappingName(volID), err)
-	}
-	return nil
-}
-
-// luksResize grows the plaintext mapping to match a grown container.
-func (p *Provider) luksResize(ctx context.Context, volID string) error {
-	err := p.runWithKey(ctx, volID, "cryptsetup", "resize", "--key-file", "-", p.mappingName(volID))
-	if err != nil {
-		return fmt.Errorf("go-blockstore/local: resizing %s: %w", p.mappingName(volID), err)
 	}
 	return nil
 }
@@ -417,85 +465,29 @@ func (p *Provider) luksResize(ctx context.Context, volID string) error {
 // luksTestPassphrase checks that the key this provider holds for volID opens
 // the container on device, WITHOUT unlocking it.
 //
-// --test-passphrase is what makes that possible: measured on cryptsetup 2.7.0,
-// it verifies the passphrase against the keyslots and creates no device-mapper
-// mapping at all — exit 0 for a key that opens the container, 2 for one that
-// does not, 1 for a device that is not a LUKS container. So a restore can
+// The check derives the keyslot's key and verifies it against the header's
+// digest, and creates no device-mapper mapping at all. So a restore can
 // establish that the volume it is about to produce will be openable before it
 // creates anything, rather than after it has copied the image.
 func (p *Provider) luksTestPassphrase(ctx context.Context, volID, device string) error {
-	return p.runWithKey(ctx, volID, "cryptsetup", "open",
-		"--test-passphrase",
-		"--type", "luks2",
-		"--key-file", "-",
-		device,
-	)
-}
-
-// luksSegments is the shape of `cryptsetup luksDump --dump-json-metadata`, cut
-// down to the one thing this provider reads. LUKS2 renders the offset as a
-// decimal STRING, not a JSON number.
-type luksSegments struct {
-	Segments map[string]struct {
-		Offset string `json:"offset"`
-	} `json:"segments"`
+	return p.withKey(ctx, volID, func(key []byte) error {
+		return p.luks.TestKey(ctx, device, key)
+	})
 }
 
 // luksDataOffset reports where a container's data starts — the space its header
 // occupies, and so the difference between the logical volume's size and the
 // usable capacity of the mapping over it.
 //
-// It is read from the header rather than assumed to be luksHeaderBytes because
-// not every container this provider handles was formatted by this provider. A
-// volume restored from an encrypted snapshot carries its SOURCE's header
-// verbatim, and that source may have been made by an older version of this
-// package or by an operator's own cryptsetup with different parameters.
-// Assuming the constant there would misreport such a volume's capacity by
-// however much the two headers differ.
-//
-// No passphrase is involved: measured on cryptsetup 2.7.0, luksDump reads the
-// unencrypted metadata and exits 0 without one. The device has to be active —
-// an inactive logical volume has no device node at all.
-//
-// A container with anything other than exactly one data segment is refused
-// rather than guessed at. More than one means a reencryption is in progress,
-// and picking a segment out of that state would produce a capacity that is true
-// of neither the old layout nor the new one.
+// See luksBackend.DataOffset for why it is read from the header rather than
+// assumed to be luksHeaderBytes, and for what an unreadable answer means.
 func (p *Provider) luksDataOffset(ctx context.Context, device string) (int64, error) {
-	out, err := p.runner.Run(ctx, nil, "cryptsetup", "luksDump", "--dump-json-metadata", device)
+	offset, err := p.luks.DataOffset(ctx, device)
 	if err != nil {
 		return 0, fmt.Errorf("go-blockstore/local: reading the LUKS header on %s: %w", device, err)
 	}
-
-	var meta luksSegments
-	if err := json.Unmarshal(out, &meta); err != nil {
-		return 0, fmt.Errorf("go-blockstore/local: parsing the LUKS header on %s: %w", device, err)
-	}
-	if len(meta.Segments) != 1 {
-		return 0, fmt.Errorf("go-blockstore/local: the LUKS header on %s reports %d data segments, not one; "+
-			"a container mid-reencryption has no single usable capacity", device, len(meta.Segments))
-	}
-
-	for _, segment := range meta.Segments {
-		offset, parseErr := strconv.ParseInt(strings.TrimSpace(segment.Offset), 10, 64)
-		if parseErr != nil {
-			return 0, fmt.Errorf("go-blockstore/local: the LUKS header on %s reports data offset %q: not a number",
-				device, segment.Offset)
-		}
-		if offset <= 0 {
-			return 0, fmt.Errorf("go-blockstore/local: the LUKS header on %s reports data offset %d, which leaves no room for a header",
-				device, offset)
-		}
-		return offset, nil
-	}
-	// Unreachable: the length was checked above.
-	return 0, fmt.Errorf("go-blockstore/local: the LUKS header on %s reports no data segment", device)
+	return offset, nil
 }
-
-// cryptsetupWrongDevice is the status cryptsetup returns from `status` when the
-// named mapping does not exist. Its other statuses cover wrong parameters, no
-// permission and out of memory, none of which mean "not open".
-const cryptsetupWrongDevice = 4
 
 // luksIsOpen reports whether the volume's plaintext mapping exists AND is the
 // one this provider would have made.
@@ -507,66 +499,37 @@ const cryptsetupWrongDevice = 4
 // plaintext device — handing the caller some other volume's decrypted contents
 // to mount — and Detach close it, and Resize grow it.
 //
-// So the backing device is checked. cryptsetup names it on a "device:" line,
-// and the comparison is by major:minor rather than by path, because the same
-// device answers to several paths — measured, cryptsetup reports the
-// dm-canonical /dev/mapper/<vg>-<lv> whatever the mapping was opened against.
-// A mapping under our name over some other device is an error, not something to
+// So the backing device is checked, and the comparison is by major:minor rather
+// than by path, because the same device answers to several paths: the kernel
+// names the mapping's backing device in sysfs as a dm-canonical
+// /dev/mapper/<vg>-<lv>, whatever path the mapping was opened against. A
+// mapping under our name over some other device is an error, not something to
 // adopt: it is a conflict a human has to resolve, and continuing would act on
 // the wrong volume.
 //
-// Only cryptsetup's "no such device" status is the negative answer. Anything
+// Only "there is no mapping under that name" is the negative answer. Anything
 // else is reported, because guessing "not open" would make Attach try to unlock
 // a volume that is already unlocked, or Detach skip a mapping it should have
 // closed.
 func (p *Provider) luksIsOpen(ctx context.Context, volID string) (bool, error) {
 	name := p.mappingName(volID)
 
-	out, err := p.runner.Run(ctx, nil, "cryptsetup", "status", name)
+	info, exists, err := p.luks.Mapping(ctx, name)
 	if err != nil {
-		if exitErr, ok := asExitError(err); ok && exitErr.Code == cryptsetupWrongDevice {
-			return false, nil
-		}
 		return false, fmt.Errorf("go-blockstore/local: checking %s: %w", name, err)
 	}
-
-	backing, err := parseCryptsetupBackingDevice(out)
-	if err != nil {
-		return false, fmt.Errorf("go-blockstore/local: reading what %s is backed by: %w", name, err)
+	if !exists {
+		return false, nil
 	}
 
-	same, err := p.sameDevice(ctx, backing, p.lvPath(volID))
+	want, err := p.luks.Identity(ctx, p.lvPath(volID))
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("go-blockstore/local: identifying %s: %w", p.lvPath(volID), err)
 	}
-	if !same {
+	if info.BackingID != want {
 		return false, fmt.Errorf("go-blockstore/local: the device-mapper name %q is in use by a mapping over %s, "+
 			"not over this volume's %s; close it or rename it before operating on this volume",
-			name, backing, p.lvPath(volID))
+			name, info.Backing, p.lvPath(volID))
 	}
 	return true, nil
-}
-
-// parseCryptsetupBackingDevice pulls the "device:" line out of cryptsetup
-// status. Absent or repeated, it fails closed rather than guessing — the whole
-// point of reading it is to refuse a mapping whose identity is not established.
-func parseCryptsetupBackingDevice(out []byte) (string, error) {
-	var devices []string
-	for _, line := range strings.Split(string(out), "\n") {
-		rest, found := strings.CutPrefix(strings.TrimSpace(line), "device:")
-		if !found {
-			continue
-		}
-		if device := strings.TrimSpace(rest); device != "" {
-			devices = append(devices, device)
-		}
-	}
-	switch len(devices) {
-	case 1:
-		return devices[0], nil
-	case 0:
-		return "", errors.New("cryptsetup status reported no backing device")
-	default:
-		return "", fmt.Errorf("cryptsetup status reported %d backing devices: %s", len(devices), strings.Join(devices, ", "))
-	}
 }

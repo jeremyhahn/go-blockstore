@@ -16,8 +16,10 @@ package local
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -51,27 +53,27 @@ type fakeRunner struct {
 	calls    []fakeCall
 	handlers map[string]responder
 
-	// What blkid reports for a device, shared with the cryptsetup fake so the
-	// two cannot contradict each other: a device blkid calls a LUKS container
-	// is one cryptsetup will dump a header for, which is how a real host
+	// What blkid reports for a device, shared with the LUKS fake so the two
+	// cannot contradict each other: a device blkid calls a LUKS container is
+	// one the LUKS backend will read a header off, which is how a real host
 	// behaves and what stops a test from describing an impossible one.
 	blkidTypes map[string]string
 
-	// The device-mapper names cryptsetup reports as open, each against the
-	// device it is open over.
+	// The device-mapper names the LUKS backend reports as open, each against
+	// the device it is open over.
 	luksBacking map[string]string
 
 	// Data offsets for containers whose header is NOT the one this provider
 	// formats — a volume restored from somebody else's snapshot. A container
-	// absent from here dumps luksHeaderBytes.
+	// absent from here reports luksHeaderBytes.
 	luksOffsets map[string]int64
 
 	// Devices whose container this provider's key does NOT open, which is what
-	// `open --test-passphrase` is asked about.
+	// the passphrase check is asked about.
 	luksWrongKey map[string]bool
 
-	// Devices whose luksDump fails, which is what a device node that has gone
-	// away underneath a lockless read looks like.
+	// Devices whose header read fails, which is what a device node that has
+	// gone away underneath a lockless read looks like.
 	luksDumpFails map[string]bool
 
 	// The same fake serves as the Mounter, so a test holds one object and can
@@ -109,7 +111,7 @@ func newFakeRunner() *fakeRunner {
 		luksWrongKey:  map[string]bool{},
 		luksDumpFails: map[string]bool{},
 	}
-	f.handlers["cryptsetup"] = f.cryptsetup
+	f.handlers[luksBinary] = f.luks
 
 	// An empty volume group, so a provider with no fixtures sees no volumes
 	// rather than a parse failure.
@@ -122,9 +124,8 @@ func newFakeRunner() *fakeRunner {
 	// as a failure now, so "nothing is mounted" has to be a real report.
 	f.withMounts(nil)
 
-	// "cryptsetup status" on an absent mapping exits non-zero, and that is the
-	// answer the provider reads as "not unlocked". Defaulting it to success
-	// would make every plain volume look encrypted-and-open.
+	// No mapping is open. Defaulting the lookup to "found" would make every
+	// plain volume look encrypted-and-open.
 	f.withOpenMappings()
 
 	// blkid answers "nothing here" with an exit status, never with a zero exit
@@ -132,11 +133,6 @@ func newFakeRunner() *fakeRunner {
 	// fake must not produce it.
 	f.withBlkid(nil)
 
-	// stat resolves every path that leads to one device to the same identity,
-	// the way the real /dev tree does.
-	f.handlers["stat"] = func(args []string, _ []byte) ([]byte, error) {
-		return []byte(fakeDeviceIdentity(args[len(args)-1]) + "\n"), nil
-	}
 	return f
 }
 
@@ -240,7 +236,7 @@ func (f *fakeRunner) withBlkid(types map[string]string) *fakeRunner {
 	})
 }
 
-// withOpenMappings makes cryptsetup report these device-mapper names as
+// withOpenMappings makes the LUKS backend report these device-mapper names as
 // unlocked, each backed by the logical volume this provider would have opened
 // it over, and every other name as absent.
 func (f *fakeRunner) withOpenMappings(names ...string) *fakeRunner {
@@ -264,9 +260,9 @@ func (f *fakeRunner) withMappingsBackedBy(backing map[string]string) *fakeRunner
 	return f
 }
 
-// withLUKSHeader makes cryptsetup dump a data offset other than the one this
-// provider formats with, which is what a container restored from an outside
-// snapshot has.
+// withLUKSHeader gives a device a data offset other than the one this provider
+// formats with, which is what a container restored from an outside snapshot
+// has.
 func (f *fakeRunner) withLUKSHeader(device string, offset int64) *fakeRunner {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -274,8 +270,8 @@ func (f *fakeRunner) withLUKSHeader(device string, offset int64) *fakeRunner {
 	return f
 }
 
-// withLUKSDumpFailure makes `cryptsetup luksDump` fail for a device, which is
-// how a device node that vanished under a lockless read behaves.
+// withLUKSDumpFailure makes the header read fail for a device, which is how a
+// device node that vanished under a lockless read behaves.
 func (f *fakeRunner) withLUKSDumpFailure(device string) *fakeRunner {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -301,8 +297,8 @@ func (f *fakeRunner) withLVsThen(first, rest []lvFixture) *fakeRunner {
 	})
 }
 
-// withWrongKeyFor makes `cryptsetup open --test-passphrase` refuse these
-// devices, modeling a KeyProvider whose key does not open that container.
+// withWrongKeyFor makes the passphrase check refuse these devices, modeling a
+// KeyProvider whose key does not open that container.
 func (f *fakeRunner) withWrongKeyFor(devices ...string) *fakeRunner {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -312,76 +308,147 @@ func (f *fakeRunner) withWrongKeyFor(devices ...string) *fakeRunner {
 	return f
 }
 
-// cryptsetupNoKey and cryptsetupNotLUKS are the statuses cryptsetup 2.7.0 was
-// measured to exit with from `open --test-passphrase`: 2 for a passphrase that
-// opens no keyslot, 1 for a device that is not a LUKS container at all.
-const (
-	cryptsetupNoKey   = 2
-	cryptsetupNotLUKS = 1
-)
+// luksBinary is the name the fake records LUKS operations under.
+//
+// They are not a binary any more — go-luks2 does the work in this process — but
+// they go through the same recorder as the commands that still are, and for the
+// reason a second recorder would have destroyed: the assertions that matter are
+// about ORDER across the two. The tag is written after the format; the mapping
+// is closed before the lvremove; the container resize happens before resize2fs.
+// A test cannot check any of that against two lists.
+const luksBinary = "luks"
 
-// cryptsetup answers the subcommands the provider issues, from the fake's own
+// The fake is the provider's luksBackend as well as its CommandRunner and its
+// Mounter, so one object describes the whole host a test is pretending to be.
+var _ luksBackend = (*fakeRunner)(nil)
+
+func (f *fakeRunner) Format(ctx context.Context, device string, key []byte) error {
+	_, err := f.Run(ctx, key, luksBinary, "format", device)
+	return err
+}
+
+func (f *fakeRunner) Open(ctx context.Context, device, name string, key []byte) error {
+	_, err := f.Run(ctx, key, luksBinary, "open", device, name)
+	return err
+}
+
+func (f *fakeRunner) Close(ctx context.Context, name string) error {
+	_, err := f.Run(ctx, nil, luksBinary, "close", name)
+	return err
+}
+
+func (f *fakeRunner) TestKey(ctx context.Context, device string, key []byte) error {
+	_, err := f.Run(ctx, key, luksBinary, "test-key", device)
+	return err
+}
+
+func (f *fakeRunner) DataOffset(ctx context.Context, device string) (int64, error) {
+	out, err := f.Run(ctx, nil, luksBinary, "data-offset", device)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+}
+
+func (f *fakeRunner) Mapping(ctx context.Context, name string) (mappingInfo, bool, error) {
+	out, err := f.Run(ctx, nil, luksBinary, "mapping", name)
+	if err != nil {
+		return mappingInfo{}, false, err
+	}
+	backing := strings.TrimSpace(string(out))
+	if backing == "" {
+		return mappingInfo{}, false, nil
+	}
+	return mappingInfo{Backing: backing, BackingID: fakeDeviceIdentity(backing)}, true, nil
+}
+
+func (f *fakeRunner) Identity(ctx context.Context, path string) (string, error) {
+	out, err := f.Run(ctx, nil, luksBinary, "identity", path)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// luks answers the LUKS operations the provider issues, from the fake's own
 // state rather than from a per-test closure.
 //
 // One handler for all of them, because the provider issues several against one
 // volume and a test usually cares about more than one: a Status over an
-// encrypted volume asks for a mapping's status AND dumps its header, so a fake
-// where installing an answer for either replaced the other could not describe
-// that volume at all.
+// encrypted volume asks whether the mapping is open AND reads its header, so a
+// fake where installing an answer for either replaced the other could not
+// describe that volume at all.
 //
 // Whether a device HAS a header is not tracked separately — it is whatever
-// blkid was told to report for the device. A container cryptsetup dumps but
-// blkid calls ext4 is not a host any test should be able to describe.
-func (f *fakeRunner) cryptsetup(args []string, _ []byte) ([]byte, error) {
+// blkid was told to report for the device. A container the LUKS backend reads a
+// header off but blkid calls ext4 is not a host any test should be able to
+// describe.
+func (f *fakeRunner) luks(args []string, _ []byte) ([]byte, error) {
 	if len(args) == 0 {
 		return nil, nil
 	}
-	// The trailing argument: a mapping NAME for status, a device PATH for the
-	// header operations.
+	// The trailing argument: a mapping NAME for close, a device PATH for the
+	// header operations, and for open the name follows the device.
 	target := args[len(args)-1]
 
-	switch {
-	case args[0] == "status":
+	switch args[0] {
+	case "mapping":
 		f.mu.Lock()
-		backing, ok := f.luksBacking[target]
+		backing := f.luksBacking[target]
 		f.mu.Unlock()
-		if !ok {
-			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: cryptsetupWrongDevice}
-		}
-		// The shape cryptsetup 2.7.0 actually prints.
-		return []byte("/dev/mapper/" + target + " is active.\n" +
-			"  type:    LUKS2\n" +
-			"  cipher:  aes-xts-plain64\n" +
-			"  keysize: 512 bits\n" +
-			"  device:  " + backing + "\n" +
-			"  mode:    read/write\n"), nil
+		// The empty answer is "no mapping under that name", which is what the
+		// provider reads as not unlocked.
+		return []byte(backing), nil
 
-	case args[0] == "luksDump":
+	case "open":
+		// A successful unlock leaves a mapping behind, and a successful close
+		// takes one away. The fake tracks that rather than answering from a
+		// fixed table, because the questions worth asking of it are about what
+		// SURVIVES an operation — a rollback that must not close somebody
+		// else's mapping, a failed resize that must not lose the caller's. A
+		// fake whose mapping set never moved answered every one of those with
+		// whatever the test set up, which is to say it answered none of them.
+		//
+		// args is ["open", device, name]: the device is what the mapping ends
+		// up over, and the name is what it answers to.
+		if len(args) >= 3 {
+			f.mu.Lock()
+			f.luksBacking[args[2]] = defaultBackingFor(args[2])
+			f.mu.Unlock()
+		}
+		return nil, nil
+
+	case "close":
+		f.mu.Lock()
+		delete(f.luksBacking, target)
+		f.mu.Unlock()
+		return nil, nil
+
+	case "identity":
+		return []byte(fakeDeviceIdentity(target)), nil
+
+	case "data-offset":
 		f.mu.Lock()
 		gone := f.luksDumpFails[target]
 		f.mu.Unlock()
 		if gone {
-			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: cryptsetupNotLUKS,
-				Stderr: "Device " + target + " does not exist or access denied."}
+			return nil, fmt.Errorf("device %s does not exist or access denied", target)
 		}
 		offset, ok := f.luksHeaderOf(target)
 		if !ok {
-			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: cryptsetupNotLUKS,
-				Stderr: "Device " + target + " is not a valid LUKS device."}
+			return nil, fmt.Errorf("device %s is not a valid LUKS device", target)
 		}
-		return luksMetadataJSON(offset), nil
+		return []byte(strconv.FormatInt(offset, 10)), nil
 
-	case args[0] == "open" && contains(args, "--test-passphrase"):
+	case "test-key":
 		if _, ok := f.luksHeaderOf(target); !ok {
-			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: cryptsetupNotLUKS,
-				Stderr: "Device " + target + " is not a valid LUKS device."}
+			return nil, fmt.Errorf("device %s is not a valid LUKS device", target)
 		}
 		f.mu.Lock()
 		wrong := f.luksWrongKey[target]
 		f.mu.Unlock()
 		if wrong {
-			return nil, &ExitError{Name: "cryptsetup", Args: args, Code: cryptsetupNoKey,
-				Stderr: "No key available with this passphrase."}
+			return nil, errors.New("no key available with this passphrase")
 		}
 		return nil, nil
 	}
@@ -404,21 +471,9 @@ func (f *fakeRunner) luksHeaderOf(device string) (int64, bool) {
 	return luksHeaderBytes, true
 }
 
-// luksMetadataJSON renders `cryptsetup luksDump --dump-json-metadata` output.
-// The offset is a decimal STRING, which is how LUKS2 renders it and the reason
-// the provider parses rather than unmarshals it as a number.
-func luksMetadataJSON(offset int64) []byte {
-	return []byte(fmt.Sprintf(
-		`{"keyslots":{"0":{"type":"luks2","key_size":64}},"tokens":{},`+
-			`"segments":{"0":{"type":"crypt","offset":"%d","size":"dynamic",`+
-			`"iv_tweak":"0","encryption":"aes-xts-plain64","sector_size":512}},`+
-			`"digests":{"0":{"type":"pbkdf2","hash":"sha512"}},`+
-			`"config":{"json_size":"12288","keyslots_size":"16744448"}}`, offset))
-}
-
 // defaultBackingFor turns a mapping name back into the logical volume this
 // provider opens it over: "bs-<vg>_<vol>" is backed by /dev/mapper/<vg>-<vol>,
-// which is what cryptsetup reports.
+// which is the dm-canonical spelling sysfs leads to.
 func defaultBackingFor(mapping string) string {
 	rest := strings.TrimPrefix(mapping, mappingPrefix)
 	vg, vol, found := strings.Cut(rest, "_")
@@ -650,6 +705,7 @@ func newTestProvider(t *testing.T, runner *fakeRunner, mutate ...func(*Options))
 		NodeID:      "node-a",
 		Runner:      runner,
 		Mounter:     runner,
+		luks:        runner,
 		// Per-test, so tests cannot serialize against each other through a
 		// shared directory — and so a test host without /run/lock still runs.
 		LockDir: t.TempDir(),
