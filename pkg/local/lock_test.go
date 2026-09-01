@@ -349,10 +349,7 @@ func TestLockAcquisitionHonorsContext(t *testing.T) {
 func TestRestoreLocksBothVolumes(t *testing.T) {
 	g := newGate()
 	runner := newFakeRunner().withLVs(snapshotFixtures()...)
-	runner.on("dd", func([]string, []byte) ([]byte, error) {
-		g.wait()
-		return nil, nil
-	})
+	runner.gateCopy(g.wait)
 	p := newTestProvider(t, runner)
 
 	restoreDone := make(chan struct{})

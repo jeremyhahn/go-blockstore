@@ -447,139 +447,55 @@ func TestProbeFSTypeSurfacesAMissingBlkid(t *testing.T) {
 	}
 }
 
-func TestMountpointsForParsesFindmnt(t *testing.T) {
-	runner := newFakeRunner().on("findmnt", func([]string, []byte) ([]byte, error) {
-		return findmntJSON(
-			mountRow{Target: "/", Source: "/dev/sda1"},
-			mountRow{Target: "/mnt/data", Source: "/dev/vg0/data"},
-			mountRow{Target: "/mnt/data-bind", Source: "/dev/vg0/data"},
-			mountRow{Target: "/mnt/other", Source: "/dev/vg0/other"},
-		), nil
+// TestMountpointsForReturnsEveryTarget covers a device mounted more than once,
+// which Delete has to unmount all of.
+func TestMountpointsForReturnsEveryTarget(t *testing.T) {
+	runner := newFakeRunner().withMounts(map[string][]string{
+		"/dev/vg0/data":  {"/mnt/data", "/mnt/data-bind"},
+		"/dev/vg0/other": {"/mnt/other"},
 	})
 	p := newTestProvider(t, runner)
 
-	mounts, err := p.mountpointsFor(context.Background(), []string{"/dev/vg0/data"})
+	mounts, err := p.mountpointsFor(context.Background(), "/dev/vg0/data")
 	if err != nil {
 		t.Fatalf("mountpointsFor: %v", err)
 	}
 	if len(mounts) != 2 || mounts[0] != "/mnt/data" || mounts[1] != "/mnt/data-bind" {
-		t.Fatalf("mountpointsFor = %v, want both targets", mounts)
+		t.Fatalf("mountpointsFor = %v, want both of this device's mounts", mounts)
+	}
+
+	// Another device's mount is not this one's.
+	if mounts, err := p.mountpointsFor(context.Background(), "/dev/vg0/absent"); err != nil || len(mounts) != 0 {
+		t.Fatalf("mountpointsFor of an unmounted device = (%v, %v), want none and no error", mounts, err)
 	}
 }
 
-// TestMountpointsForUsesJSON pins the flag that keeps a mountpoint's spelling
-// out of the argument. findmnt's column output escapes some characters and not
-// others, and which is a matter of the flags and the util-linux version — on
-// this host the default prints a space literally while --raw renders it \x20.
-// A target that comes back spelled differently than it went in silently fails
-// to match, and Unmount then reports "not mounted there" over a volume that is
-// still mounted. JSON carries it verbatim everywhere.
-func TestMountpointsForUsesJSON(t *testing.T) {
-	runner := newFakeRunner().on("findmnt", func(args []string, _ []byte) ([]byte, error) {
-		if !contains(args, "--json") {
-			t.Errorf("findmnt called without --json: %v", args)
-		}
-		for _, a := range args {
-			if a == "--raw" {
-				t.Error("findmnt called with --raw, which escapes characters in targets")
-			}
-		}
-		return findmntJSON(mountRow{Target: "/mnt/my data", Source: "/dev/vg0/data"}), nil
-	})
-	p := newTestProvider(t, runner)
-
-	mounts, err := p.mountpointsFor(context.Background(), []string{"/dev/vg0/data"})
-	if err != nil {
-		t.Fatalf("mountpointsFor: %v", err)
-	}
-	if len(mounts) != 1 || mounts[0] != "/mnt/my data" {
-		t.Fatalf("mountpointsFor = %v, want the target with its space intact", mounts)
-	}
-}
-
+// TestMountpointsForOnAnEmptyDevice keeps an unattached volume from reaching
+// the mount table at all: there is no device to ask about.
 func TestMountpointsForOnAnEmptyDevice(t *testing.T) {
-	runner := newFakeRunner()
+	runner := newFakeRunner().withMounts(map[string][]string{"/dev/vg0/data": {"/mnt/data"}})
 	p := newTestProvider(t, runner)
 
-	mounts, err := p.mountpointsFor(context.Background(), nil)
+	mounts, err := p.mountpointsFor(context.Background(), "")
 	if err != nil {
 		t.Fatalf("mountpointsFor: %v", err)
 	}
 	if len(mounts) != 0 {
 		t.Fatalf("mountpointsFor = %v, want none", mounts)
 	}
-	runner.mustNotRun(t, "findmnt")
 }
 
-// TestMountpointsForFailsClosed is the point of enumerating the whole mount
-// table instead of asking findmnt to filter. findmnt has ONE non-zero status
-// and its manual gives it to "nothing matched" and "any other error" alike, so
-// a filtered query that came back empty could not say which had happened — and
-// "not mounted" is the answer Delete acts on immediately before a forced
-// lvremove. Every one of these is now a failure, not an empty answer.
+// TestMountpointsForFailsClosed is the distinction this conversion preserved
+// and findmnt could not express. "The mount table could not be read" must never
+// arrive as "nothing is mounted": that second answer is what Delete acts on
+// immediately before a forced lvremove.
 func TestMountpointsForFailsClosed(t *testing.T) {
-	cases := map[string]responder{
-		"findmnt missing": func([]string, []byte) ([]byte, error) {
-			return nil, errors.New("exec: findmnt: executable file not found in $PATH")
-		},
-		"exit 1": func(args []string, _ []byte) ([]byte, error) {
-			return nil, &ExitError{Name: "findmnt", Args: args, Code: 1}
-		},
-		"exit 32": func(args []string, _ []byte) ([]byte, error) {
-			return nil, &ExitError{Name: "findmnt", Args: args, Code: 32}
-		},
-		"empty output": func([]string, []byte) ([]byte, error) {
-			return nil, nil
-		},
-		"unparseable output": func([]string, []byte) ([]byte, error) {
-			return []byte("not json"), nil
-		},
-	}
-
-	for name, handler := range cases {
-		t.Run(name, func(t *testing.T) {
-			runner := newFakeRunner().on("findmnt", handler)
-			p := newTestProvider(t, runner)
-
-			mounts, err := p.mountpointsFor(context.Background(), []string{"/dev/vg0/data"})
-			if err == nil {
-				t.Fatalf("mountpointsFor returned %v and no error for %s", mounts, name)
-			}
-		})
-	}
-}
-
-// TestMountpointsForMatchesTheDMSpelling covers the alias that makes local
-// filtering work at all: findmnt reports an LVM mount under its device-mapper
-// name, not the /dev/<vg>/<lv> a mount was issued with. Measured on LVM
-// 2.03.16, mounting /dev/bs-p9/my-vol comes back as /dev/mapper/bs--p9-my--vol.
-func TestMountpointsForMatchesTheDMSpelling(t *testing.T) {
-	runner := newFakeRunner().on("findmnt", func([]string, []byte) ([]byte, error) {
-		return findmntJSON(
-			mountRow{Target: "/mnt/data", Source: "/dev/mapper/vg0-data"},
-		), nil
-	})
+	runner := newFakeRunner().failMountTable(errors.New("mount table unreadable"))
 	p := newTestProvider(t, runner)
 
-	mounts, err := p.mountpointsFor(context.Background(), p.sourceAliases("data", "/dev/vg0/data"))
-	if err != nil {
-		t.Fatalf("mountpointsFor: %v", err)
-	}
-	if len(mounts) != 1 || mounts[0] != "/mnt/data" {
-		t.Fatalf("mountpointsFor = %v, want the mount found under its dm name", mounts)
-	}
-}
-
-func TestDMNameDoublesHyphens(t *testing.T) {
-	cases := map[[2]string]string{
-		{"vg0", "data"}:     "vg0-data",
-		{"bs-p9", "my-vol"}: "bs--p9-my--vol",
-		{"a-b-c", "d-e"}:    "a--b--c-d--e",
-	}
-	for in, want := range cases {
-		if got := dmName(in[0], in[1]); got != want {
-			t.Errorf("dmName(%q, %q) = %q, want %q", in[0], in[1], got, want)
-		}
+	mounts, err := p.mountpointsFor(context.Background(), "/dev/vg0/data")
+	if err == nil {
+		t.Fatalf("mountpointsFor returned %v and no error over an unreadable table", mounts)
 	}
 }
 
@@ -590,8 +506,11 @@ func TestLVMFailuresPropagate(t *testing.T) {
 
 	cases := map[string]struct {
 		binary string
-		lvs    []lvFixture
-		call   func(*Provider) error
+		// failCopy fails the block-device copy instead of a binary, for the one
+		// operation whose failure no longer comes from an exec.
+		failCopy bool
+		lvs      []lvFixture
+		call     func(*Provider) error
 	}{
 		"lvcreate": {
 			binary: "lvcreate",
@@ -636,8 +555,8 @@ func TestLVMFailuresPropagate(t *testing.T) {
 				return p.DeleteSnapshot(ctx, common.SnapshotID("data"+snapSeparator+"nightly"))
 			},
 		},
-		"dd on restore": {
-			binary: "dd",
+		"copy on restore": {
+			failCopy: true,
 			lvs: []lvFixture{
 				{Name: "data", SizeBytes: gib},
 				{Name: "data" + snapSeparator + "nightly", SizeBytes: gib / 5, Origin: "data"},
@@ -664,11 +583,17 @@ func TestLVMFailuresPropagate(t *testing.T) {
 			if tc.binary == "resize2fs" {
 				runner.withBlkid(map[string]string{"/dev/vg0/data": "ext4"})
 			}
-			runner.fail(tc.binary, 5, "lvm said no")
+			what := tc.binary
+			if tc.failCopy {
+				what = "device copy"
+				runner.failCopy(errors.New("copy said no"))
+			} else {
+				runner.fail(tc.binary, 5, "lvm said no")
+			}
 			p := newTestProvider(t, runner)
 
 			if err := tc.call(p); err == nil {
-				t.Fatalf("the operation succeeded despite a failing %s", tc.binary)
+				t.Fatalf("the operation succeeded despite a failing %s", what)
 			}
 		})
 	}

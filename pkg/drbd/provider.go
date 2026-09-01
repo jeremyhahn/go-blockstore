@@ -17,7 +17,6 @@ package drbd
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -28,27 +27,25 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jeremyhahn/go-blockstore/internal/blkdev"
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
+	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
 // The system tooling this provider execs, beyond the LVM binaries in lvm.go.
 const (
-	binDRBDAdm    = "drbdadm"
-	binDRBDSetup  = "drbdsetup"
-	binFindmnt    = "findmnt"
-	binBlkid      = "blkid"
-	binBlkdiscard = "blkdiscard"
-	binDD         = "dd"
-	binResize2fs  = "resize2fs"
-	binXFSGrowfs  = "xfs_growfs"
-	binE2fsck     = "e2fsck"
+	binDRBDAdm   = "drbdadm"
+	binDRBDSetup = "drbdsetup"
+	binBlkid     = "blkid"
+	binResize2fs = "resize2fs"
+	binXFSGrowfs = "xfs_growfs"
+	binE2fsck    = "e2fsck"
 )
 
 // Exit codes this package interprets rather than treats as failure.
 const (
-	findmntNoMatch = 1 // findmnt: nothing matched the filter.
-	blkidNoSig     = 2 // blkid: the device carries no recognized signature.
+	blkidNoSig = 2 // blkid: the device carries no recognized signature.
 
 	// e2fsck: errors were found and fixed. Together with 0 that is a filesystem
 	// which can now be resized; 2 and above mean errors it could not fix, an
@@ -156,11 +153,13 @@ var ErrRoleUnknown = errors.New("the resource's replication role could not be de
 //
 // What is left out is read-only: ListSnapshots, Status and ReplicationState.
 type Provider struct {
-	cfg     Config
-	runner  CommandRunner
-	mounter Mounter
-	secrets SecretProvider
-	mu      sync.Mutex
+	cfg          Config
+	runner       CommandRunner
+	mounter      Mounter
+	mountTable   MountTable
+	blockDevices BlockDevices
+	secrets      SecretProvider
+	mu           sync.Mutex
 }
 
 // Compile-time proof that the provider satisfies the replicated contract, not
@@ -176,6 +175,18 @@ var _ common.ReplicatedProvider = (*Provider)(nil)
 // what lets a caller outside this module NAME the type it is handing to
 // WithMounter, which an internal package's own name would not.
 type Mounter = mount.Mounter
+
+// MountTable is the seam through which the provider asks what is mounted.
+//
+// It replaced asking findmnt, and it is shared with pkg/local for the same
+// reason Mounter is: reading /proc/self/mountinfo is not a DRBD concern, and
+// two copies of a parser would be two chances to disagree about the kernel's
+// escaping.
+type MountTable = mountinfo.Table
+
+// BlockDevices is the seam through which the provider copies and zeroes block
+// devices — what it used to reach for dd and blkdiscard to do.
+type BlockDevices = blkdev.Operator
 
 // Option customizes a Provider at construction.
 type Option func(*Provider)
@@ -206,6 +217,18 @@ func WithMounter(m Mounter) Option {
 	return func(p *Provider) { p.mounter = m }
 }
 
+// WithMountTable replaces the mount table. Tests use it to describe what is
+// mounted without mounting anything.
+func WithMountTable(m MountTable) Option {
+	return func(p *Provider) { p.mountTable = m }
+}
+
+// WithBlockDevices replaces the block-device operations. Tests use them to
+// record copies and zeroing without a device to perform them on.
+func WithBlockDevices(b BlockDevices) Option {
+	return func(p *Provider) { p.blockDevices = b }
+}
+
 // New builds a DRBD provider from a settings map. See the Setting constants for
 // the accepted keys; an unknown key is an error rather than a no-op.
 //
@@ -217,7 +240,13 @@ func New(settings map[string]string, opts ...Option) (*Provider, error) {
 		return nil, err
 	}
 
-	p := &Provider{cfg: cfg, runner: execRunner{}, mounter: mount.System()}
+	p := &Provider{
+		cfg:          cfg,
+		runner:       execRunner{},
+		mounter:      mount.System(),
+		mountTable:   mountinfo.System{},
+		blockDevices: blkdev.System{},
+	}
 	for _, o := range opts {
 		o(p)
 	}
@@ -226,6 +255,12 @@ func New(settings map[string]string, opts ...Option) (*Provider, error) {
 	}
 	if p.mounter == nil {
 		return nil, fmt.Errorf("%w: mounter is nil", common.ErrInvalidArgument)
+	}
+	if p.mountTable == nil {
+		return nil, fmt.Errorf("%w: mount table is nil", common.ErrInvalidArgument)
+	}
+	if p.blockDevices == nil {
+		return nil, fmt.Errorf("%w: block devices is nil", common.ErrInvalidArgument)
 	}
 	// An injected provider wins over the file setting, so a caller unsealing
 	// from a TPM does not also have to leave the setting unset.
@@ -915,14 +950,7 @@ func (p *Provider) restoreSource(ctx context.Context, spec *common.VolumeSpec) (
 
 // copyDevice copies one block device onto another.
 func (p *Provider) copyDevice(ctx context.Context, src, dst string) error {
-	_, err := p.runner.Run(ctx, binDD,
-		"if="+src,
-		"of="+dst,
-		"bs=4M",
-		"conv=fsync,nocreat",
-		"status=none",
-	)
-	if err != nil {
+	if err := p.blockDevices.Copy(ctx, src, dst); err != nil {
 		return fmt.Errorf("copying %q to %q: %w", src, dst, err)
 	}
 	return nil
@@ -1306,18 +1334,15 @@ func (p *Provider) Unmount(ctx context.Context, volID, target string) error {
 		return err
 	}
 
-	source, mounted, err := p.mountSource(ctx, target)
+	mounted, err := p.mountedAt(ctx, devicePath(meta.Minor), target)
 	if err != nil {
 		return err
 	}
 	if !mounted {
-		return nil
-	}
-	if source != devicePath(meta.Minor) {
-		// Something else is mounted here. This volume is not mounted at the
-		// target, which the contract says is not an error — and the other
-		// device is emphatically not ours to unmount, so the call does nothing
-		// and reports success for the thing it was asked about.
+		// Either nothing is mounted at the target or something else is. Neither
+		// is an error by contract, and neither unmounts anything: this provider
+		// unmounts its own volume, and another device is emphatically not ours
+		// to take out from under whoever is using it.
 		return nil
 	}
 
@@ -1327,32 +1352,43 @@ func (p *Provider) Unmount(ctx context.Context, volID, target string) error {
 	return nil
 }
 
-// findmntReport models "findmnt --json".
-type findmntReport struct {
-	Filesystems []struct {
-		Target string `json:"target"`
-		Source string `json:"source"`
-		FSType string `json:"fstype"`
-	} `json:"filesystems"`
-}
-
-// mountSource returns the device mounted at target, if any.
-func (p *Provider) mountSource(ctx context.Context, target string) (string, bool, error) {
-	out, err := p.runner.Run(ctx, binFindmnt, "--json", "--mountpoint", target, "-o", "TARGET,SOURCE,FSTYPE")
+// mountedAt reports whether dev — this volume's device — is mounted at target.
+//
+// It asks which paths the DEVICE is mounted at rather than which device is
+// mounted at the path, because the answer to the second question is a string:
+// the mount source is whichever of the device's names was used to mount it, and
+// a DRBD device has several — /dev/drbdN, /dev/drbd/by-res/<res>/0,
+// /dev/drbd/by-disk/... . Comparing that string against the one name this
+// provider spells would read a mount made through an alias as belonging to
+// somebody else, and quietly not unmount a filesystem it was asked to unmount.
+// Matching by the device number, which is what MountPointsFor does, has no such
+// hole.
+//
+// A device node that does not exist is not an error: the resource is down, so
+// nothing of this volume is mounted anywhere, which is the same converging
+// no-op as a target it is not mounted at. Every other failure — a mount table
+// that could not be read above all — stops the unmount, because "not mounted"
+// is exactly the answer a teardown acts on.
+func (p *Provider) mountedAt(ctx context.Context, dev, target string) (bool, error) {
+	// Visible, not merely mounted: umount(2) detaches whatever is visible at
+	// the path it is given, so a target this volume has been over-mounted at is
+	// one where unmounting takes down somebody else's filesystem and leaves
+	// this one where it was. That is not mounted "at" the target in any sense
+	// this method should answer yes to.
+	targets, err := p.mountTable.VisibleMountPointsFor(ctx, dev)
 	if err != nil {
-		if code, ok := exitCode(err); ok && code == findmntNoMatch {
-			return "", false, nil
+		// Only the DEVICE being absent converges. os.ErrNotExist alone is too
+		// broad a test: a mount table that could not be opened reports the same
+		// thing about /proc/self/mountinfo, and reading THAT as "not mounted"
+		// is the fail-open this whole change removed. The error type is what
+		// separates them.
+		var deviceErr *mountinfo.DeviceError
+		if errors.As(err, &deviceErr) && errors.Is(err, os.ErrNotExist) {
+			return false, nil
 		}
-		return "", false, fmt.Errorf("looking up mount at %q: %w", target, err)
+		return false, fmt.Errorf("looking up mounts of %q: %w", dev, err)
 	}
-	var rep findmntReport
-	if err := json.Unmarshal(out, &rep); err != nil {
-		return "", false, fmt.Errorf("parsing findmnt output for %q: %w", target, err)
-	}
-	if len(rep.Filesystems) == 0 {
-		return "", false, nil
-	}
-	return rep.Filesystems[0].Source, true, nil
+	return slices.Contains(targets, target), nil
 }
 
 // mountTarget returns where the device is mounted, if it is. A device mounted
@@ -1361,21 +1397,14 @@ func (p *Provider) mountSource(ctx context.Context, target string) (string, bool
 // xfs_growfs, and growing through any of a filesystem's mount points grows the
 // filesystem.
 func (p *Provider) mountTarget(ctx context.Context, dev string) (string, bool, error) {
-	out, err := p.runner.Run(ctx, binFindmnt, "--json", "--source", dev, "-o", "TARGET,SOURCE,FSTYPE")
+	targets, err := p.mountTable.MountPointsFor(ctx, dev)
 	if err != nil {
-		if code, ok := exitCode(err); ok && code == findmntNoMatch {
-			return "", false, nil
-		}
 		return "", false, fmt.Errorf("looking up mounts of %q: %w", dev, err)
 	}
-	var rep findmntReport
-	if err := json.Unmarshal(out, &rep); err != nil {
-		return "", false, fmt.Errorf("parsing findmnt output for %q: %w", dev, err)
-	}
-	if len(rep.Filesystems) == 0 {
+	if len(targets) == 0 {
 		return "", false, nil
 	}
-	return rep.Filesystems[0].Target, true, nil
+	return targets[0], true, nil
 }
 
 // isMounted reports whether the device is mounted anywhere.
@@ -1916,7 +1945,7 @@ func (p *Provider) wipe(ctx context.Context, lv string, wasActive bool) error {
 			return err
 		}
 	}
-	if _, err := p.runner.Run(ctx, binBlkdiscard, "--zeroout", p.lvPath(lv)); err != nil {
+	if err := p.blockDevices.ZeroOut(ctx, p.lvPath(lv), 0); err != nil {
 		wipeErr := fmt.Errorf("wiping %s before deleting it: %w", p.lvRef(lv), err)
 		if wasActive {
 			return wipeErr

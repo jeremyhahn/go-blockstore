@@ -28,7 +28,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeremyhahn/go-blockstore/internal/blkdev"
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
+	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
@@ -461,7 +463,6 @@ func TestProvisionFromSnapshot(t *testing.T) {
 		Name: snapLV, VG: testVG, Size: "214748364", Origin: "vol1",
 		OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10), Time: "2026-08-26 10:00:00 -0500", Attr: "swi-a-s---",
 	}))
-	r.on(binDD, "if=/dev/vg0/"+snapLV, "of=/dev/vg0/vol2", "bs=4M", "conv=fsync,nocreat", "status=none").returns("")
 
 	r.scriptProvisionAt("vol2", originBacking())
 	if _, err := p.Provision(context.Background(), common.VolumeSpec{
@@ -471,7 +472,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 		t.Fatalf("Provision: %v", err)
 	}
 
-	r.assertRan(t, "dd if=/dev/vg0/vol1.snap.nightly of=/dev/vg0/vol2 bs=4M conv=fsync,nocreat status=none")
+	assertCopied(t, r, "/dev/vg0/vol1.snap.nightly", "/dev/vg0/vol2")
 	// Created at the SOURCE's size, not the caller's: the copy is whole-device,
 	// and a longer destination strands the source's metadata inside it.
 	r.assertRan(t, fmt.Sprintf("lvcreate --yes --name vol2 --size %db vg0", originBacking()))
@@ -479,17 +480,17 @@ func TestProvisionFromSnapshot(t *testing.T) {
 	// The copy happens before DRBD metadata is written, so the metadata
 	// describes the new device rather than the one the image came from.
 	cmds := r.commands()
-	ddAt, mdAt := -1, -1
+	copyAt, mdAt := -1, -1
 	for i, c := range cmds {
-		if strings.HasPrefix(c, "dd ") {
-			ddAt = i
+		if strings.HasPrefix(c, "copy ") {
+			copyAt = i
 		}
 		if strings.Contains(c, "create-md") {
 			mdAt = i
 		}
 	}
-	if ddAt < 0 || mdAt < 0 || ddAt > mdAt {
-		t.Errorf("dd must run before create-md; commands were:\n  %s", strings.Join(cmds, "\n  "))
+	if copyAt < 0 || mdAt < 0 || copyAt > mdAt {
+		t.Errorf("the copy must run before create-md; commands were:\n  %s", strings.Join(cmds, "\n  "))
 	}
 }
 
@@ -1049,8 +1050,7 @@ func TestUnmount(t *testing.T) {
 	provision(t, p, r, defaultSpec())
 	r.reset()
 
-	r.on(binFindmnt, "--json", "--mountpoint", testMountPoint, "-o", "TARGET,SOURCE,FSTYPE").
-		returns(`{"filesystems":[{"target":"` + testMountPoint + `","source":"/dev/drbd0","fstype":"ext4"}]}`)
+	r.scriptMount("/dev/drbd0", testMountPoint)
 
 	if err := p.Unmount(context.Background(), testVolume, testMountPoint); err != nil {
 		t.Fatalf("Unmount: %v", err)
@@ -1063,11 +1063,91 @@ func TestUnmountConvergesWhenNotMounted(t *testing.T) {
 	provision(t, p, r, defaultSpec())
 	r.reset()
 
-	r.on(binFindmnt, "--json", "--mountpoint", testMountPoint, "-o", "TARGET,SOURCE,FSTYPE").
-		fails(findmntNoMatch, "")
+	r.scriptMount("/dev/drbd0", "")
 
 	if err := p.Unmount(context.Background(), testVolume, testMountPoint); err != nil {
 		t.Fatalf("Unmount of an unmounted target = %v, want nil", err)
+	}
+	assertNoUnmount(t, m)
+}
+
+// TestUnmountFindsAMountMadeUnderAnAliasedDeviceName is the hole that comparing
+// mount SOURCES left open.
+//
+// A DRBD device has several names — /dev/drbdN and the udev symlinks under
+// /dev/drbd/by-res and /dev/drbd/by-disk — and the mount table records whichever
+// one was used to mount it. Comparing that string against the single name this
+// provider spells read a filesystem mounted through an alias as belonging to
+// somebody else, and Unmount converged on "not mounted" while the filesystem
+// stayed up. Identity is the device number, which is the same under every name.
+func TestUnmountFindsAMountMadeUnderAnAliasedDeviceName(t *testing.T) {
+	p, r, m := newTestProviderWithMounter(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	r.scriptMountUnderAlias("/dev/drbd/by-res/vol1/0", "/dev/drbd0", testMountPoint)
+
+	if err := p.Unmount(context.Background(), testVolume, testMountPoint); err != nil {
+		t.Fatalf("Unmount: %v", err)
+	}
+	assertUnmounted(t, m, testMountPoint)
+}
+
+// TestUnmountConvergesWhenTheDeviceIsGone covers a teardown that has already
+// taken the resource down: the device node is absent, so nothing of this volume
+// can be mounted anywhere, and the unmount converges rather than failing on a
+// device it cannot identify.
+func TestUnmountConvergesWhenTheDeviceIsGone(t *testing.T) {
+	p, r, m := newTestProviderWithMounter(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	r.failMountTable(&mountinfo.DeviceError{Path: "/dev/drbd0", Err: os.ErrNotExist})
+
+	if err := p.Unmount(context.Background(), testVolume, testMountPoint); err != nil {
+		t.Fatalf("Unmount with the device gone = %v, want nil", err)
+	}
+	assertNoUnmount(t, m)
+}
+
+// TestUnmountFailsClosedWhenTheMountTableItselfIsMissing is the other half of
+// the convergence above, and the reason it tests the error's TYPE.
+//
+// A missing device node and an unopenable /proc/self/mountinfo both report
+// os.ErrNotExist. The first means nothing of this volume is mounted anywhere;
+// the second means nothing is known at all, and reading it as "not mounted" is
+// exactly the fail-open this provider stopped asking findmnt to avoid.
+func TestUnmountFailsClosedWhenTheMountTableItselfIsMissing(t *testing.T) {
+	p, r, m := newTestProviderWithMounter(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	r.failMountTable(&mountinfo.ReadError{Path: mountinfo.ProcPath, Err: os.ErrNotExist})
+
+	err := p.Unmount(context.Background(), testVolume, testMountPoint)
+	if err == nil {
+		t.Fatal("Unmount converged over a mount table it could not read")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Unmount = %v, want it to carry the read failure", err)
+	}
+	assertNoUnmount(t, m)
+}
+
+// TestUnmountLeavesAnOverMountedTargetAlone covers the target this volume is
+// mounted at and no longer visible at, because something has been mounted over
+// it. umount(2) detaches what is visible, so acting on the path would take that
+// other filesystem down and leave this volume mounted underneath it.
+func TestUnmountLeavesAnOverMountedTargetAlone(t *testing.T) {
+	p, r, m := newTestProviderWithMounter(t)
+	provision(t, p, r, defaultSpec())
+	r.reset()
+
+	r.scriptMount("/dev/drbd0", testMountPoint)
+	r.overMount(testMountPoint, "/dev/sdb1")
+
+	if err := p.Unmount(context.Background(), testVolume, testMountPoint); err != nil {
+		t.Fatalf("Unmount of an over-mounted target = %v, want nil", err)
 	}
 	assertNoUnmount(t, m)
 }
@@ -1081,8 +1161,7 @@ func TestUnmountLeavesAnotherDeviceAlone(t *testing.T) {
 	provision(t, p, r, defaultSpec())
 	r.reset()
 
-	r.on(binFindmnt, "--json", "--mountpoint", testMountPoint, "-o", "TARGET,SOURCE,FSTYPE").
-		returns(`{"filesystems":[{"target":"` + testMountPoint + `","source":"/dev/sda1","fstype":"ext4"}]}`)
+	r.scriptMount("/dev/sda1", testMountPoint)
 
 	if err := p.Unmount(context.Background(), testVolume, testMountPoint); err != nil {
 		t.Fatalf("Unmount of a target holding another device = %v, want nil", err)
@@ -1109,7 +1188,7 @@ func TestResize(t *testing.T) {
 	}))
 	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize), 10)+"b", "vg0/vol1").returns("")
 	r.on(binDRBDAdm, "resize", testVolume).returns("")
-	r.scriptFindmntSource("/dev/drbd0", "")
+	r.scriptMount("/dev/drbd0", "")
 	// Unmounted ext4 on a Primary: checked, then grown offline.
 	r.scriptStatus(primaryStatus(testVolume, 0))
 	r.on(binE2fsck, "-f", "-p", "/dev/drbd0").returns("")
@@ -1168,7 +1247,7 @@ func TestResizeRepeatFinishesTheFilesystem(t *testing.T) {
 		Size: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
 	}))
 	r.on(binDRBDAdm, "resize", testVolume).returns("")
-	r.scriptFindmntSource("/dev/drbd0", testMountPoint)
+	r.scriptMount("/dev/drbd0", testMountPoint)
 	r.on(binResize2fs, "/dev/drbd0").returns("")
 
 	if err := p.Resize(context.Background(), testVolume, testSize); err != nil {
@@ -1254,7 +1333,7 @@ func TestResizeAttemptsTheLargestRepresentableSize(t *testing.T) {
 	}))
 	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(limit), 10)+"b", "vg0/vol1").returns("")
 	r.on(binDRBDAdm, "resize", testVolume).returns("")
-	r.scriptFindmntSource("/dev/drbd0", "")
+	r.scriptMount("/dev/drbd0", "")
 	r.on(binE2fsck, "-f", "-p", "/dev/drbd0").returns("")
 	r.on(binResize2fs, "/dev/drbd0").returns("")
 
@@ -1669,7 +1748,6 @@ func TestDeleteWipesTheBackingVolumeWhenConfigured(t *testing.T) {
 	r.scriptStatus(secondaryStatus(testVolume, 0))
 	r.scriptLVS(lvsJSON(lvEntry{Name: "vol1", VG: testVG, Size: strconv.FormatInt(testSize, 10), Attr: attrActiveVolume}))
 	r.on(binDRBDAdm, "down", testVolume).returns("")
-	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").returns("")
 	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
 
 	if err := p.Delete(context.Background(), testVolume); err != nil {
@@ -1678,13 +1756,13 @@ func TestDeleteWipesTheBackingVolumeWhenConfigured(t *testing.T) {
 
 	// Already active, so it is left exactly as found.
 	r.assertNotRan(t, "lvchange")
-	r.assertRan(t, "blkdiscard --zeroout /dev/vg0/vol1")
+	assertZeroed(t, r, "/dev/vg0/vol1", 0)
 	// Not the replicated device: zeroing that would go to the peer as well.
 	r.assertNotRan(t, "/dev/drbd0")
 
 	cmds := r.commands()
 	downAt := indexOfCommand(cmds, "drbdadm down vol1")
-	wipeAt := indexOfCommand(cmds, "blkdiscard --zeroout /dev/vg0/vol1")
+	wipeAt := indexOfCommand(cmds, "zeroout /dev/vg0/vol1 0")
 	removeAt := indexOfCommand(cmds, "lvremove --force vg0/vol1")
 	if downAt < 0 || wipeAt < 0 || removeAt < 0 {
 		t.Fatalf("expected the teardown, the wipe and the removal; ran:\n  %s", strings.Join(cmds, "\n  "))
@@ -1706,15 +1784,12 @@ func TestDeleteDoesNotWipeByDefault(t *testing.T) {
 	r.scriptStatus(secondaryStatus(testVolume, 0))
 	r.scriptLVS(lvsJSON(lvEntry{Name: "vol1", VG: testVG, Size: strconv.FormatInt(testSize, 10), Attr: attrActiveVolume}))
 	r.on(binDRBDAdm, "down", testVolume).returns("")
-	// Scripted to succeed, so its absence proves the option gates it rather
-	// than the fake refusing the command.
-	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").returns("")
 	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
 
 	if err := p.Delete(context.Background(), testVolume); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	r.assertNotRan(t, "blkdiscard")
+	assertNothingZeroed(t, r)
 	r.assertRan(t, "lvremove --force vg0/vol1")
 }
 
@@ -1730,14 +1805,17 @@ func TestDeleteStopsWhenTheWipeFails(t *testing.T) {
 	r.scriptStatus(secondaryStatus(testVolume, 0))
 	r.scriptLVS(lvsJSON(lvEntry{Name: "vol1", VG: testVG, Size: strconv.FormatInt(testSize, 10), Attr: attrActiveVolume}))
 	r.on(binDRBDAdm, "down", testVolume).returns("")
-	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").fails(1, "blkdiscard: BLKZEROOUT ioctl failed: Operation not supported")
+	r.failZeroOut(&blkdev.ZeroOutError{
+		Device: "/dev/vg0/vol1",
+		Err:    blkdev.ErrZeroOutUnsupported,
+	})
 	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
 
 	err := p.Delete(context.Background(), testVolume)
 	if err == nil {
 		t.Fatal("Delete succeeded despite the wipe failing")
 	}
-	for _, want := range []string{"vg0/vol1", "not supported"} {
+	for _, want := range []string{"vg0/vol1", "does not support zeroing"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the failure does not mention %q: %v", want, err)
 		}
@@ -1760,7 +1838,7 @@ func TestDeleteStopsWhenTheWipeFails(t *testing.T) {
 // device node at all: after a reboot without autoactivation, after an
 // administrator deactivates it, or from a provisioning run that failed partway.
 //
-// Without the activation, blkdiscard fails on a device that is not there, the
+// Without the activation, the zeroing fails on a device that is not there, the
 // wipe failure stops the delete by design, and wipe_on_delete becomes a
 // PERMANENT block on a perfectly valid deletion — the operator cannot get past
 // it without turning the option off. Fail-closed retention is meant to protect
@@ -1777,7 +1855,6 @@ func TestDeleteWipesAnInactiveBackingVolume(t *testing.T) {
 		Size: strconv.FormatInt(testSize, 10), Attr: attrInactiveVolume,
 	}))
 	r.on(binLVChange, "--activate", "y", "--yes", "vg0/vol1").returns("")
-	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").returns("")
 	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
 
 	if err := p.Delete(context.Background(), testVolume); err != nil {
@@ -1786,7 +1863,7 @@ func TestDeleteWipesAnInactiveBackingVolume(t *testing.T) {
 
 	cmds := r.commands()
 	activateAt := indexOfCommand(cmds, "lvchange --activate y --yes vg0/vol1")
-	wipeAt := indexOfCommand(cmds, "blkdiscard --zeroout /dev/vg0/vol1")
+	wipeAt := indexOfCommand(cmds, "zeroout /dev/vg0/vol1 0")
 	removeAt := indexOfCommand(cmds, "lvremove --force vg0/vol1")
 	if activateAt < 0 || wipeAt < 0 || removeAt < 0 {
 		t.Fatalf("expected activation, wipe and removal; ran:\n  %s", strings.Join(cmds, "\n  "))
@@ -1815,7 +1892,10 @@ func TestFailedWipeRestoresAnInactiveVolume(t *testing.T) {
 		Size: strconv.FormatInt(testSize, 10), Attr: attrInactiveVolume,
 	}))
 	r.on(binLVChange, "--activate", "y", "--yes", "vg0/vol1").returns("")
-	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").fails(1, "blkdiscard: BLKZEROOUT ioctl failed: Operation not supported")
+	r.failZeroOut(&blkdev.ZeroOutError{
+		Device: "/dev/vg0/vol1",
+		Err:    blkdev.ErrZeroOutUnsupported,
+	})
 	r.on(binLVChange, "--activate", "n", "--yes", "vg0/vol1").returns("")
 	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
 
@@ -1823,7 +1903,7 @@ func TestFailedWipeRestoresAnInactiveVolume(t *testing.T) {
 	if err == nil {
 		t.Fatal("Delete succeeded despite the wipe failing")
 	}
-	if !strings.Contains(err.Error(), "not supported") {
+	if !strings.Contains(err.Error(), "does not support zeroing") {
 		t.Errorf("the wipe failure is not reported: %v", err)
 	}
 	r.assertRan(t, "lvchange --activate n --yes vg0/vol1")
@@ -1853,7 +1933,6 @@ func TestFailedRemovalRestoresAnInactiveVolume(t *testing.T) {
 		Size: strconv.FormatInt(testSize, 10), Attr: attrInactiveVolume,
 	}))
 	r.on(binLVChange, "--activate", "y", "--yes", "vg0/vol1").returns("")
-	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").returns("")
 	r.on(binLVRemove, "--force", "vg0/vol1").fails(5, "Logical volume vg0/vol1 in use")
 	r.on(binLVChange, "--activate", "n", "--yes", "vg0/vol1").returns("")
 
@@ -1885,7 +1964,6 @@ func TestFailedRemovalLeavesAnActiveVolumeAlone(t *testing.T) {
 		Size: strconv.FormatInt(testSize, 10), Attr: attrActiveVolume,
 	}))
 	r.on(binDRBDAdm, "down", testVolume).returns("")
-	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").returns("")
 	r.on(binLVRemove, "--force", "vg0/vol1").fails(5, "Logical volume vg0/vol1 in use")
 	// Scripted to succeed, so its absence is the decision not to run it.
 	r.on(binLVChange, "--activate", "n", "--yes", "vg0/vol1").returns("")
@@ -1900,7 +1978,7 @@ func TestFailedRemovalLeavesAnActiveVolumeAlone(t *testing.T) {
 // makes the two restore paths worth having at all.
 //
 // A cancellation or timeout DURING the wipe is the likeliest way to reach them —
-// blkdiscard is the long step, minutes per terabyte — and the compensating
+// the zeroing is the long step, minutes per terabyte — and the compensating
 // lvchange must not inherit the context that just died. The production runner
 // execs through exec.CommandContext, so a canceled context means the cleanup
 // process never starts, and the restore silently does not happen while the code
@@ -1924,10 +2002,8 @@ func TestBorrowedActivationIsGivenBackOnAFailedContext(t *testing.T) {
 	}))
 	r.on(binLVChange, "--activate", "y", "--yes", "vg0/vol1").returns("")
 	// The caller gives up while the wipe is running, which is what a deadline
-	// on a long blkdiscard looks like from in here.
-	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").
-		fails(1, "interrupted").
-		then(cancel)
+	// on a long zeroing looks like from in here.
+	r.onZeroOut(cancel)
 	r.on(binLVChange, "--activate", "n", "--yes", "vg0/vol1").returns("")
 
 	if err := p.Delete(ctx, testVolume); err == nil {
@@ -1959,17 +2035,16 @@ func TestWipeNeverRunsUnderASnapshot(t *testing.T) {
 		lvEntry{Name: "vol1", VG: testVG, Size: strconv.FormatInt(testSize, 10)},
 		lvEntry{Name: "vol1.snap.nightly", VG: testVG, Origin: "vol1"},
 	))
-	// Both scripted to succeed: nothing here may run, and the reason must be
-	// the refusal rather than an unscripted command.
+	// Scripted to succeed: nothing here may run, and the reason must be the
+	// refusal rather than an unscripted command.
 	r.on(binDRBDAdm, "down", testVolume).returns("")
-	r.on(binBlkdiscard, "--zeroout", "/dev/vg0/vol1").returns("")
 	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
 
 	err := p.Delete(context.Background(), testVolume)
 	if !errors.Is(err, common.ErrHasSnapshots) {
 		t.Fatalf("Delete with snapshots = %v, want common.ErrHasSnapshots", err)
 	}
-	r.assertNotRan(t, "blkdiscard")
+	assertNothingZeroed(t, r)
 	r.assertNotRan(t, "lvremove")
 	r.assertNotRan(t, "drbdadm down")
 }
@@ -2008,15 +2083,17 @@ func TestStatus(t *testing.T) {
 	const deviceSize = int64(1052600) * statusSizeUnit
 
 	tests := []struct {
-		name       string
-		status     string
-		mounted    string
-		wantState  common.VolumeState
-		wantSize   int64
-		wantConn   common.ReplConnState
-		wantRole   common.ReplRole
-		wantNodes  []common.NodeID
-		skipFindmn bool
+		name string
+		// status is the drbdsetup report, and mountedAt is where the mount
+		// table says the DRBD device is mounted — empty for not mounted, which
+		// the table reports as an empty answer rather than as a failure.
+		status    string
+		mountedAt string
+		wantState common.VolumeState
+		wantSize  int64
+		wantConn  common.ReplConnState
+		wantRole  common.ReplRole
+		wantNodes []common.NodeID
 	}{
 		{
 			// With no device to measure, the size falls back to the record.
@@ -2024,25 +2101,25 @@ func TestStatus(t *testing.T) {
 			// zero value, which would claim the volume is not replicated; see
 			// TestStatusAndReplicationStateAgreeWhenTheResourceIsDown.
 			name: "not up", status: emptyStatus,
-			wantState: common.VolumeStateAvailable, wantSize: testSize, skipFindmn: true,
+			wantState: common.VolumeStateAvailable, wantSize: testSize,
 			wantConn: common.ReplStateDown, wantRole: common.ReplRoleUnknown,
 		},
 		{
-			name: "up and secondary", status: secondaryStatus(testVolume, 0),
-			mounted:   `{"filesystems":[]}`,
+			name:      "up and secondary",
+			status:    secondaryStatus(testVolume, 0),
 			wantState: common.VolumeStateAttached, wantSize: deviceSize, wantConn: common.ReplStateUpToDate,
 			wantRole: common.ReplRoleSecondary, wantNodes: []common.NodeID{testNode, testPeer},
 		},
 		{
-			name: "mounted", status: primaryStatus(testVolume, 0),
-			mounted:   `{"filesystems":[{"target":"` + testMountPoint + `","source":"/dev/drbd0","fstype":"ext4"}]}`,
+			name:      "mounted",
+			status:    primaryStatus(testVolume, 0),
+			mountedAt: testMountPoint,
 			wantState: common.VolumeStateMounted, wantSize: deviceSize, wantConn: common.ReplStateUpToDate,
 			wantRole: common.ReplRolePrimary, wantNodes: []common.NodeID{testNode, testPeer},
 		},
 		{
 			name:      "disconnected peer is not reported as attached",
 			status:    statusJSON(testVolume, 0, "Primary", "Connecting", "Off", "UpToDate"),
-			mounted:   `{"filesystems":[]}`,
 			wantState: common.VolumeStateAttached, wantSize: deviceSize, wantConn: common.ReplStateConnecting,
 			wantRole: common.ReplRolePrimary, wantNodes: []common.NodeID{testNode},
 		},
@@ -2051,7 +2128,6 @@ func TestStatus(t *testing.T) {
 			status:    statusJSON(testVolume, 0, "Primary", "Connected", "Established", "Failed"),
 			wantState: common.VolumeStateError, wantSize: deviceSize, wantConn: common.ReplStateInconsistent,
 			wantRole: common.ReplRolePrimary, wantNodes: []common.NodeID{testNode, testPeer},
-			skipFindmn: true,
 		},
 	}
 
@@ -2062,9 +2138,7 @@ func TestStatus(t *testing.T) {
 			r.reset()
 
 			r.scriptStatus(tc.status)
-			if !tc.skipFindmn {
-				r.on(binFindmnt, "--json", "--source", "/dev/drbd0", "-o", "TARGET,SOURCE,FSTYPE").returns(tc.mounted)
-			}
+			r.scriptMount("/dev/drbd0", tc.mountedAt)
 
 			st, err := p.Status(context.Background(), testVolume)
 			if err != nil {
@@ -2127,7 +2201,7 @@ func TestStatusAndReplicationStateAgreeWhenTheResourceIsDown(t *testing.T) {
 
 	// Configured, known to this provider, and not running.
 	r.scriptStatus(emptyStatus)
-	r.scriptFindmntSource("/dev/drbd0", "")
+	r.scriptMount("/dev/drbd0", "")
 
 	st, err := p.Status(context.Background(), testVolume)
 	if err != nil {
@@ -2535,7 +2609,6 @@ func TestRestoreSizeBoundary(t *testing.T) {
 			}))
 			if tc.wantErr == nil {
 				r.scriptProvisionAt("vol2", tc.originSize)
-				r.on(binDD, "if=/dev/vg0/"+snapLV, "of=/dev/vg0/vol2", "bs=4M", "conv=fsync,nocreat", "status=none").returns("")
 			}
 
 			_, err := p.Provision(context.Background(), common.VolumeSpec{
@@ -2891,7 +2964,7 @@ func TestResizeConvergesAfterAPartialFailure(t *testing.T) {
 		Size: strconv.FormatInt(roundUpTo(backingBytes(newSize), testExtentSize), 10),
 	}))
 	r.on(binDRBDAdm, "resize", testVolume).returns("")
-	r.scriptFindmntSource("/dev/drbd0", "")
+	r.scriptMount("/dev/drbd0", "")
 	r.scriptStatus(primaryStatus(testVolume, 0))
 	r.on(binE2fsck, "-f", "-p", "/dev/drbd0").returns("")
 	r.on(binResize2fs, "/dev/drbd0").returns("")
@@ -2958,6 +3031,9 @@ func TestResizeGrowsTheFilesystem(t *testing.T) {
 		script  func(*fakeRunner)
 		wantRan string
 		wantNot string
+		// wantNoLookup requires that the mount table was never read, which is
+		// how a volume with no filesystem proves it looked nothing up.
+		wantNoLookup bool
 	}{
 		{
 			// resize2fs takes the device and finds the mount point itself.
@@ -2995,9 +3071,10 @@ func TestResizeGrowsTheFilesystem(t *testing.T) {
 			wantNot: "xfs_growfs",
 		},
 		{
-			// A raw volume has no filesystem, so nothing is looked up either.
+			// A raw volume has no filesystem, so nothing is looked up either:
+			// no growth tool runs, and the mount table is never consulted.
 			name: "raw volume", fsType: "", mounted: "",
-			wantNot: "findmnt",
+			wantNoLookup: true,
 		},
 		{
 			// The mounted ext4 path must NOT check: e2fsck against a mounted
@@ -3027,7 +3104,7 @@ func TestResizeGrowsTheFilesystem(t *testing.T) {
 			r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize), 10)+"b", "vg0/vol1").returns("")
 			r.on(binDRBDAdm, "resize", testVolume).returns("")
 			if tc.fsType != "" {
-				r.scriptFindmntSource("/dev/drbd0", tc.mounted)
+				r.scriptMount("/dev/drbd0", tc.mounted)
 			}
 			if tc.script != nil {
 				tc.script(r)
@@ -3041,6 +3118,9 @@ func TestResizeGrowsTheFilesystem(t *testing.T) {
 			}
 			if tc.wantNot != "" {
 				r.assertNotRan(t, tc.wantNot)
+			}
+			if tc.wantNoLookup && r.mountLookups() != 0 {
+				t.Errorf("the mount table was consulted %d times for a volume with no filesystem", r.mountLookups())
 			}
 
 			// The device grows either way, and the record follows it.
@@ -3074,7 +3154,7 @@ func TestResizeFailsWhenTheFilesystemGrowFails(t *testing.T) {
 	}))
 	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize), 10)+"b", "vg0/vol1").returns("")
 	r.on(binDRBDAdm, "resize", testVolume).returns("")
-	r.scriptFindmntSource("/dev/drbd0", testMountPoint)
+	r.scriptMount("/dev/drbd0", testMountPoint)
 	r.on(binResize2fs, "/dev/drbd0").fails(1, "resize2fs: Device or resource busy")
 
 	err := p.Resize(context.Background(), testVolume, newSize)
@@ -3237,26 +3317,24 @@ func TestSnapshotAndDeleteAreSerialized(t *testing.T) {
 	}
 }
 
-// TestFindmntIsReadAsJSON pins how mount lookups are parsed.
+// TestMountLookupsRunNoCommand pins where the answer comes from.
 //
-// findmnt's default output prints a path's spaces literally and --raw is what
-// escapes them, which is the opposite of what it sounds like — so a
-// line-oriented parser is wrong in a way that reads as correct on every path
-// without a space in it. Asking for --json sidesteps the question: the target
-// arrives as a decoded string and no spelling of a path can split a field.
+// Mount lookups used to be findmnt, whose default output prints a path's spaces
+// literally while --raw escapes them — the opposite of what it sounds like, so
+// a line-oriented parser was wrong in a way that read as correct on every path
+// without a space in it. The lookups now read /proc/self/mountinfo, where the
+// kernel does the escaping and internal/mountinfo undoes it.
 //
-// This fails if anyone moves these calls to --raw, or drops --json for
-// line-based parsing.
-func TestFindmntIsReadAsJSON(t *testing.T) {
+// This fails if a mount lookup goes back to being a subprocess: both calls
+// below ask where something is mounted, and neither may run anything to find
+// out.
+func TestMountLookupsRunNoCommand(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, defaultSpec())
 	r.reset()
 
-	const dev = "/dev/drbd0"
 	r.scriptStatus(primaryStatus(testVolume, 0))
-	r.on(binFindmnt, "--json", "--source", dev, "-o", "TARGET,SOURCE,FSTYPE").returns(`{"filesystems":[]}`)
-	r.on(binFindmnt, "--json", "--mountpoint", testMountPoint, "-o", "TARGET,SOURCE,FSTYPE").
-		fails(findmntNoMatch, "")
+	r.scriptMount("/dev/drbd0", "")
 
 	if _, err := p.Status(context.Background(), testVolume); err != nil {
 		t.Fatalf("Status: %v", err)
@@ -3265,25 +3343,16 @@ func TestFindmntIsReadAsJSON(t *testing.T) {
 		t.Fatalf("Unmount: %v", err)
 	}
 
-	var findmntCalls int
+	// One lookup by source for Status, one by mount point for Unmount.
+	if got := r.mountLookups(); got != 2 {
+		t.Errorf("the mount table was consulted %d times, want 2 (one by source, one by mount point)", got)
+	}
 	for _, cmd := range r.commands() {
-		if !strings.HasPrefix(cmd, binFindmnt+" ") {
-			continue
-		}
-		findmntCalls++
-		if !strings.Contains(cmd, "--json") {
-			t.Errorf("findmnt call %q does not ask for --json", cmd)
-		}
-		// --raw escapes what the default prints literally; either way, a
-		// parser that cares is the wrong parser.
-		for _, forbidden := range []string{"--raw", "--pairs", "--noheadings"} {
-			if strings.Contains(cmd, forbidden) {
-				t.Errorf("findmnt call %q uses %s; mount lookups are read as JSON", cmd, forbidden)
+		for _, forbidden := range []string{"findmnt", "mount", "lsblk"} {
+			if strings.HasPrefix(cmd, forbidden+" ") {
+				t.Errorf("a mount lookup ran %q; the mount table is read, not asked for", cmd)
 			}
 		}
-	}
-	if findmntCalls != 2 {
-		t.Errorf("findmnt was called %d times, want 2 (one by source, one by mountpoint)", findmntCalls)
 	}
 }
 
@@ -3309,8 +3378,7 @@ func TestMountPathsWithSpacesRoundTrip(t *testing.T) {
 		t.Fatalf("Mount: %v", err)
 	}
 
-	r.on(binFindmnt, "--json", "--mountpoint", target, "-o", "TARGET,SOURCE,FSTYPE").
-		returns(`{"filesystems":[{"target":"` + target + `","source":"/dev/drbd0","fstype":"ext4"}]}`)
+	r.scriptMount("/dev/drbd0", target)
 	if err := p.Unmount(context.Background(), testVolume, target); err != nil {
 		t.Fatalf("Unmount: %v", err)
 	}
@@ -3420,7 +3488,7 @@ func TestOfflineExtGrowStopsOnAnUnfixableCheck(t *testing.T) {
 			}))
 			r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize), 10)+"b", "vg0/vol1").returns("")
 			r.on(binDRBDAdm, "resize", testVolume).returns("")
-			r.scriptFindmntSource("/dev/drbd0", "")
+			r.scriptMount("/dev/drbd0", "")
 			r.scriptStatus(primaryStatus(testVolume, 0))
 			if tc.exit == 0 {
 				r.on(binE2fsck, "-f", "-p", "/dev/drbd0").returns("")
@@ -3571,7 +3639,6 @@ func TestRestoreInheritsTheSourceFilesystem(t *testing.T) {
 		Name: snapLV, VG: testVG, Origin: testVolume,
 		OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
 	}))
-	r.on(binDD, "if=/dev/vg0/"+snapLV, "of=/dev/vg0/vol2", "bs=4M", "conv=fsync,nocreat", "status=none").returns("")
 	r.scriptProvisionAt("vol2", originBacking())
 	if _, err := p.Provision(context.Background(), common.VolumeSpec{
 		Name: "vol2", SizeBytes: testSize, Replicas: 2,
@@ -3733,8 +3800,7 @@ func TestMountAndUnmountDoNotExec(t *testing.T) {
 		t.Fatalf("Mount: %v", err)
 	}
 
-	r.on(binFindmnt, "--json", "--mountpoint", testMountPoint, "-o", "TARGET,SOURCE,FSTYPE").
-		returns(`{"filesystems":[{"target":"` + testMountPoint + `","source":"/dev/drbd0","fstype":"ext4"}]}`)
+	r.scriptMount("/dev/drbd0", testMountPoint)
 	if err := p.Unmount(context.Background(), testVolume, testMountPoint); err != nil {
 		t.Fatalf("Unmount: %v", err)
 	}
@@ -3937,17 +4003,15 @@ func TestUnmountCannotActOnAMinorThatWasRecycledUnderIt(t *testing.T) {
 	inWindow := make(chan struct{})
 	release := make(chan struct{})
 
-	// findmnt is Unmount's first command, after the lookup.
-	r.on(binFindmnt, "--json", "--source", dev, "-o", "TARGET,SOURCE,FSTYPE").
-		returns(`{"filesystems":[{"target":"` + testMountPoint + `","source":"` + dev + `","fstype":"ext4"}]}`)
-	r.on(binFindmnt, "--json", "--mountpoint", testMountPoint, "-o", "TARGET,SOURCE,FSTYPE").
-		returns(`{"filesystems":[{"target":"` + testMountPoint + `","source":"` + dev + `","fstype":"ext4"}]}`).
-		then(func() {
-			once.Do(func() {
-				close(inWindow)
-				<-release
-			})
+	// Reading the mount table is Unmount's first step, after the record lookup,
+	// and the window this test needs is the one it opens.
+	r.scriptMount(dev, testMountPoint)
+	r.onMountTable(func() {
+		once.Do(func() {
+			close(inWindow)
+			<-release
 		})
+	})
 	r.scriptStatus(emptyStatus)
 	r.scriptLVS(lvsJSON(lvEntry{Name: "vol1", VG: testVG, Size: strconv.FormatInt(testSize, 10)}))
 	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
@@ -4220,7 +4284,6 @@ func TestRestoreIntoALargerVolume(t *testing.T) {
 		lvEntry{Name: "vol2", VG: testVG, Size: strconv.FormatInt(originBacking(), 10)},
 	))
 	r.scriptProvisionAt("vol2", originBacking())
-	r.on(binDD, "if=/dev/vg0/"+snapLV, "of=/dev/vg0/vol2", "bs=4M", "conv=fsync,nocreat", "status=none").returns("")
 
 	// The grow runs against a resource that is UP, because Provision brought it
 	// up immediately before. That matters: Resize refuses to extend a detached
@@ -4228,7 +4291,7 @@ func TestRestoreIntoALargerVolume(t *testing.T) {
 	r.scriptStatus(statusJSON("vol2", 1, "Secondary", "Connected", "Established", "Inconsistent"))
 	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(requested), 10)+"b", "vg0/vol2").returns("")
 	r.on(binDRBDAdm, "resize", "vol2").returns("")
-	r.scriptFindmntSource("/dev/drbd1", "")
+	r.scriptMount("/dev/drbd1", "")
 
 	vol, err := p.Provision(context.Background(), common.VolumeSpec{
 		Name: "vol2", SizeBytes: requested, Replicas: 2,
@@ -4239,7 +4302,7 @@ func TestRestoreIntoALargerVolume(t *testing.T) {
 	}
 
 	r.assertRan(t, fmt.Sprintf("lvcreate --yes --name vol2 --size %db vg0", originBacking()))
-	r.assertRan(t, "dd if=/dev/vg0/"+snapLV+" of=/dev/vg0/vol2 bs=4M conv=fsync,nocreat status=none")
+	assertCopied(t, r, "/dev/vg0/"+snapLV, "/dev/vg0/vol2")
 	r.assertRan(t, fmt.Sprintf("lvextend --size %db vg0/vol2", backingBytes(requested)))
 	r.assertRan(t, "drbdadm resize vol2")
 

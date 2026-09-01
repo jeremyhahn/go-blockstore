@@ -25,7 +25,9 @@ import (
 
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 
+	"github.com/jeremyhahn/go-blockstore/internal/blkdev"
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
+	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
 )
 
 // defaultSnapshotCoWPercent is the share of the origin's size given to a
@@ -51,7 +53,35 @@ type Provider struct {
 	wipeOnDelete       bool
 	lockDir            string
 	mounter            Mounter
+	mountTable         MountTable
+	blockDevices       BlockDevices
 	luks               luksBackend
+}
+
+// ErrMountedBeneathAnother reports a volume still mounted at a path where
+// something else has since been mounted on top of it.
+//
+// It is its own sentinel because the advice it carries is specific and is not
+// the advice any other failure here carries: the volume cannot be unmounted
+// from this side. umount(2) takes a path and detaches whatever is visible at
+// it, so unmounting that path would take down the filesystem on top — which
+// belongs to somebody else and was never this provider's to touch — and leave
+// this volume mounted underneath it anyway. Whoever mounted over it unmounts
+// theirs first; then the delete goes through unchanged.
+//
+// Like ErrResizeWhileAttached, it says "the request is fine, the volume is in
+// the wrong state at the moment" rather than "this cannot be done".
+var ErrMountedBeneathAnother = errors.New("volume is mounted beneath another filesystem")
+
+// excluding returns the items of all that are not in keep, in order.
+func excluding(all, keep []string) []string {
+	var out []string
+	for _, item := range all {
+		if !contains(keep, item) {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 // Ensure the provider satisfies the contract at compile time.
@@ -70,6 +100,18 @@ var _ common.VolumeProvider = (*Provider)(nil)
 // one: no "var m local.Mounter", no function returning one. The type was
 // exported at v0.1.0-alpha and stays nameable.
 type Mounter = mount.Mounter
+
+// MountTable is the seam through which the provider asks what is mounted.
+//
+// It replaced asking findmnt, and the reason it is a seam rather than a direct
+// read is the reason Mounter is one: the answer comes from the running kernel,
+// so a test that cannot substitute it can only run on a host that happens to
+// have the right things mounted.
+type MountTable = mountinfo.Table
+
+// BlockDevices is the seam through which the provider copies and zeroes block
+// devices — what it used to reach for dd and blkdiscard to do.
+type BlockDevices = blkdev.Operator
 
 // Options configures a Provider.
 type Options struct {
@@ -90,6 +132,14 @@ type Options struct {
 	// Mounter mounts and unmounts. It defaults to the pinning implementation
 	// described on the Mounter interface; tests substitute a fake.
 	Mounter Mounter
+
+	// MountTable answers what is mounted. It defaults to reading
+	// /proc/self/mountinfo; tests substitute a fake.
+	MountTable MountTable
+
+	// BlockDevices copies and zeroes block devices. It defaults to the real
+	// syscalls; tests substitute a fake.
+	BlockDevices BlockDevices
 
 	// Encrypted provisions new volumes as LUKS2 containers. It requires
 	// KeyProvider. Volumes already on disk are detected by probing rather than
@@ -241,6 +291,16 @@ func New(opts Options) (*Provider, error) {
 		runner = execRunner{}
 	}
 
+	mountTable := opts.MountTable
+	if mountTable == nil {
+		mountTable = mountinfo.System{}
+	}
+
+	blockDevices := opts.BlockDevices
+	if blockDevices == nil {
+		blockDevices = blkdev.System{}
+	}
+
 	mounter := opts.Mounter
 	if mounter == nil {
 		mounter = mount.System()
@@ -278,6 +338,8 @@ func New(opts Options) (*Provider, error) {
 		wipeOnDelete:       opts.WipeOnDelete,
 		lockDir:            lockDir,
 		mounter:            mounter,
+		mountTable:         mountTable,
+		blockDevices:       blockDevices,
 		luks:               luks,
 	}, nil
 }
@@ -842,13 +904,7 @@ func (p *Provider) restoreImage(ctx context.Context, snapID string, origin lvInf
 		dest = p.cryptPath(volID)
 	}
 
-	if _, runErr := p.runner.Run(ctx, nil, "dd",
-		"if="+p.lvPath(snapID),
-		"of="+dest,
-		"bs=4M",
-		"conv=fsync",
-		"status=none",
-	); runErr != nil {
+	if runErr := p.blockDevices.Copy(ctx, p.lvPath(snapID), dest); runErr != nil {
 		return fmt.Errorf("go-blockstore/local: copying snapshot %q into %q: %w", snapID, volID, runErr)
 	}
 
@@ -928,9 +984,7 @@ func (p *Provider) zeroTail(ctx context.Context, volID string, offset int64) (er
 		err = errors.Join(err, p.deactivate(ctx, volID))
 	}()
 
-	_, runErr := p.runner.Run(ctx, nil, "blkdiscard", "--zeroout",
-		"--offset", strconv.FormatInt(offset, 10), p.lvPath(volID))
-	if runErr != nil {
+	if runErr := p.blockDevices.ZeroOut(ctx, p.lvPath(volID), offset); runErr != nil {
 		return fmt.Errorf("go-blockstore/local: zeroing %s past %d bytes: %w", p.lvRef(volID), offset, runErr)
 	}
 	return nil
@@ -1330,7 +1384,11 @@ func (p *Provider) Unmount(ctx context.Context, volID, target string) error {
 		return nil
 	}
 
-	mounts, err := p.mountpointsFor(ctx, p.sourceAliases(volID, device))
+	// Visible, not merely mounted: if something has been mounted over this
+	// volume at the target, unmounting the path takes that other filesystem
+	// down instead. This volume is not what is at the target any more, which
+	// the contract already calls a converging no-op.
+	mounts, err := p.visibleMountpointsFor(ctx, device)
 	if err != nil {
 		return err
 	}
@@ -1547,7 +1605,7 @@ func (p *Provider) growFilesystem(ctx context.Context, volID, device string) err
 		return nil
 	}
 
-	mounts, err := p.mountpointsFor(ctx, p.sourceAliases(volID, device))
+	mounts, err := p.mountpointsFor(ctx, device)
 	if err != nil {
 		return err
 	}
@@ -1790,11 +1848,24 @@ func (p *Provider) Delete(ctx context.Context, volID string) error {
 		if err != nil {
 			return err
 		}
-		mounts, err := p.mountpointsFor(ctx, p.sourceAliases(volID, device))
+		mounts, err := p.mountpointsFor(ctx, device)
 		if err != nil {
 			return err
 		}
-		for _, target := range deepestFirst(mounts) {
+		visible, err := p.visibleMountpointsFor(ctx, device)
+		if err != nil {
+			return err
+		}
+		// A mount this volume has been over-mounted at cannot be unmounted from
+		// here: umount(2) would detach the filesystem on top, which belongs to
+		// somebody else and was never this provider's to touch. The delete
+		// stops instead of doing that, or of removing a volume still mounted.
+		if hidden := excluding(mounts, visible); len(hidden) > 0 {
+			return fmt.Errorf(
+				"go-blockstore/local: volume %q is mounted at %s beneath another filesystem; unmount that first: %w",
+				volID, strings.Join(hidden, ", "), ErrMountedBeneathAnother)
+		}
+		for _, target := range deepestFirst(visible) {
 			if err := p.umount(ctx, target); err != nil {
 				return err
 			}
@@ -1858,7 +1929,7 @@ func (p *Provider) wipe(ctx context.Context, volID string, wasActive bool) error
 	if err := p.activate(ctx, volID); err != nil {
 		return err
 	}
-	if _, err := p.runner.Run(ctx, nil, "blkdiscard", "--zeroout", p.lvPath(volID)); err != nil {
+	if err := p.blockDevices.ZeroOut(ctx, p.lvPath(volID), 0); err != nil {
 		wipeErr := fmt.Errorf("go-blockstore/local: wiping %s: %w", p.lvRef(volID), err)
 		if wasActive {
 			return wipeErr
@@ -1938,7 +2009,7 @@ func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatu
 	status.State = common.VolumeStateAttached
 	status.AttachedNodes = []common.NodeID{p.nodeID}
 
-	mounts, err := p.mountpointsFor(ctx, p.sourceAliases(volID, device))
+	mounts, err := p.mountpointsFor(ctx, device)
 	if err != nil {
 		return common.VolumeStatus{}, err
 	}

@@ -29,9 +29,15 @@ The library is built from three pieces:
   optional LUKS2 on a single host. A volume is a logical volume in one volume
   group; `Attach` activates it and unlocks its LUKS container when it has one,
   so callers get a mountable device path either way. It keeps no state of its
-  own — every answer is read back from `lvs`, `blkid` and `findmnt` — and every
-  system command goes through an injectable `CommandRunner`, which is what makes
-  the backend unit-testable without root or a block device. LUKS is done in
+  own — every answer is read back from `lvs`, `blkid` and the kernel's mount
+  table — and every system command goes through an injectable `CommandRunner`,
+  which is what makes the backend unit-testable without root or a block device.
+  Where the kernel offers the operation directly it is used directly: mounting
+  and unmounting are `mount(2)`/`umount2(2)`, the mount table is
+  `/proc/self/mountinfo` rather than `findmnt`, whole-device copies are ordinary
+  file I/O rather than `dd`, and zeroing a volume is the `BLKZEROOUT` ioctl
+  rather than `blkdiscard`. None of those four binaries is forked or needs to be
+  installed. LUKS is done in
   pure Go by [go-luks2](https://github.com/jeremyhahn/go-luks2) — headers are
   written and parsed in-process and the plaintext mapping is created with
   device-mapper ioctls — so **no `cryptsetup` binary is forked or needs to be
@@ -294,7 +300,9 @@ sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 go test -tags local_integration 
 ```
 
 They build their own volume group on a loopback file and tear it down again.
-They need root and the `lvm2`, `e2fsprogs` and `util-linux` tooling.
-`cryptsetup` is not required: the containers are formatted, unlocked and
-inspected in-process by go-luks2, and the loop device is attached with the loop
-ioctls rather than by forking `losetup`.
+They need root and the `lvm2` and `e2fsprogs` tooling, plus `blkid` from
+`util-linux`. `cryptsetup` is not required: the containers are formatted,
+unlocked and inspected in-process by go-luks2, and the loop device is attached
+with the loop ioctls rather than by forking `losetup`. Neither are `findmnt`,
+`dd`, `blkdiscard` or `mount`/`umount`: those operations are syscalls and ioctls
+made in-process.

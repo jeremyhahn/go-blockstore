@@ -24,6 +24,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jeremyhahn/go-blockstore/internal/blkdev"
+	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
@@ -54,10 +56,7 @@ func TestSystemCommandFailuresSurface(t *testing.T) {
 			"--extents", "20%ORIGIN", "vg0/vol1").returns("")
 		r.on(binBlkid, "-p", "-o", "export", dev).returns("TYPE=ext4\n")
 		r.on(binResize2fs, dev).returns("")
-		r.on(binFindmnt, "--json", "--source", dev, "-o", "TARGET,SOURCE,FSTYPE").
-			returns(`{"filesystems":[{"target":"` + testMountPoint + `","source":"` + dev + `","fstype":"ext4"}]}`)
-		r.on(binFindmnt, "--json", "--mountpoint", testMountPoint, "-o", "TARGET,SOURCE,FSTYPE").
-			returns(`{"filesystems":[{"target":"` + testMountPoint + `","source":"` + dev + `","fstype":"ext4"}]}`)
+		r.scriptMount(dev, testMountPoint)
 	}
 
 	// The lvs report a snapshot case needs: the origin plus its snapshot.
@@ -133,14 +132,6 @@ func TestSystemCommandFailuresSurface(t *testing.T) {
 				return p.Mount(context.Background(), testVolume, testMountPoint, common.MountOptions{})
 			},
 			"ext4",
-		},
-		{
-			"Unmount: findmnt", func(r *fakeRunner) {
-				r.on(binFindmnt, "--json", "--mountpoint", testMountPoint, "-o", "TARGET,SOURCE,FSTYPE").
-					fails(64, "findmnt: bad usage")
-			},
-			func(p *Provider) error { return p.Unmount(context.Background(), testVolume, testMountPoint) },
-			testMountPoint,
 		},
 		{
 			"Resize: lvs", lvsFails,
@@ -233,14 +224,6 @@ func TestSystemCommandFailuresSurface(t *testing.T) {
 			"drbd status",
 		},
 		{
-			"Status: findmnt", func(r *fakeRunner) {
-				r.on(binFindmnt, "--json", "--source", dev, "-o", "TARGET,SOURCE,FSTYPE").
-					fails(64, "findmnt: bad usage")
-			},
-			func(p *Provider) error { _, err := p.Status(context.Background(), testVolume); return err },
-			dev,
-		},
-		{
 			"Demote: drbdadm secondary", func(r *fakeRunner) {
 				r.on(binDRBDAdm, "secondary", testVolume).fails(11, "device is held open")
 			},
@@ -277,6 +260,65 @@ func TestSystemCommandFailuresSurface(t *testing.T) {
 				t.Errorf("error does not carry the *CommandError: %v", err)
 			}
 		})
+	}
+}
+
+// TestMountTableFailuresFailClosed is the sweep above's counterpart for the one
+// lookup that is no longer a command.
+//
+// A mount table that could not be read must never be reported as "not mounted".
+// That confusion is what asking findmnt made unavoidable — its single non-zero
+// exit meant both — and "not mounted" is what Unmount converges on and what
+// Status presents as a volume nobody is using.
+func TestMountTableFailuresFailClosed(t *testing.T) {
+	cases := map[string]error{
+		"unreadable proc file": &mountinfo.ReadError{Path: mountinfo.ProcPath, Err: os.ErrPermission},
+		"malformed record": &mountinfo.ParseError{
+			Line: 12, Text: "1 2 8:1 /", Err: mountinfo.ErrTooFewFields,
+		},
+		"device not identifiable": &mountinfo.DeviceError{
+			Path: "/dev/drbd0", Err: mountinfo.ErrNotBlockDevice,
+		},
+	}
+
+	calls := map[string]struct {
+		call   func(*Provider) error
+		wantIn string
+	}{
+		"Unmount": {
+			call: func(p *Provider) error { return p.Unmount(context.Background(), testVolume, testMountPoint) },
+			// Unmount asks where the DEVICE is mounted, not what is mounted at
+			// the path, so the device is what its failure names.
+			wantIn: "/dev/drbd0",
+		},
+		"Status": {
+			call:   func(p *Provider) error { _, err := p.Status(context.Background(), testVolume); return err },
+			wantIn: "/dev/drbd0",
+		},
+	}
+
+	for name, tableErr := range cases {
+		for method, tc := range calls {
+			t.Run(method+"/"+name, func(t *testing.T) {
+				p, r := newTestProvider(t)
+				provision(t, p, r, defaultSpec())
+				r.reset()
+
+				r.scriptStatus(primaryStatus(testVolume, 0))
+				r.failMountTable(tableErr)
+
+				err := tc.call(p)
+				if err == nil {
+					t.Fatalf("%s succeeded over a mount table it could not read", method)
+				}
+				if !errors.Is(err, tableErr) {
+					t.Errorf("%s = %v, want it to carry the mount-table failure", method, err)
+				}
+				if !strings.Contains(err.Error(), tc.wantIn) {
+					t.Errorf("error %q does not say what was being looked up", err)
+				}
+			})
+		}
 	}
 }
 
@@ -354,7 +396,7 @@ func TestDeleteRejectsAHostileVolumeID(t *testing.T) {
 	}
 }
 
-// TestRestoreCopyFailureRollsBack covers the dd in the restore path: a copy
+// TestRestoreCopyFailureRollsBack covers the copy in the restore path: a copy
 // that fails must unwind the volume it was filling, not leave a backing device
 // holding half a filesystem.
 func TestRestoreCopyFailureRollsBack(t *testing.T) {
@@ -368,8 +410,12 @@ func TestRestoreCopyFailureRollsBack(t *testing.T) {
 		OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
 	}))
 	r.scriptProvisionAt("vol2", originBacking())
-	r.on(binDD, "if=/dev/vg0/"+snapLV, "of=/dev/vg0/vol2", "bs=4M", "conv=fsync,nocreat", "status=none").
-		fails(1, "dd: error reading '/dev/vg0/vol1.snap.nightly': Input/output error")
+	r.failCopy(&blkdev.CopyError{
+		Source:      "/dev/vg0/" + snapLV,
+		Destination: "/dev/vg0/vol2",
+		Op:          "copying",
+		Err:         errors.New("input/output error"),
+	})
 	r.on(binLVRemove, "--force", "vg0/vol2").returns("")
 
 	_, err := p.Provision(context.Background(), common.VolumeSpec{
@@ -407,7 +453,7 @@ func TestFilesystemGrowFailureOnXFS(t *testing.T) {
 	}))
 	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize), 10)+"b", "vg0/vol1").returns("")
 	r.on(binDRBDAdm, "resize", testVolume).returns("")
-	r.scriptFindmntSource("/dev/drbd0", testMountPoint)
+	r.scriptMount("/dev/drbd0", testMountPoint)
 	r.on(binXFSGrowfs, testMountPoint).fails(1, "xfs_growfs: XFS_IOC_FSGROWFSDATA failed")
 
 	err := p.Resize(context.Background(), testVolume, newSize)
@@ -434,7 +480,7 @@ func TestFilesystemGrowRejectsAnUnknownType(t *testing.T) {
 	}
 	meta.FSType = "btrfs"
 
-	r.scriptFindmntSource("/dev/drbd0", testMountPoint)
+	r.scriptMount("/dev/drbd0", testMountPoint)
 	err = p.growFilesystem(context.Background(), &meta)
 	if !errors.Is(err, common.ErrUnsupported) {
 		t.Fatalf("growFilesystem of an unknown type = %v, want ErrUnsupported", err)
@@ -447,10 +493,8 @@ func TestFilesystemGrowRejectsAnUnknownType(t *testing.T) {
 // TestMalformedToolOutputSurfaces requires a parse failure to be an error. A
 // tool whose output this package cannot read is not a tool reporting "nothing
 // here", and treating it as one would read an unparseable status as "no
-// resources up" and an unparseable findmnt as "not mounted".
+// resources up" and an unreadable mount table as "not mounted".
 func TestMalformedToolOutputSurfaces(t *testing.T) {
-	const dev = "/dev/drbd0"
-
 	tests := []struct {
 		name   string
 		script func(*fakeRunner)
@@ -471,20 +515,23 @@ func TestMalformedToolOutputSurfaces(t *testing.T) {
 			"lvs report",
 		},
 		{
-			"findmnt by mountpoint", func(r *fakeRunner) {
-				r.on(binFindmnt, "--json", "--mountpoint", testMountPoint, "-o", "TARGET,SOURCE,FSTYPE").
-					returns("{{{")
+			"mount table by mountpoint", func(r *fakeRunner) {
+				r.failMountTable(&mountinfo.ParseError{
+					Line: 12, Text: "1 2 8:1 /", Err: mountinfo.ErrTooFewFields,
+				})
 			},
 			func(p *Provider) error { return p.Unmount(context.Background(), testVolume, testMountPoint) },
-			"findmnt",
+			"mountinfo",
 		},
 		{
-			"findmnt by source", func(r *fakeRunner) {
+			"mount table by source", func(r *fakeRunner) {
 				r.scriptStatus(primaryStatus(testVolume, 0))
-				r.on(binFindmnt, "--json", "--source", dev, "-o", "TARGET,SOURCE,FSTYPE").returns("{{{")
+				r.failMountTable(&mountinfo.ParseError{
+					Line: 12, Text: "1 2 8:1 /", Err: mountinfo.ErrTooFewFields,
+				})
 			},
 			func(p *Provider) error { _, err := p.Status(context.Background(), testVolume); return err },
-			"findmnt",
+			"mountinfo",
 		},
 	}
 
@@ -552,8 +599,7 @@ func TestMountAndUnmountFailuresSurface(t *testing.T) {
 		provision(t, p, r, defaultSpec())
 		r.reset()
 
-		r.on(binFindmnt, "--json", "--mountpoint", testMountPoint, "-o", "TARGET,SOURCE,FSTYPE").
-			returns(`{"filesystems":[{"target":"` + testMountPoint + `","source":"/dev/drbd0","fstype":"ext4"}]}`)
+		r.scriptMount("/dev/drbd0", testMountPoint)
 		m.FailUnmount(errors.New("target is busy"))
 
 		err := p.Unmount(context.Background(), testVolume, testMountPoint)

@@ -44,6 +44,35 @@ type fakeRunner struct {
 	mu        sync.Mutex
 	responses map[string]*fakeResponse
 	calls     []fakeCall
+
+	// The kernel mount table this provider sees: device path to the paths it
+	// is mounted at, and the error to report instead of an answer.
+	mounted       map[string][]string
+	deviceAliases map[string]string
+	overMounted   map[string]string
+	mountTableErr error
+	tableLookups  int
+	tableHook     func()
+
+	// The block-device work, recorded rather than performed, and the failures
+	// and hooks a test scripts onto it.
+	copies   []copyCall
+	zeroes   []zeroCall
+	copyErr  error
+	zeroErr  error
+	copyHook func()
+	zeroHook func()
+}
+
+// copyCall and zeroCall are the block-device operations the provider asked for.
+type copyCall struct {
+	Source      string
+	Destination string
+}
+
+type zeroCall struct {
+	Device string
+	Offset int64
 }
 
 type fakeCall struct {
@@ -152,6 +181,187 @@ func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) ([]by
 	return []byte(r.stdout), nil
 }
 
+// The mount-table seam. It answers as /proc/self/mountinfo would, which the
+// provider reads instead of asking findmnt: a device that is not mounted is an
+// empty answer and NOT an error, and a table that could not be read is an
+// error and NEVER an empty answer. Keeping those apart is the whole reason the
+// lookup moved off findmnt, whose single non-zero exit meant both.
+
+// scriptMountUnderAlias mounts a device at target under one of its OTHER names,
+// the way a filesystem mounted through /dev/drbd/by-res/<res>/0 appears in the
+// table. The mount belongs to canonical all the same.
+func (f *fakeRunner) scriptMountUnderAlias(alias, canonical, target string) {
+	f.scriptMount(alias, target)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deviceAliases == nil {
+		f.deviceAliases = make(map[string]string)
+	}
+	f.deviceAliases[alias] = canonical
+}
+
+// failMountTable makes the mount table unreadable.
+func (f *fakeRunner) failMountTable(err error) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mountTableErr = err
+	return f
+}
+
+// onMountTable registers a function to run while a mount lookup is in flight.
+// It is how a test holds a caller inside the window between reading the table
+// and acting on what it said.
+func (f *fakeRunner) onMountTable(hook func()) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tableHook = hook
+	return f
+}
+
+// MountPointsFor returns where the device is mounted.
+func (f *fakeRunner) MountPointsFor(_ context.Context, device string) ([]string, error) {
+	f.mu.Lock()
+	f.tableLookups++
+	hook, tableErr := f.tableHook, f.mountTableErr
+	targets := append([]string(nil), f.mounted[device]...)
+	// A device is one device however it is spelled, which is what matching by
+	// major:minor gives the real implementation and what this reproduces: a
+	// mount made under an alias belongs to the device the alias names.
+	for alias, canonical := range f.deviceAliases {
+		if canonical == device {
+			targets = append(targets, f.mounted[alias]...)
+		}
+	}
+	f.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+	if tableErr != nil {
+		return nil, tableErr
+	}
+	return targets, nil
+}
+
+// VisibleMountPointsFor answers with the mounts that have not been covered by
+// something mounted on top of them, which is what umount(2) would detach.
+func (f *fakeRunner) VisibleMountPointsFor(ctx context.Context, device string) ([]string, error) {
+	targets, err := f.MountPointsFor(ctx, device)
+	if err != nil {
+		return nil, err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var visible []string
+	for _, target := range targets {
+		if top, covered := f.overMounted[target]; covered && top != device {
+			continue
+		}
+		visible = append(visible, target)
+	}
+	return visible, nil
+}
+
+// overMount covers a path with another device's filesystem. What was mounted
+// there stays mounted and stops being what is visible.
+func (f *fakeRunner) overMount(target, device string) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.overMounted == nil {
+		f.overMounted = make(map[string]string)
+	}
+	f.overMounted[target] = device
+	return f
+}
+
+// mountLookups is how many times the mount table was consulted. A method that
+// looks nothing up is a decision worth pinning: it is what keeps a raw volume
+// from reading the table for a filesystem it does not have.
+func (f *fakeRunner) mountLookups() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tableLookups
+}
+
+// The block-device seam, standing in for what dd and blkdiscard used to do.
+// The calls are recorded into the same log as the commands, so a test that
+// orders a copy or a wipe against the LVM and DRBD calls around it still can.
+
+// failCopy makes the block-device copy fail.
+func (f *fakeRunner) failCopy(err error) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.copyErr = err
+	return f
+}
+
+// failZeroOut makes the zeroing fail.
+func (f *fakeRunner) failZeroOut(err error) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.zeroErr = err
+	return f
+}
+
+// onZeroOut registers a function to run while the zeroing is in flight. It is
+// how a test cancels a context during the step that takes minutes per terabyte
+// on real hardware.
+func (f *fakeRunner) onZeroOut(hook func()) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.zeroHook = hook
+	return f
+}
+
+// Copy records the copy the provider asked for.
+func (f *fakeRunner) Copy(ctx context.Context, src, dst string) error {
+	f.mu.Lock()
+	f.copies = append(f.copies, copyCall{Source: src, Destination: dst})
+	f.calls = append(f.calls, fakeCall{Name: "copy", Args: []string{src, dst}})
+	hook, err := f.copyHook, f.copyErr
+	f.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+// ZeroOut records the zeroing the provider asked for.
+func (f *fakeRunner) ZeroOut(ctx context.Context, device string, offset int64) error {
+	f.mu.Lock()
+	f.zeroes = append(f.zeroes, zeroCall{Device: device, Offset: offset})
+	f.calls = append(f.calls, fakeCall{Name: "zeroout", Args: []string{device, strconv.FormatInt(offset, 10)}})
+	hook, err := f.zeroHook, f.zeroErr
+	f.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+// zeroCalls returns the zeroing the provider asked for.
+func (f *fakeRunner) zeroCalls() []zeroCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]zeroCall(nil), f.zeroes...)
+}
+
+// copyCalls returns the copies the provider asked for.
+func (f *fakeRunner) copyCalls() []copyCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]copyCall(nil), f.copies...)
+}
+
 // commands returns every call made so far, one "binary arg arg" line each.
 func (f *fakeRunner) commands() []string {
 	f.mu.Lock()
@@ -190,6 +400,7 @@ func (f *fakeRunner) reset() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = nil
+	f.copies, f.zeroes, f.tableLookups = nil, nil, 0
 }
 
 // -----------------------------------------------------------------------------
@@ -256,7 +467,13 @@ func newTestProviderWith(t *testing.T, tweak func(map[string]string)) (*Provider
 	if tweak != nil {
 		tweak(settings)
 	}
-	p, err := New(settings, WithRunner(r), WithMounter(m), WithSecretProvider(testSecretProvider))
+	p, err := New(settings,
+		WithRunner(r),
+		WithMounter(m),
+		WithMountTable(r),
+		WithBlockDevices(r),
+		WithSecretProvider(testSecretProvider),
+	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -323,15 +540,20 @@ func (f *fakeRunner) scriptLVS(out string) {
 	f.on(binLVS, "--reportformat", "json", "--units", "b", "--nosuffix", "-o", lvsFields, testVG).returns(out)
 }
 
-// scriptFindmntSource scripts the device-side findmnt lookup. An empty target
-// scripts the "not mounted" exit code.
-func (f *fakeRunner) scriptFindmntSource(dev, target string) {
-	call := f.on(binFindmnt, "--json", "--source", dev, "-o", "TARGET,SOURCE,FSTYPE")
+// scriptMount puts the device in the mount table at target. An empty target
+// leaves it unmounted, which the table reports as an empty answer rather than
+// as a failure.
+func (f *fakeRunner) scriptMount(dev, target string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mounted == nil {
+		f.mounted = make(map[string][]string)
+	}
 	if target == "" {
-		call.fails(findmntNoMatch, "")
+		delete(f.mounted, dev)
 		return
 	}
-	call.returns(`{"filesystems":[{"target":"` + target + `","source":"` + dev + `","fstype":"ext4"}]}`)
+	f.mounted[dev] = []string{target}
 }
 
 // scriptStatus scripts the one drbdsetup invocation this package makes.
@@ -386,5 +608,36 @@ func assertNoUnmount(t *testing.T, m *mount.Fake) {
 	t.Helper()
 	if calls := m.UnmountCalls(); len(calls) != 0 {
 		t.Errorf("something was unmounted: %v", calls)
+	}
+}
+
+// The block-device assertions, reading the recorded operations rather than a
+// command line. An exit status from dd said nothing about what was copied; the
+// recorded call says both ends.
+
+func assertCopied(t *testing.T, r *fakeRunner, src, dst string) {
+	t.Helper()
+	for _, c := range r.copyCalls() {
+		if c.Source == src && c.Destination == dst {
+			return
+		}
+	}
+	t.Errorf("%s was not copied to %s; copies: %+v", src, dst, r.copyCalls())
+}
+
+func assertZeroed(t *testing.T, r *fakeRunner, device string, offset int64) {
+	t.Helper()
+	for _, z := range r.zeroCalls() {
+		if z.Device == device && z.Offset == offset {
+			return
+		}
+	}
+	t.Errorf("%s was not zeroed from %d; zeroing: %+v", device, offset, r.zeroCalls())
+}
+
+func assertNothingZeroed(t *testing.T, r *fakeRunner) {
+	t.Helper()
+	if z := r.zeroCalls(); len(z) != 0 {
+		t.Errorf("something was zeroed: %+v", z)
 	}
 }

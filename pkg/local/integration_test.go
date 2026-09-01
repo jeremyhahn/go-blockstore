@@ -54,6 +54,8 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 	"github.com/jeremyhahn/go-luks2/pkg/luks2"
 
+	"github.com/jeremyhahn/go-blockstore/internal/blkdev"
+	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
@@ -393,10 +395,10 @@ func TestIntegrationMountTargetWithASpace(t *testing.T) {
 		t.Fatalf("Mount: %v", err)
 	}
 
-	// The target has to come back from findmnt spelled the way it went in, or
-	// none of what follows can match it.
-	aliases := p.sourceAliases(vol.ID, p.lvPath(vol.ID))
-	mounts, err := p.mountpointsFor(ctx, aliases)
+	// The target has to come back from the kernel's mount table spelled the way
+	// it went in — the kernel escapes the spaces, and the parser has to undo
+	// that — or none of what follows can match it.
+	mounts, err := p.mountpointsFor(ctx, p.lvPath(vol.ID))
 	if err != nil {
 		t.Fatalf("mountpointsFor: %v", err)
 	}
@@ -417,7 +419,7 @@ func TestIntegrationMountTargetWithASpace(t *testing.T) {
 	if err := p.Unmount(ctx, vol.ID, target); err != nil {
 		t.Fatalf("Unmount: %v", err)
 	}
-	after, err := p.mountpointsFor(ctx, aliases)
+	after, err := p.mountpointsFor(ctx, p.lvPath(vol.ID))
 	if err != nil {
 		t.Fatalf("mountpointsFor: %v", err)
 	}
@@ -2198,5 +2200,203 @@ func TestIntegrationResizeDoesNotDestroyTheMappingItCannotGrow(t *testing.T) {
 	// writing to it works exactly as it did before.
 	if err := os.WriteFile(filepath.Join(target, "after"), []byte("written after"), 0o600); err != nil {
 		t.Fatalf("writing after a refused resize: %v", err)
+	}
+}
+
+// TestIntegrationBlockDeviceOperations drives internal/blkdev against a real
+// logical volume, which is the only place its two remaining operations can be
+// checked at all.
+//
+// Both need a block device opened for writing, so a unit test can reach their
+// refusals and nothing else: BLKGETSIZE64 and BLKZEROOUT are answered by a
+// driver, and a regular file's driver answers ENOTTY. What is proved here is
+// what the callers depend on and what the weaker ioctl would not have given
+// them — that after the call, the bytes that were there are zeroes, rather than
+// a range the device is free to remember.
+func TestIntegrationBlockDeviceOperations(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	p, err := New(Options{VolumeGroup: vg, NodeID: "test-node"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const size = 32 << 20
+	vol, err := p.Provision(ctx, common.VolumeSpec{Name: "scratch", SizeBytes: size})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, vol.ID) })
+
+	info, err := p.Attach(ctx, vol.ID, "test-node")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Detach(ctx, vol.ID, "test-node") })
+
+	// Size reads the driver rather than seeking, so it reports at least the
+	// capacity that was asked for.
+	got, err := blkdev.Size(info.DevicePath)
+	if err != nil {
+		t.Fatalf("Size(%s): %v", info.DevicePath, err)
+	}
+	if got < size {
+		t.Errorf("Size = %d, want at least the %d that was provisioned", got, size)
+	}
+
+	const marker = "SENSITIVE-TENANT-DATA"
+	writeMarker(t, info.DevicePath, marker)
+	if !markerPresent(t, info.DevicePath, marker) {
+		t.Fatal("the marker did not reach the device; the rest of this test would prove nothing")
+	}
+
+	// From an offset, so the range arithmetic is exercised rather than the
+	// whole-device case alone. The marker sits past it.
+	if err := blkdev.ZeroOut(ctx, info.DevicePath, markerOffset-(4<<20)); err != nil {
+		t.Fatalf("ZeroOut: %v", err)
+	}
+	if markerPresent(t, info.DevicePath, marker) {
+		t.Error("the marker survived the zeroing")
+	}
+
+	// A caller that has given up is told so rather than having a real device
+	// written on its behalf. (This is the check before the ioctl; the one after
+	// it — for a caller that gave up while the uninterruptible ioctl was
+	// running — cannot be reached without racing the kernel, and is left to the
+	// seam-level test in pkg/drbd, which cancels mid-wipe through the fake.)
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := blkdev.ZeroOut(canceled, info.DevicePath, 0); !errors.Is(err, context.Canceled) {
+		t.Errorf("ZeroOut under a canceled context = %v, want context.Canceled", err)
+	}
+
+	// The end of the device is nothing to do rather than an error, and past it
+	// is a refusal: a caller that computed an offset from the wrong size must
+	// not have it silently accepted.
+	if err := blkdev.ZeroOut(ctx, info.DevicePath, got); err != nil {
+		t.Errorf("ZeroOut at the end of the device = %v, want nil", err)
+	}
+	if err := blkdev.ZeroOut(ctx, info.DevicePath, got+1); !errors.Is(err, blkdev.ErrOffsetPastEnd) {
+		t.Errorf("ZeroOut past the end = %v, want ErrOffsetPastEnd", err)
+	}
+}
+
+// TestIntegrationCopyMovesAWholeDevice covers the other half of the conversion:
+// the copy that used to be dd. A regular file exercises the loop, but only a
+// device proves the copy is whole-device and flushed — the property a restore
+// depends on when the volume is detached immediately afterwards.
+func TestIntegrationCopyMovesAWholeDevice(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	p, err := New(Options{VolumeGroup: vg, NodeID: "test-node"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const size = 32 << 20
+	src, err := p.Provision(ctx, common.VolumeSpec{Name: "source", SizeBytes: size})
+	if err != nil {
+		t.Fatalf("Provision the source: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, src.ID) })
+	dst, err := p.Provision(ctx, common.VolumeSpec{Name: "destination", SizeBytes: size})
+	if err != nil {
+		t.Fatalf("Provision the destination: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, dst.ID) })
+
+	srcInfo, err := p.Attach(ctx, src.ID, "test-node")
+	if err != nil {
+		t.Fatalf("Attach the source: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Detach(ctx, src.ID, "test-node") })
+	dstInfo, err := p.Attach(ctx, dst.ID, "test-node")
+	if err != nil {
+		t.Fatalf("Attach the destination: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Detach(ctx, dst.ID, "test-node") })
+
+	const marker = "COPIED-CONTENT"
+	writeMarker(t, srcInfo.DevicePath, marker)
+
+	if err := blkdev.Copy(ctx, srcInfo.DevicePath, dstInfo.DevicePath); err != nil {
+		t.Fatalf("Copy: %v", err)
+	}
+	if !markerPresent(t, dstInfo.DevicePath, marker) {
+		t.Error("the copy did not carry the source's content to the destination")
+	}
+}
+
+// TestIntegrationMountTableIdentifiesTheDeviceByNumber is the round trip that
+// decides whether any mount lookup finds anything, checked where it can be:
+// against a real logical volume this test built.
+//
+// It cannot live in the unit suite, which runs in a container on CI — a
+// container has a mount table and no device nodes to stat, so a test needing
+// one fails there while passing on a workstation. The detail it pins would
+// otherwise be found by nobody: /proc/self/mountinfo prints major:minor in
+// DECIMAL, while the obvious way to obtain the same pair for comparison —
+// stat's %t:%T — prints hex. Read one as the other and every mount lookup
+// silently matches nothing, which this provider reports as "not mounted" and
+// acts on by destroying a volume.
+func TestIntegrationMountTableIdentifiesTheDeviceByNumber(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	p, err := New(Options{VolumeGroup: vg, NodeID: "test-node"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	vol, err := p.Provision(ctx, common.VolumeSpec{Name: "data", SizeBytes: 64 << 20, FSType: "ext4"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, vol.ID) })
+
+	if _, err := p.Attach(ctx, vol.ID, "test-node"); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Detach(ctx, vol.ID, "test-node") })
+
+	target := t.TempDir()
+	if err := p.Mount(ctx, vol.ID, target, common.MountOptions{}); err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Unmount(ctx, vol.ID, target) })
+
+	// The name this provider spells is a symlink to the /dev/dm-N that carries
+	// the number; the number is what the table records.
+	device := p.lvPath(vol.ID)
+	major, minor, err := mountinfo.DeviceNumber(device)
+	if err != nil {
+		t.Fatalf("DeviceNumber(%s): %v", device, err)
+	}
+
+	entries, err := mountinfo.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	entry, ok := mountinfo.EntryAt(entries, target)
+	if !ok {
+		t.Fatalf("the mount table has no entry for %q", target)
+	}
+	if entry.Major != major || entry.Minor != minor {
+		t.Errorf("stat says %d:%d, the mount table says %d:%d — one of them is being read in the wrong base",
+			major, minor, entry.Major, entry.Minor)
+	}
+
+	// And the seam the provider actually uses finds the mount from the device
+	// name, whichever of the device's names it was given.
+	for _, name := range []string{device, "/dev/mapper/" + vg + "-" + string(vol.ID)} {
+		targets, err := (mountinfo.System{}).MountPointsFor(ctx, name)
+		if err != nil {
+			t.Fatalf("MountPointsFor(%s): %v", name, err)
+		}
+		if !contains(targets, target) {
+			t.Errorf("MountPointsFor(%s) = %v, want it to include %q", name, targets, target)
+		}
 	}
 }

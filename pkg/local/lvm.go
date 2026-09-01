@@ -14,7 +14,6 @@
 package local
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -608,14 +607,6 @@ func (p *Provider) probeFSType(ctx context.Context, device string) (string, erro
 	}
 }
 
-// findmntReport is the shape of `findmnt --list --json`.
-type findmntReport struct {
-	Filesystems []struct {
-		Target string `json:"target"`
-		Source string `json:"source"`
-	} `json:"filesystems"`
-}
-
 // dmName composes the device-mapper name LVM gives a logical volume.
 //
 // Each component has its hyphens doubled, which is what lets the single-hyphen
@@ -625,78 +616,41 @@ func dmName(vg, lv string) string {
 	return strings.ReplaceAll(vg, "-", "--") + "-" + strings.ReplaceAll(lv, "-", "--")
 }
 
-// sourceAliases lists the spellings findmnt may report for the device a volume
-// is reachable at.
+// mountpointsFor returns every path the volume is currently mounted at.
 //
-// A volume is reachable under several names — /dev/<vg>/<lv>, the dm-mangled
-// /dev/mapper/<vg>-<lv>, and the /dev/dm-N underneath — and findmnt reports the
-// one it resolves to rather than the one a mount was issued with. Matching a
-// single spelling would miss a mount that is plainly there, and a missed mount
-// is what turns Unmount into a silent no-op and lets Delete remove a volume out
-// from under a live filesystem.
+// The device is identified by its major:minor rather than by a path, which is
+// what removed sourceAliases from this file. A volume answers to several names
+// — /dev/<vg>/<lv>, /dev/mapper/<vg>-<lv>, the /dev/dm-N beneath them — and
+// asking findmnt meant guessing which spelling it would report a mount under,
+// then listing them all so one would match. The kernel records the device
+// number, and every name resolves to the same one.
 //
-// Measured on util-linux 2.39.3, findmnt CANONICALIZES a device-mapper source to
-// /dev/mapper/<dm-name> however the filesystem was mounted — mounting
-// /dev/bs-p9/my-vol reports /dev/mapper/bs--p9-my--vol, and so does mounting
-// /dev/dm-3 directly. So that spelling plus the caller's own is the whole set,
-// and /dev/dm-N is deliberately absent rather than forgotten: findmnt was never
-// observed to report it. Should a util-linux appear that does, the robust fix is
-// to match on the MAJ:MIN column instead of on names at all.
-//
-// An unlocked encrypted volume needs no alias: its plaintext mapping is a
-// device-mapper name in its own right, and /dev/mapper/<that name> is what
-// findmnt reports.
-func (p *Provider) sourceAliases(volID, device string) []string {
-	aliases := []string{device}
-	if device == p.lvPath(volID) {
-		aliases = append(aliases, "/dev/mapper/"+dmName(p.volumeGroup, volID))
-	}
-	return aliases
-}
-
-// mountpointsFor returns every path the volume is currently mounted at, given
-// the spellings its device may be reported under.
-//
-// The WHOLE mount table is enumerated and filtered here rather than handed to
-// findmnt as a --source filter, because a filtered query cannot say why it came
-// back empty. findmnt has exactly one non-zero status and its manual gives that
-// status to "no filesystem matched" and "any other error" alike, so a findmnt
-// that could not read the mount table at all was indistinguishable from a
-// volume that is not mounted — and "not mounted" is the answer Delete acts on
-// immediately before a forced lvremove. Unfiltered, a readable mount table is
-// an exit of zero and a report that parses; anything else is a failure and is
-// returned as one. Only a report that parsed, and holds no row for this device,
-// means the volume is unmounted.
-//
-// --list rather than the default, which nests submounts under "children" and
-// would hide any mount below another. The report is read as JSON because
-// findmnt's column output escapes some characters in a path and not others,
-// depending on flags and util-linux version — measured here, the default prints
-// a space literally while --raw renders it \x20 — and a target that comes back
-// spelled differently than it went in silently fails to match.
-func (p *Provider) mountpointsFor(ctx context.Context, aliases []string) ([]string, error) {
-	if len(aliases) == 0 {
+// A device that is not mounted yields no paths and no error. Only a mount table
+// that could not be READ is an error, and keeping those apart is the point:
+// "not mounted" is the answer Delete acts on immediately before a forced
+// lvremove, and findmnt spent one exit status on both.
+func (p *Provider) mountpointsFor(ctx context.Context, device string) ([]string, error) {
+	if device == "" {
 		return nil, nil
 	}
+	return p.mountTable.MountPointsFor(ctx, device)
+}
 
-	out, err := p.runner.Run(ctx, nil, "findmnt", "--list", "--json", "--output", "TARGET,SOURCE")
-	if err != nil {
-		return nil, fmt.Errorf("go-blockstore/local: reading the mount table: %w", err)
+// visibleMountpointsFor returns the paths where the volume is the filesystem
+// VISIBLE, which is the set anything unmounting by path may act on.
+//
+// The difference from mountpointsFor is a directory this volume was mounted at
+// and something else has since been mounted over: both records stay in the
+// table, the later one is what a process reaching that path gets, and umount(2)
+// detaches what is visible. Unmounting by such a path would take the other
+// filesystem down and leave this volume mounted underneath it.
+//
+// So the two questions are asked separately: "is it mounted at all", which
+// keeps a hidden mount counted and a teardown honest, and "where can it be
+// unmounted", which is this.
+func (p *Provider) visibleMountpointsFor(ctx context.Context, device string) ([]string, error) {
+	if device == "" {
+		return nil, nil
 	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return nil, fmt.Errorf("go-blockstore/local: reading the mount table: findmnt produced no report")
-	}
-
-	var report findmntReport
-	if err := json.Unmarshal(out, &report); err != nil {
-		return nil, fmt.Errorf("go-blockstore/local: parsing the mount table: %w", err)
-	}
-
-	var targets []string
-	for _, fs := range report.Filesystems {
-		if fs.Target != "" && contains(aliases, fs.Source) {
-			targets = append(targets, fs.Target)
-		}
-	}
-	return targets, nil
+	return p.mountTable.VisibleMountPointsFor(ctx, device)
 }

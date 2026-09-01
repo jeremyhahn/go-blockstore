@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +51,22 @@ type fakeRunner struct {
 	mu       sync.Mutex
 	calls    []fakeCall
 	handlers map[string]responder
+
+	// What is mounted, and the failure to report instead. The fake serves the
+	// MountTable seam directly rather than scripting findmnt's output.
+	mounted       map[string][]string
+	mountTableErr error
+
+	// overMounted maps a path to the device now mounted ON TOP of whatever was
+	// there, which is how a test builds the shadowed case.
+	overMounted map[string]string
+
+	// Recorded block-device work, and the failures to report instead.
+	copies      []copyCall
+	zeroes      []zeroCall
+	copyErr     error
+	zeroErr     error
+	copyHandler func()
 
 	// What blkid reports for a device, shared with the LUKS fake so the two
 	// cannot contradict each other: a device blkid calls a LUKS container is
@@ -483,45 +498,156 @@ func defaultBackingFor(mapping string) string {
 	return "/dev/mapper/" + dmName(vg, vol)
 }
 
-// withMounts maps a device path to the targets it is mounted at, and renders
-// the whole thing as the flat mount table `findmnt --list --json` produces.
+// withMounts maps a device path to the targets it is mounted at.
 //
-// The fake answers with the WHOLE table however it is asked, because that is
-// what the provider now does: it enumerates and filters locally rather than
-// letting findmnt filter, so that a findmnt which cannot read the mount table is
-// distinguishable from a volume that is not mounted.
+// The fake IS the MountTable now rather than scripting findmnt's output, which
+// is the shape of the conversion: the provider asks a seam what is mounted
+// instead of asking a binary to format /proc/self/mountinfo for it.
 func (f *fakeRunner) withMounts(mounts map[string][]string) *fakeRunner {
-	rows := make([]mountRow, 0, len(mounts))
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mounted = make(map[string][]string, len(mounts))
 	for device, targets := range mounts {
-		for _, target := range targets {
-			rows = append(rows, mountRow{Target: target, Source: device})
+		f.mounted[device] = append([]string(nil), targets...)
+	}
+	return f
+}
+
+// overMount covers a path with another device's filesystem, the way mounting
+// over an occupied directory does. What was mounted there stays mounted and
+// stops being what is visible.
+func (f *fakeRunner) overMount(target, device string) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.overMounted == nil {
+		f.overMounted = make(map[string]string)
+	}
+	f.overMounted[target] = device
+	return f
+}
+
+// failMountTable makes the mount table unreadable.
+//
+// Its own error, distinct from "nothing is mounted", because keeping those two
+// apart is why the provider stopped asking findmnt: one exit status served both,
+// and "not mounted" is what a teardown acts on before destroying a volume.
+func (f *fakeRunner) failMountTable(err error) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mountTableErr = err
+	return f
+}
+
+// MountPointsFor answers as the kernel's mount table would.
+func (f *fakeRunner) MountPointsFor(_ context.Context, device string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mountTableErr != nil {
+		return nil, f.mountTableErr
+	}
+	return append([]string(nil), f.mounted[device]...), nil
+}
+
+// VisibleMountPointsFor answers with the mounts that have not been covered.
+//
+// The distinction is the kernel's: mounting over an occupied directory leaves
+// both records in the table, the later one is what is visible there, and
+// umount(2) detaches what is visible. A test covers a path with overMount.
+func (f *fakeRunner) VisibleMountPointsFor(_ context.Context, device string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mountTableErr != nil {
+		return nil, f.mountTableErr
+	}
+
+	var visible []string
+	for _, target := range f.mounted[device] {
+		if top, covered := f.overMounted[target]; covered && top != device {
+			continue
 		}
+		visible = append(visible, target)
 	}
-	// A real mount table holds unrelated entries; keeping one here means a test
-	// passes only if the provider actually filters.
-	rows = append(rows, mountRow{Target: "/", Source: "/dev/sda1"})
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Target < rows[j].Target })
-
-	out := findmntJSON(rows...)
-	return f.on("findmnt", func([]string, []byte) ([]byte, error) { return out, nil })
+	return visible, nil
 }
 
-// mountRow is one entry of the mount table the fake reports.
-type mountRow struct {
-	Target string `json:"target"`
-	Source string `json:"source"`
+// Copy records a device copy instead of performing one.
+//
+// It lands in the same call log as the exec'd commands, so the tests that
+// assert on ORDER — a copy before the tail is zeroed, a wipe before the volume
+// is removed — keep working across a seam boundary the provider now has.
+func (f *fakeRunner) Copy(_ context.Context, src, dst string) error {
+	f.mu.Lock()
+	f.copies = append(f.copies, copyCall{Source: src, Destination: dst})
+	f.calls = append(f.calls, fakeCall{Name: "copy", Args: []string{src, dst}})
+	handler, err := f.copyHandler, f.copyErr
+	f.mu.Unlock()
+
+	if handler != nil {
+		handler()
+	}
+	return err
 }
 
-// findmntJSON renders rows as `findmnt --list --json` output.
-func findmntJSON(rows ...mountRow) []byte {
-	report := struct {
-		Filesystems []mountRow `json:"filesystems"`
-	}{Filesystems: rows}
-	out, err := json.Marshal(report)
-	if err != nil {
-		panic("findmntJSON: " + err.Error())
-	}
-	return out
+// gateCopy runs fn inside every Copy, so a test can hold one open.
+func (f *fakeRunner) gateCopy(fn func()) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.copyHandler = fn
+	return f
+}
+
+// ZeroOut records a zeroing instead of performing one.
+func (f *fakeRunner) ZeroOut(_ context.Context, device string, offset int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.zeroes = append(f.zeroes, zeroCall{Device: device, Offset: offset})
+	f.calls = append(f.calls, fakeCall{Name: "zeroout", Args: []string{device, itoaTest(offset)}})
+	return f.zeroErr
+}
+
+// itoaTest formats an offset for the call log.
+func itoaTest(n int64) string { return strconv.FormatInt(n, 10) }
+
+// copyCall is one recorded Copy.
+type copyCall struct {
+	Source      string
+	Destination string
+}
+
+// zeroCall is one recorded ZeroOut.
+type zeroCall struct {
+	Device string
+	Offset int64
+}
+
+// copyCalls returns the copies recorded so far.
+func (f *fakeRunner) copyCalls() []copyCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]copyCall(nil), f.copies...)
+}
+
+// zeroCalls returns the zeroings recorded so far.
+func (f *fakeRunner) zeroCalls() []zeroCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]zeroCall(nil), f.zeroes...)
+}
+
+// failCopy makes the next copies fail.
+func (f *fakeRunner) failCopy(err error) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.copyErr = err
+	return f
+}
+
+// failZeroOut makes the next zeroings fail.
+func (f *fakeRunner) failZeroOut(err error) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.zeroErr = err
+	return f
 }
 
 // snapshot returns a copy of the calls recorded so far.
@@ -701,11 +827,13 @@ func hasSnapshotIn(lvs []lvFixture, name string) bool {
 func newTestProvider(t *testing.T, runner *fakeRunner, mutate ...func(*Options)) *Provider {
 	t.Helper()
 	opts := Options{
-		VolumeGroup: "vg0",
-		NodeID:      "node-a",
-		Runner:      runner,
-		Mounter:     runner,
-		luks:        runner,
+		VolumeGroup:  "vg0",
+		NodeID:       "node-a",
+		Runner:       runner,
+		Mounter:      runner,
+		MountTable:   runner,
+		BlockDevices: runner,
+		luks:         runner,
 		// Per-test, so tests cannot serialize against each other through a
 		// shared directory — and so a test host without /run/lock still runs.
 		LockDir: t.TempDir(),
@@ -718,4 +846,62 @@ func newTestProvider(t *testing.T, runner *fakeRunner, mutate ...func(*Options))
 		t.Fatalf("New: %v", err)
 	}
 	return p
+}
+
+// assertCopied requires exactly this device copy to have happened.
+func assertCopied(t *testing.T, runner *fakeRunner, src, dst string) {
+	t.Helper()
+	for _, c := range runner.copyCalls() {
+		if c.Source == src && c.Destination == dst {
+			return
+		}
+	}
+	t.Fatalf("expected a copy %s -> %s; got %+v", src, dst, runner.copyCalls())
+}
+
+// assertNotCopied requires this device copy NOT to have happened.
+func assertNotCopied(t *testing.T, runner *fakeRunner, src, dst string) {
+	t.Helper()
+	for _, c := range runner.copyCalls() {
+		if c.Source == src && c.Destination == dst {
+			t.Fatalf("did not expect a copy %s -> %s", src, dst)
+		}
+	}
+}
+
+// assertZeroed requires exactly this zeroing to have happened.
+func assertZeroed(t *testing.T, runner *fakeRunner, device string, offset int64) {
+	t.Helper()
+	for _, z := range runner.zeroCalls() {
+		if z.Device == device && z.Offset == offset {
+			return
+		}
+	}
+	t.Fatalf("expected %s zeroed from %d; got %+v", device, offset, runner.zeroCalls())
+}
+
+// assertNotZeroed requires this zeroing NOT to have happened.
+func assertNotZeroed(t *testing.T, runner *fakeRunner, device string, offset int64) {
+	t.Helper()
+	for _, z := range runner.zeroCalls() {
+		if z.Device == device && z.Offset == offset {
+			t.Fatalf("did not expect %s zeroed from %d", device, offset)
+		}
+	}
+}
+
+// assertNothingZeroed requires no zeroing at all.
+func assertNothingZeroed(t *testing.T, runner *fakeRunner) {
+	t.Helper()
+	if z := runner.zeroCalls(); len(z) != 0 {
+		t.Fatalf("expected no zeroing; got %+v", z)
+	}
+}
+
+// assertNothingCopied requires no copy at all.
+func assertNothingCopied(t *testing.T, runner *fakeRunner) {
+	t.Helper()
+	if c := runner.copyCalls(); len(c) != 0 {
+		t.Fatalf("expected no copy; got %+v", c)
+	}
 }

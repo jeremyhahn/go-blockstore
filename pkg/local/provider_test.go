@@ -18,12 +18,14 @@ import (
 	"context"
 	"errors"
 	"math"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/jeremyhahn/go-enclave"
 
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
+	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
@@ -441,7 +443,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 	}
 
 	assertLine(t, runner, "lvcreate --yes --name restored --size 1073741824b --setautoactivation n vg0")
-	assertLine(t, runner, "dd if=/dev/vg0/data_snap_nightly of=/dev/vg0/restored bs=4M conv=fsync status=none")
+	assertCopied(t, runner, "/dev/vg0/data_snap_nightly", "/dev/vg0/restored")
 	// The origin was detached, so the pair goes back down after the copy. The
 	// deactivation is aimed at the origin rather than the snapshot because LVM
 	// moves the two together and the origin is the one whose state matters.
@@ -506,8 +508,8 @@ func TestEncryptedProviderReencryptsAPlaintextRestore(t *testing.T) {
 	assertLine(t, runner, "luks format /dev/vg0/restored")
 	assertLine(t, runner, "luks open /dev/vg0/restored bs-vg0_restored")
 	// Through the mapping. This is the whole point.
-	assertLine(t, runner, "dd if=/dev/vg0/data_snap_nightly of=/dev/mapper/bs-vg0_restored bs=4M conv=fsync status=none")
-	assertNoLine(t, runner, "dd if=/dev/vg0/data_snap_nightly of=/dev/vg0/restored bs=4M conv=fsync status=none")
+	assertCopied(t, runner, "/dev/vg0/data_snap_nightly", "/dev/mapper/bs-vg0_restored")
+	assertNotCopied(t, runner, "/dev/vg0/data_snap_nightly", "/dev/vg0/restored")
 	// And left locked, the way Attach expects to find a volume.
 	assertLine(t, runner, "luks close bs-vg0_restored")
 	assertKeyNeverOnArgv(t, runner)
@@ -521,7 +523,7 @@ func TestReencryptingRestoreRemovesThePartialVolumeOnFailure(t *testing.T) {
 	runner := newFakeRunner().withLVs(snapshotFixtures()...)
 	runner.withBlkid(map[string]string{"/dev/vg0/data_snap_nightly": "ext4"})
 	runner.withOpenMappings("bs-vg0_restored")
-	runner.fail("dd", 1, "dd: writing: No space left on device")
+	runner.failCopy(errors.New("writing: no space left on device"))
 	p := newTestProvider(t, runner, encrypted)
 
 	_, err := p.Provision(context.Background(), common.VolumeSpec{
@@ -557,8 +559,8 @@ func TestEncryptedProviderRestoresAnEncryptedSnapshot(t *testing.T) {
 		t.Fatalf("Provision: %v", err)
 	}
 	// Onto the logical volume, header and all — not through a mapping.
-	assertLine(t, runner, "dd if=/dev/vg0/data_snap_nightly of=/dev/vg0/restored bs=4M conv=fsync status=none")
-	assertNoLine(t, runner, "dd if=/dev/vg0/data_snap_nightly of=/dev/mapper/bs-vg0_restored bs=4M conv=fsync status=none")
+	assertCopied(t, runner, "/dev/vg0/data_snap_nightly", "/dev/vg0/restored")
+	assertNotCopied(t, runner, "/dev/vg0/data_snap_nightly", "/dev/mapper/bs-vg0_restored")
 
 	// The image is copied as it stands; it is not reformatted under a new
 	// header, and no mapping is opened over it.
@@ -602,7 +604,7 @@ func TestEncryptedRestoreRefusesAKeyThatWouldNotOpenIt(t *testing.T) {
 	// Refused before anything was created, so there is no unreadable volume to
 	// clean up and nothing was copied.
 	runner.mustNotRun(t, "lvcreate")
-	runner.mustNotRun(t, "dd")
+	assertNothingCopied(t, runner)
 }
 
 // TestEncryptedRestoreRefusesWithoutAKeyProvider is the same refusal for a
@@ -622,7 +624,7 @@ func TestEncryptedRestoreRefusesWithoutAKeyProvider(t *testing.T) {
 		t.Fatalf("Provision = %v, want ErrInvalidArgument", err)
 	}
 	runner.mustNotRun(t, "lvcreate")
-	runner.mustNotRun(t, "dd")
+	assertNothingCopied(t, runner)
 }
 
 // TestEncryptedRestoreSizesFromTheSourcesOwnHeader pins the half of the sizing
@@ -685,8 +687,8 @@ func TestExactSizeRestoreSkipsTheTailZeroing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	assertLine(t, runner, "dd if=/dev/vg0/data_snap_nightly of=/dev/vg0/restored bs=4M conv=fsync status=none")
-	runner.mustNotRun(t, "blkdiscard")
+	assertCopied(t, runner, "/dev/vg0/data_snap_nightly", "/dev/vg0/restored")
+	assertNothingZeroed(t, runner)
 }
 
 // grownOriginFixtures is a volume snapshotted at 1 GiB and grown to 4 GiB
@@ -722,7 +724,7 @@ func TestRestoreSizesFromTheSnapshotNotTheOrigin(t *testing.T) {
 	}
 	assertLine(t, runner, "lvcreate --yes --name restored --size 1073741824b --setautoactivation n vg0")
 	// Nothing past the image, so no tail to clear.
-	runner.mustNotRun(t, "blkdiscard")
+	assertNothingZeroed(t, runner)
 }
 
 // TestRestoreZeroesFromTheImageSize is the sharper half. dd copies the bytes the
@@ -744,8 +746,8 @@ func TestRestoreZeroesFromTheImageSize(t *testing.T) {
 	}
 
 	// 1 GiB — the image — not the origin's current 4 GiB.
-	assertLine(t, runner, "blkdiscard --zeroout --offset 1073741824 /dev/vg0/restored")
-	assertNoLine(t, runner, "blkdiscard --zeroout --offset 4294967296 /dev/vg0/restored")
+	assertZeroed(t, runner, "/dev/vg0/restored", 1073741824)
+	assertNotZeroed(t, runner, "/dev/vg0/restored", 4294967296)
 }
 
 // TestRestoreStillRefusesBelowTheImageSize keeps the shrink guard pinned to the
@@ -1139,6 +1141,54 @@ func TestUnmountUnmounts(t *testing.T) {
 	}
 }
 
+// TestUnmountLeavesAnOverMountedTargetAlone is the hazard in unmounting by
+// path: umount(2) detaches whatever is VISIBLE at the path it is given. A
+// volume that was mounted at the target and has since been mounted over is not
+// what is visible there, so unmounting the path would take down the filesystem
+// on top — somebody else's, never this provider's to touch — and leave this
+// volume mounted underneath it regardless.
+func TestUnmountLeavesAnOverMountedTargetAlone(t *testing.T) {
+	runner := newFakeRunner().
+		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
+		withBlkid(map[string]string{"/dev/vg0/data": "ext4"}).
+		withMounts(map[string][]string{"/dev/vg0/data": {"/mnt/data"}}).
+		overMount("/mnt/data", "/dev/sdb1")
+	p := newTestProvider(t, runner)
+
+	// Not an error: this volume is not what is at the target, which the
+	// contract already calls a converging no-op.
+	if err := p.Unmount(context.Background(), "data", "/mnt/data"); err != nil {
+		t.Fatalf("Unmount of an over-mounted target = %v, want nil", err)
+	}
+	if got := runner.unmountCalls(); len(got) != 0 {
+		t.Fatalf("unmounted %v; the filesystem on top is not ours to unmount", got)
+	}
+}
+
+// TestDeleteRefusesAVolumeMountedBeneathAnother is the same hazard where it
+// cannot be converged away: Delete has to leave the volume unmounted, and the
+// only path to it holds somebody else's filesystem.
+func TestDeleteRefusesAVolumeMountedBeneathAnother(t *testing.T) {
+	runner := newFakeRunner().
+		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
+		withBlkid(map[string]string{"/dev/vg0/data": "ext4"}).
+		withMounts(map[string][]string{"/dev/vg0/data": {"/mnt/data"}}).
+		overMount("/mnt/data", "/dev/sdb1")
+	p := newTestProvider(t, runner)
+
+	err := p.Delete(context.Background(), "data")
+	if !errors.Is(err, ErrMountedBeneathAnother) {
+		t.Fatalf("Delete = %v, want ErrMountedBeneathAnother", err)
+	}
+	if !strings.Contains(err.Error(), "/mnt/data") {
+		t.Errorf("error %q does not name the mount that has to be dealt with", err)
+	}
+	if got := runner.unmountCalls(); len(got) != 0 {
+		t.Errorf("Delete unmounted %v; the filesystem on top is not ours", got)
+	}
+	runner.mustNotRun(t, "lvremove")
+}
+
 // --- Resize ----------------------------------------------------------------
 
 func TestResizeNotFound(t *testing.T) {
@@ -1423,15 +1473,15 @@ func TestRestoreZeroesTheTailOfAnOversizedVolume(t *testing.T) {
 	}
 
 	// The origin is 1 GiB, so everything past that byte is zeroed.
-	assertLine(t, runner, "blkdiscard --zeroout --offset 1073741824 /dev/vg0/restored")
+	assertZeroed(t, runner, "/dev/vg0/restored", 1073741824)
 
 	lines := runner.lines()
 	copyAt, zeroAt := -1, -1
 	for i, line := range lines {
 		switch line {
-		case "dd if=/dev/vg0/data_snap_nightly of=/dev/vg0/restored bs=4M conv=fsync status=none":
+		case "copy /dev/vg0/data_snap_nightly /dev/vg0/restored":
 			copyAt = i
-		case "blkdiscard --zeroout --offset 1073741824 /dev/vg0/restored":
+		case "zeroout /dev/vg0/restored 1073741824":
 			zeroAt = i
 		}
 	}
@@ -1860,7 +1910,7 @@ func TestSnapshotOwnershipIsCheckedNotAssumed(t *testing.T) {
 			t.Fatalf("Provision = %v, want ErrSnapshotNotFound", err)
 		}
 		runner.mustNotRun(t, "lvcreate")
-		runner.mustNotRun(t, "dd")
+		assertNothingCopied(t, runner)
 	})
 
 	t.Run("a doubled separator is not ours either", func(t *testing.T) {
@@ -1963,7 +2013,7 @@ func TestDeleteDoesNotWipeByDefault(t *testing.T) {
 	if err := p.Delete(context.Background(), "data"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	runner.mustNotRun(t, "blkdiscard")
+	assertNothingZeroed(t, runner)
 	assertLine(t, runner, "lvremove --force vg0/data")
 }
 
@@ -1983,14 +2033,14 @@ func TestDeleteWipesWhenAsked(t *testing.T) {
 	wipeAt, removeAt := -1, -1
 	for i, line := range lines {
 		switch line {
-		case "blkdiscard --zeroout /dev/vg0/data":
+		case "zeroout /dev/vg0/data 0":
 			wipeAt = i
 		case "lvremove --force vg0/data":
 			removeAt = i
 		}
 	}
 	if wipeAt < 0 {
-		t.Fatalf("expected a blkdiscard; got:\n  %s", strings.Join(lines, "\n  "))
+		t.Fatalf("expected a zeroing; got:\n  %s", strings.Join(lines, "\n  "))
 	}
 	if removeAt < wipeAt {
 		t.Errorf("the volume was removed before it was wiped:\n  %s", strings.Join(lines, "\n  "))
@@ -2011,8 +2061,8 @@ func TestDeleteWipesTheContainerNotTheMapping(t *testing.T) {
 	if err := p.Delete(context.Background(), "data"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	assertLine(t, runner, "blkdiscard --zeroout /dev/vg0/data")
-	assertNoLine(t, runner, "blkdiscard --zeroout /dev/mapper/bs-vg0_data")
+	assertZeroed(t, runner, "/dev/vg0/data", 0)
+	assertNotZeroed(t, runner, "/dev/mapper/bs-vg0_data", 0)
 }
 
 // TestDeleteRefusesAVolumeWithSnapshots is the contract: Delete does not
@@ -2048,7 +2098,7 @@ func TestDeleteRefusesAVolumeWithSnapshots(t *testing.T) {
 			// Nothing was destroyed, and nothing was torn down on the way to
 			// refusing: the volume is exactly as the caller left it.
 			runner.mustNotRun(t, "lvremove")
-			runner.mustNotRun(t, "blkdiscard")
+			assertNothingZeroed(t, runner)
 			runner.mustNotRun(t, "umount")
 			runner.mustNotRun(t, luksBinary)
 		})
@@ -2068,7 +2118,7 @@ func TestDeleteProceedsOnceSnapshotsAreGone(t *testing.T) {
 	if err := p.Delete(context.Background(), "data"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	assertLine(t, runner, "blkdiscard --zeroout /dev/vg0/data")
+	assertZeroed(t, runner, "/dev/vg0/data", 0)
 	assertLine(t, runner, "lvremove --force vg0/data")
 	// Another volume's snapshot is untouched.
 	assertNoLine(t, runner, "lvremove --force vg0/other_snap_nightly")
@@ -2078,7 +2128,7 @@ func TestDeleteProceedsOnceSnapshotsAreGone(t *testing.T) {
 // destroyed from being released back to the free pool regardless.
 func TestDeleteStopsWhenAWipeFails(t *testing.T) {
 	runner := newFakeRunner().withLVs(lvFixture{Name: "data", SizeBytes: gib})
-	runner.fail("blkdiscard", 1, "operation not supported")
+	runner.failZeroOut(errors.New("operation not supported"))
 	p := newTestProvider(t, runner, func(o *Options) { o.WipeOnDelete = true })
 
 	if err := p.Delete(context.Background(), "data"); err == nil {
@@ -2094,7 +2144,7 @@ func TestDeleteStopsWhenAWipeFails(t *testing.T) {
 // available comes back attached after an operation the caller saw fail.
 func TestFailedWipeLeavesTheVolumeAsItFoundIt(t *testing.T) {
 	runner := newFakeRunner().withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: false})
-	runner.fail("blkdiscard", 1, "operation not supported")
+	runner.failZeroOut(errors.New("operation not supported"))
 	p := newTestProvider(t, runner, func(o *Options) { o.WipeOnDelete = true })
 
 	if err := p.Delete(context.Background(), "data"); err == nil {
@@ -2110,7 +2160,7 @@ func TestFailedWipeLeavesAnAttachedVolumeAttached(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
 		withBlkid(map[string]string{"/dev/vg0/data": "ext4"})
-	runner.fail("blkdiscard", 1, "operation not supported")
+	runner.failZeroOut(errors.New("operation not supported"))
 	p := newTestProvider(t, runner, func(o *Options) { o.WipeOnDelete = true })
 
 	if err := p.Delete(context.Background(), "data"); err == nil {
@@ -2151,7 +2201,7 @@ func TestFailedRemovalAfterAWipeRestoresActivation(t *testing.T) {
 	if err := p.Delete(context.Background(), "data"); err == nil {
 		t.Fatal("Delete succeeded despite a failing lvremove")
 	}
-	assertLine(t, runner, "blkdiscard --zeroout /dev/vg0/data")
+	assertZeroed(t, runner, "/dev/vg0/data", 0)
 	assertLine(t, runner, "lvchange --activate n --yes vg0/data")
 }
 
@@ -2172,32 +2222,41 @@ func TestFailedRemovalLeavesAnAttachedVolumeAttached(t *testing.T) {
 
 // TestDeleteFailsClosedOnAnUnreadableMountTable is the hazard the mount-table
 // rework exists for. Delete acts on "nothing is mounted" by running a forced
-// lvremove, so a findmnt failure that read as "nothing is mounted" would take a
-// live filesystem's volume out from under it. Every failure mode has to stop
-// the delete instead.
+// lvremove, so a mount-table failure that read as "nothing is mounted" would
+// take a live filesystem's volume out from under it. Every failure mode has to
+// stop the delete instead.
+//
+// The cases are the shapes reading /proc/self/mountinfo actually fails in: the
+// file could not be opened, a record did not parse, or the device path could
+// not be identified. None of them may be mistaken for an empty table.
 func TestDeleteFailsClosedOnAnUnreadableMountTable(t *testing.T) {
-	cases := map[string]responder{
-		"findmnt missing": func([]string, []byte) ([]byte, error) {
-			return nil, errors.New("exec: findmnt: executable file not found in $PATH")
+	cases := map[string]error{
+		"unreadable proc file": &mountinfo.ReadError{Path: mountinfo.ProcPath, Err: os.ErrPermission},
+		"malformed record": &mountinfo.ParseError{
+			Line: 12,
+			Text: "1 2 8:1 /",
+			Err:  mountinfo.ErrTooFewFields,
 		},
-		"exit 1": func(args []string, _ []byte) ([]byte, error) {
-			return nil, &ExitError{Name: "findmnt", Args: args, Code: 1}
-		},
-		"unparseable": func([]string, []byte) ([]byte, error) {
-			return []byte("not json"), nil
+		"device not identifiable": &mountinfo.DeviceError{
+			Path: "/dev/vg0/data",
+			Err:  mountinfo.ErrNotBlockDevice,
 		},
 	}
 
-	for name, handler := range cases {
+	for name, tableErr := range cases {
 		t.Run(name, func(t *testing.T) {
 			runner := newFakeRunner().
 				withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
-				withBlkid(map[string]string{"/dev/vg0/data": "ext4"})
-			runner.on("findmnt", handler)
+				withBlkid(map[string]string{"/dev/vg0/data": "ext4"}).
+				failMountTable(tableErr)
 			p := newTestProvider(t, runner)
 
-			if err := p.Delete(context.Background(), "data"); err == nil {
+			err := p.Delete(context.Background(), "data")
+			if err == nil {
 				t.Fatal("Delete succeeded over a mount table it could not read")
+			}
+			if !errors.Is(err, tableErr) {
+				t.Errorf("Delete = %v, want it to report the mount-table failure", err)
 			}
 			runner.mustNotRun(t, "lvremove")
 		})
@@ -2211,9 +2270,7 @@ func TestUnmountFailsClosedOnAnUnreadableMountTable(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
 		withBlkid(map[string]string{"/dev/vg0/data": "ext4"})
-	runner.on("findmnt", func(args []string, _ []byte) ([]byte, error) {
-		return nil, &ExitError{Name: "findmnt", Args: args, Code: 1}
-	})
+	runner.failMountTable(&mountinfo.ReadError{Path: mountinfo.ProcPath, Err: os.ErrPermission})
 	p := newTestProvider(t, runner)
 
 	if err := p.Unmount(context.Background(), "data", "/mnt/data"); err == nil {
@@ -2228,9 +2285,7 @@ func TestResizeFailsClosedOnAnUnreadableMountTable(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
 		withBlkid(map[string]string{"/dev/vg0/data": "xfs"})
-	runner.on("findmnt", func(args []string, _ []byte) ([]byte, error) {
-		return nil, &ExitError{Name: "findmnt", Args: args, Code: 1}
-	})
+	runner.failMountTable(&mountinfo.ReadError{Path: mountinfo.ProcPath, Err: os.ErrPermission})
 	p := newTestProvider(t, runner)
 
 	if err := p.Resize(context.Background(), "data", 2*gib); err == nil {
@@ -2668,7 +2723,7 @@ func TestEncryptedRestoreThresholdIsUsableCapacity(t *testing.T) {
 	}
 	// And it produces a volume the size of the image, with nothing over.
 	assertLine(t, runner, "lvcreate --yes --name restored --size 1073741824b --setautoactivation n vg0")
-	runner.mustNotRun(t, "blkdiscard")
+	assertNothingZeroed(t, runner)
 
 	// One byte less does not fit, and is refused before anything is created.
 	runner = encryptedSnapshot()
@@ -2710,7 +2765,7 @@ func TestRestoreZeroesTheExtentRoundingSlice(t *testing.T) {
 		t.Fatalf("Provision: %v", err)
 	}
 	// From the end of the image ON THE LOGICAL VOLUME, which is past the header.
-	assertLine(t, runner, "blkdiscard --zeroout --offset 1090519040 /dev/vg0/restored")
+	assertZeroed(t, runner, "/dev/vg0/restored", 1090519040)
 
 	// On a volume group whose extents DO divide the header there is no slice,
 	// and the zeroing is skipped as before.
@@ -2724,7 +2779,7 @@ func TestRestoreZeroesTheExtentRoundingSlice(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	aligned.mustNotRun(t, "blkdiscard")
+	assertNothingZeroed(t, aligned)
 }
 
 // TestReencryptingRestoreZeroesPastTheHeader checks the offset itself. The image
@@ -2744,8 +2799,8 @@ func TestReencryptingRestoreZeroesPastTheHeader(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	assertLine(t, runner, "blkdiscard --zeroout --offset 1090519040 /dev/vg0/restored")
-	assertNoLine(t, runner, "blkdiscard --zeroout --offset 1073741824 /dev/vg0/restored")
+	assertZeroed(t, runner, "/dev/vg0/restored", 1090519040)
+	assertNotZeroed(t, runner, "/dev/vg0/restored", 1073741824)
 }
 
 // TestStatusSurvivesAVolumeMovingUnderIt covers the race Status invites by
@@ -2895,17 +2950,17 @@ func TestRestoreTagsTheEncryptedResult(t *testing.T) {
 		// copy landing that makes the volume a container.
 		assertLine(t, runner, "lvchange --addtag blockstore.luks-header=16777216 vg0/restored")
 		lines := runner.lines()
-		dd, tag := -1, -1
+		copied, tag := -1, -1
 		for i, line := range lines {
-			if strings.HasPrefix(line, "dd ") {
-				dd = i
+			if strings.HasPrefix(line, "copy ") {
+				copied = i
 			}
 			if strings.Contains(line, "--addtag") {
 				tag = i
 			}
 		}
-		if dd < 0 || tag < 0 || tag < dd {
-			t.Errorf("the tag must follow the copy; got dd at %d, tag at %d", dd, tag)
+		if copied < 0 || tag < 0 || tag < copied {
+			t.Errorf("the tag must follow the copy; got the copy at %d, tag at %d", copied, tag)
 		}
 	})
 
