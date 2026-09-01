@@ -71,6 +71,8 @@ pkg/
   local/     always-compiled LVM + LUKS2 provider (no build tag)
   drbd/      DRBD 9 replicated provider (build tag: drbd)
   ha/        lease-based HA controller — promote/demote/fence, no build tag
+  preflight/ startup privilege checks — probes device-mapper, mount(2) and the
+             kernel keyring, and refuses a deployment that cannot serve them
 ```
 
 ## High availability
@@ -134,6 +136,147 @@ coordinator backend whose lease sweeper is running.
 Nothing in `pkg/ha` has been run against real DRBD or a real two-node pair; it
 is verified against the contracts its dependencies publish. Read it as
 contract-validated, not hardware-validated, failover.
+
+## Deployment: privilege belongs in ONE component
+
+Attaching an encrypted volume needs privilege. That privilege belongs in exactly
+one small, audited component — a control plane, an init container, a CSI node
+plugin — which unseals the key, attaches the LUKS volume, mounts the filesystem,
+and hands the **already-mounted filesystem** to the workload.
+
+```
+  ┌─────────────────────────────┐        ┌──────────────────────────┐
+  │ storage component           │        │ workload container       │
+  │ (control-plane / init /     │        │                          │
+  │  CSI node plugin)           │        │  NO capabilities         │
+  │                             │        │  NO seccomp exception    │
+  │  CAP_SYS_ADMIN              │───────▶│  NO device access        │
+  │  seccomp: default + 3       │ mount  │  NEVER sees the key      │
+  │  /dev/mapper/control        │        │                          │
+  │  the block device           │        │  just a mounted fs       │
+  └─────────────────────────────┘        └──────────────────────────┘
+```
+
+**The workload's requirements are none.** No capabilities, no seccomp exception,
+no device access, no key. It receives a directory. A deployment that finds itself
+granting the workload `CAP_SYS_ADMIN` has the shape wrong.
+
+**The storage component's minimum**, measured rather than assumed:
+
+| Requirement | Why | Docker | Kubernetes |
+|---|---|---|---|
+| `CAP_SYS_ADMIN` | device-mapper ioctls, `mount(2)` | `--cap-add SYS_ADMIN` | `securityContext.capabilities.add: ["SYS_ADMIN"]` |
+| seccomp: default **+ `add_key`, `keyctl`, `request_key`** | the volume key reaches dm-crypt as a keyring reference | `--security-opt seccomp=<profile>.json` | `securityContext.seccompProfile` (localhost) |
+| an LSM profile permitting `mount(2)` | the default AppArmor profile denies it | `--security-opt apparmor=<profile>` | node-level profile |
+| `/dev/mapper/control` | the device-mapper control node | `--device /dev/mapper/control` (**not** a bind mount) | the node must be **allowed**, not merely mounted in |
+| the specific block device | and nothing else under `/dev` | `--device <path>` | `hostPath` |
+
+**Never `--privileged`.** It grants every capability, disables the seccomp
+profile *and* the LSM confinement wholesale, and exposes every host device, so it
+replaces a bounded grant with an unbounded one. It is not the fix for any refusal
+this library reports.
+
+### The three mechanisms are independent, and that is the trap
+
+Capabilities, seccomp and LSM confinement are enforced by different subsystems,
+granting one does not lift another, and all three surface as a bare "operation
+not permitted". Measured 2026-09-01 in a container with `--cap-add SYS_ADMIN` and
+`--device /dev/mapper/control` under Docker's **default** profiles:
+
+| | verdict |
+|---|---|
+| device-mapper | **works** — `DM_VERSION` returns interface version 4.48.0 |
+| kernel keyring | **BLOCKED** — seccomp denies `add_key`/`keyctl`/`request_key` |
+| `mount(2)` | **BLOCKED** — the default AppArmor profile denies it |
+
+So an operator grants `CAP_SYS_ADMIN`, watches device-mapper work, and concludes
+the container is correctly privileged. The keyring failure arrives later, under
+load, in a path that looks like a storage fault rather than a container-config
+fault.
+
+### The guard
+
+`pkg/preflight` probes each mechanism separately, at startup, and refuses with an
+error naming which one is missing and the exact remedy. `local.New` runs it for
+the capabilities the configuration implies, so a provider constructed in a
+misconfigured container is not constructed at all:
+
+```go
+// explicitly, in a storage component's initialization
+err := preflight.Check(ctx,
+    preflight.CapabilityDeviceMapper,
+    preflight.CapabilityMount,
+    preflight.CapabilityKernelKeyring)
+```
+
+Every check **attempts the operation**; nothing reads `CapEff` and reasons about
+it, because that reports full confidence in exactly the container above. Where
+one errno has two possible causes — `mount(2)` answers `EPERM` both for a
+missing `CAP_SYS_ADMIN` and for a seccomp denial — the guard asks the kernel to
+*demonstrate* the capability through a device-mapper ioctl rather than guessing,
+and where that witness is out of reach it reports the ambiguity and names both
+fixes. A probe
+that cannot establish an answer **fails** rather than passing — an empty
+capability list and an unregistered capability are failures too.
+
+The `preflight` setting (`configured`, `all`, `off`) selects the mode through
+the factory. `off` exists for a process that constructs a provider it will not
+perform privileged operations with; it is an explicit, reviewable line in
+configuration and never a default.
+
+### Verifying it
+
+```
+make preflight-matrix     # needs Docker; asserts, does not merely print
+```
+
+It starts eleven containers and checks the guard refuses each misconfigured one —
+including the `CAP_SYS_ADMIN`-with-default-seccomp trap — and **passes** the one
+with a narrow seccomp profile that adds the three syscalls. That passing row is
+what keeps this from being a guard that refuses everything.
+
+The refusals are distinguished, because they have different fixes and one errno
+is not enough to tell them apart:
+
+| What is actually wrong | How the guard tells | Cause |
+|---|---|---|
+| the node is not in this namespace | `open` → `ENOENT` | `device-missing` |
+| the node is visible but not **allowed** (bind-mounted instead of `--device`) | `open` → `EPERM` | `device-access-denied` |
+| the storage component runs as a non-root uid | `open` → `EACCES` (the node is 0600) | `device-not-readable` |
+| `CAP_SYS_ADMIN` is absent | the ioctl → `EACCES`, the kernel's own check | `privilege-missing` |
+| a seccomp filter denies the syscall | the ioctl → `EPERM`, before that check runs | `syscall-blocked` |
+| an LSM denies `mount(2)` | `mount` → `EACCES` | `lsm-denied` |
+| `mount(2)` → `EPERM`, with the capability witnessed held | a device-mapper ioctl succeeded | `syscall-blocked` |
+| `mount(2)` → `EPERM`, with no witness available | the control node is out of reach | `privilege-or-policy` |
+
+### What crosses the boundary
+
+Only the mount. Not the key — not by environment variable, not by a file in a
+shared volume, not over an API. That property is **structural rather than tested
+here**: the volume key reaches dm-crypt as a kernel keyring reference and
+go-luks2 never populates the inline table field, so there is no configuration in
+which the key lands somewhere an operator can read it. It is stated so a reader
+knows it is reviewed, not covered by a test in this repository.
+
+**Mount propagation is where this goes wrong in practice**, and it fails
+silently: get it wrong and the workload sees an empty directory with no error and
+writes to its own filesystem. Kubernetes needs `Bidirectional` propagation on the
+node plugin and `HostToContainer` on the consumer; plain Docker needs a shared
+bind mount. Verify it rather than assume it. A workload that only reads should
+receive a read-only mount.
+
+**An init container may attach and mount for a pod**, but the mount has to
+outlive it and stay in the pod's namespace — and teardown then has no obvious
+owner, so a volume left attached but unmounted leaks a plaintext device-mapper
+mapping on the node. Name the owner of detach: a node plugin with a lifecycle,
+not an init container that has already exited.
+
+**Kernel keyrings are not namespaced.** Keys are scoped by uid and session on the
+host, so two storage components running as the same uid can reach the same user
+keyring. go-luks2 narrows this to the session ring and holds an entry only for
+the duration of one activation ioctl, but the residual is real: a multi-tenant
+deployment must not assume keyring isolation it does not have. Separate uids, or
+separate nodes, are what separate tenants here.
 
 ## Testing
 

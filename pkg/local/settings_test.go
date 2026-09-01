@@ -29,6 +29,11 @@ func TestNewFromSettings(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
+	// The startup privilege checks are off because this test is about
+	// SETTINGS PARSING, not about the host it runs on: with them on, the result
+	// would depend on whether the test machine can do device-mapper. The check
+	// itself is exercised against a real kernel in preflight_test.go and
+	// through NewFromSettings in TestNewFromSettingsRunsThePreflight.
 	p, err := NewFromSettings(map[string]string{
 		SettingVolumeGroup:        "vg0",
 		SettingNodeID:             "node-a",
@@ -36,6 +41,7 @@ func TestNewFromSettings(t *testing.T) {
 		SettingLUKSKeyFile:        keyFile,
 		SettingSnapshotCoWPercent: "35",
 		SettingWipeOnDelete:       "true",
+		SettingPreflight:          "off",
 	})
 	if err != nil {
 		t.Fatalf("NewFromSettings: %v", err)
@@ -61,7 +67,7 @@ func TestNewFromSettings(t *testing.T) {
 }
 
 func TestNewFromSettingsDefaults(t *testing.T) {
-	p, err := NewFromSettings(map[string]string{SettingVolumeGroup: "vg0"})
+	p, err := NewFromSettings(map[string]string{SettingVolumeGroup: "vg0", SettingPreflight: "off"})
 	if err != nil {
 		t.Fatalf("NewFromSettings: %v", err)
 	}
@@ -146,6 +152,7 @@ func TestNewFromSettingsAcceptsBooleanSpellings(t *testing.T) {
 			SettingVolumeGroup: "vg0",
 			SettingEncrypted:   spelling,
 			SettingLUKSKeyFile: keyFile,
+			SettingPreflight:   "off",
 		})
 		if err != nil {
 			t.Fatalf("NewFromSettings(encrypted=%q): %v", spelling, err)
@@ -159,6 +166,7 @@ func TestNewFromSettingsAcceptsBooleanSpellings(t *testing.T) {
 		p, err := NewFromSettings(map[string]string{
 			SettingVolumeGroup: "vg0",
 			SettingEncrypted:   spelling,
+			SettingPreflight:   "off",
 		})
 		if err != nil {
 			t.Fatalf("NewFromSettings(encrypted=%q): %v", spelling, err)

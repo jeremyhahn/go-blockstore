@@ -2467,7 +2467,11 @@ func TestNewRejectsOutOfRangeCoWPercent(t *testing.T) {
 }
 
 func TestNewDefaultsNodeIDToTheHostname(t *testing.T) {
-	p, err := New(Options{VolumeGroup: "vg0", Runner: newFakeRunner()})
+	// PreflightOff because this test is about the node ID default, and the
+	// provider leaves the Mounter and the LUKS backend at their real
+	// implementations — so with the checks on, the result would depend on
+	// whether the machine running the test can call mount(2).
+	p, err := New(Options{VolumeGroup: "vg0", Runner: newFakeRunner(), Preflight: PreflightOff})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

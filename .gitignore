@@ -31,3 +31,6 @@ go.work.sum
 # env file
 .env
 
+
+# staging directory for scripts/preflight-container-matrix.sh
+.preflight-matrix-tmp/

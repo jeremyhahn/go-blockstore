@@ -240,6 +240,45 @@ integration-test-local:
 	$(GO) test -tags=local_integration -count=1 -timeout=$(TEST_TIMEOUT) -run Integration ./pkg/local/
 	@echo "$(GREEN)✓ local provider real suite complete$(RESET)"
 
+# The Go toolchain the container suite runs under, read from go.mod so it cannot
+# drift from what this module declares.
+GO_VERSION := $(shell awk '/^go /{print $$2}' go.mod)
+
+.PHONY: test-container
+## test-container: Run the unit suite inside a container, where CI runs it
+# NOT redundant with `make test`, and this target exists because the difference
+# cost a review round. Several tests assert what the guard says on a machine
+# that CANNOT do something — a blocked kernel keyring, an absent device node —
+# and a developer host can do all of it, so those branches never execute there.
+# A suite that is green on a desk and red in CI is the same false evidence this
+# repo's preflight work exists to remove, so the container run is a target
+# rather than a thing to remember.
+#
+# The module cache is mounted read-only; nothing is fetched.
+test-container:
+	@echo "$(CYAN)$(BOLD)→ Running the unit suite inside a container...$(RESET)"
+	docker run --rm \
+		-v "$(CURDIR):/src:ro" -v "$$(go env GOMODCACHE):/gomod:ro" \
+		-w /src --user 0 \
+		-e GOFLAGS=-mod=mod -e GOPATH=/tmp/gopath -e GOMODCACHE=/gomod \
+		-e GOPROXY=off -e GOCACHE=/tmp/gocache \
+		golang:$(GO_VERSION) go test -count=1 -timeout=$(TEST_TIMEOUT) ./...
+	@echo "$(GREEN)✓ Container suite complete$(RESET)"
+
+.PHONY: preflight-matrix
+## preflight-matrix: Prove the startup privilege guard fires (and does not) in real containers
+# NOT in `make ci`, and not because it is optional. The condition the guard
+# exists to catch is a property of how the PROCESS WAS STARTED — CAP_SYS_ADMIN
+# granted, /dev/mapper/control passed in, and the runtime's DEFAULT seccomp
+# profile still denying add_key — which nothing inside `go test` can reproduce.
+# It needs a Docker-capable host, which the shared runner is not, so it is run
+# here and by an operator. It ASSERTS rather than prints: a row that does not
+# behave as pkg/preflight claims exits non-zero.
+preflight-matrix:
+	@echo "$(CYAN)$(BOLD)→ Running the preflight container matrix...$(RESET)"
+	./scripts/preflight-container-matrix.sh
+	@echo "$(GREEN)✓ preflight container matrix complete$(RESET)"
+
 .PHONY: coverage
 ## coverage: Enforce the coverage threshold and write an HTML report
 coverage: test

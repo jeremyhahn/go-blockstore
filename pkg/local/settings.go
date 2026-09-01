@@ -70,6 +70,16 @@ const (
 	// rests on, and two providers pointed at different directories do not
 	// serialize against each other at all.
 	SettingLockDir = "lock_dir"
+
+	// SettingPreflight selects which startup privilege checks New performs:
+	// "configured" (the default), "all", or "off".
+	//
+	// It is spelled out in configuration rather than inferred because "off" is
+	// the setting that re-enables a silent failure — a provider that constructs
+	// happily in a container which cannot attach a volume — and a choice with
+	// that consequence should appear in the deployment's own configuration
+	// where a reviewer can see it. See PreflightMode.
+	SettingPreflight = "preflight"
 )
 
 // knownSettings is every key NewFromSettings understands.
@@ -81,6 +91,7 @@ var knownSettings = map[string]struct{}{
 	SettingSnapshotCoWPercent: {},
 	SettingWipeOnDelete:       {},
 	SettingLockDir:            {},
+	SettingPreflight:          {},
 }
 
 // NewFromSettings builds a Provider from the string map the factory passes to a
@@ -121,6 +132,15 @@ func NewFromSettings(settings map[string]string) (*Provider, error) {
 			return nil, fmt.Errorf("%w: %s=%q is not a boolean", common.ErrInvalidArgument, SettingWipeOnDelete, raw)
 		}
 		opts.WipeOnDelete = wipe
+	}
+
+	if raw, ok := settings[SettingPreflight]; ok && raw != "" {
+		mode, known := preflightModeNames[raw]
+		if !known {
+			return nil, fmt.Errorf("%w: %s=%q is not one of %s",
+				common.ErrInvalidArgument, SettingPreflight, raw, strings.Join(preflightModeSpellings(), ", "))
+		}
+		opts.Preflight = mode
 	}
 
 	if path := settings[SettingLUKSKeyFile]; path != "" {

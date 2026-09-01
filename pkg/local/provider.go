@@ -188,6 +188,17 @@ type Options struct {
 	// full-volume zero-fill on every deletion in every deployment.
 	WipeOnDelete bool
 
+	// Preflight selects which privilege checks New performs before it returns a
+	// Provider. It defaults to PreflightConfigured, which checks exactly the
+	// capabilities this configuration will exercise.
+	//
+	// The checks are not a formality. The privileges this provider needs are
+	// granted by three INDEPENDENT mechanisms — capabilities, the seccomp
+	// profile and the LSM profile — and a container can satisfy two of them and
+	// fail the third with no symptom until the first volume is attached. See
+	// package preflight for what is probed and what each refusal means.
+	Preflight PreflightMode
+
 	// luks performs the LUKS2 operations. It defaults to nativeLUKS, which does
 	// them in this process with go-luks2; tests substitute a fake.
 	//
@@ -247,6 +258,14 @@ func New(opts Options) (*Provider, error) {
 			return nil, fmt.Errorf("go-blockstore/local: determining node ID: %w", err)
 		}
 		node = common.NodeID(hostname)
+	}
+
+	// Last, after every argument has been validated: a caller who got the
+	// configuration wrong should hear about the configuration, not about the
+	// container's capabilities. See runPreflight for why it is here at all
+	// rather than at the first privileged operation.
+	if err := runPreflight(opts, opts.Preflight); err != nil {
+		return nil, err
 	}
 
 	return &Provider{
