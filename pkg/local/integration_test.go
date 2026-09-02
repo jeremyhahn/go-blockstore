@@ -2720,3 +2720,140 @@ func onlyFinding(t *testing.T, findings []MappingFinding) MappingFinding {
 	}
 	return findings[0]
 }
+
+// TestIntegrationKeyFileContainment drives the key-path guard against a real
+// mounted volume, which is the shape the exposure actually takes: the volume is
+// mounted, somebody puts the key file inside it because that is the convenient
+// place, and everything works — the volume unlocks and the credential is now in
+// the workload's filesystem.
+func TestIntegrationKeyFileContainment(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	keys := filepath.Join(t.TempDir(), "keys")
+	if err := os.MkdirAll(keys, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	outside := filepath.Join(keys, "volume.key")
+	if err := os.WriteFile(outside, []byte("correct-horse-battery-staple"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	build := func(t *testing.T, keyFile string) *Provider {
+		t.Helper()
+		p, err := NewFromSettings(map[string]string{
+			SettingVolumeGroup: vg,
+			SettingNodeID:      "test-node",
+			SettingEncrypted:   "true",
+			SettingLUKSKeyFile: keyFile,
+		})
+		if err != nil {
+			t.Fatalf("NewFromSettings: %v", err)
+		}
+		return p
+	}
+
+	p := build(t, outside)
+	vol, err := p.Provision(ctx, common.VolumeSpec{Name: "secrets", SizeBytes: 64 << 20, FSType: "ext4"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, vol.ID) })
+	if _, err := p.Attach(ctx, vol.ID, "test-node"); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Detach(ctx, vol.ID, "test-node") })
+
+	target := t.TempDir()
+	if err := p.Mount(ctx, vol.ID, target, common.MountOptions{}); err != nil {
+		t.Fatalf("Mount with the key file outside = %v, want nil", err)
+	}
+	t.Cleanup(func() { _ = p.Unmount(ctx, vol.ID, target) })
+
+	t.Run("a key file inside the mounted volume is refused", func(t *testing.T) {
+		// Written into the volume itself, through the live mount — exactly what
+		// somebody does when the shared volume looks like a good place for it.
+		inside := filepath.Join(target, "volume.key")
+		if err := os.WriteFile(inside, []byte("correct-horse-battery-staple"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		exposed := build(t, inside)
+		err := exposed.Mount(ctx, vol.ID, target, common.MountOptions{})
+		if !errors.Is(err, ErrKeyFileInsideVolume) {
+			t.Fatalf("Mount = %v, want ErrKeyFileInsideVolume", err)
+		}
+
+		// And the unlock path refuses it too, from the other side: the volume is
+		// already mounted and the key is inside that mount.
+		if _, err := exposed.Attach(ctx, vol.ID, "test-node"); !errors.Is(err, ErrKeyFileInsideVolume) {
+			t.Errorf("Attach = %v, want the unlock refused as well", err)
+		}
+	})
+
+	t.Run("the volume's own file at the key's path is refused on a FIRST mount", func(t *testing.T) {
+		// The case the existing-mounts check structurally cannot see, because
+		// on a first mount the volume has no mount points to inspect.
+		//
+		// The volume already contains a file called "planted.key". A host file
+		// of the same name sits in the directory it is about to be mounted on,
+		// and that host file is what the configuration names. After the mount
+		// that path would resolve to the VOLUME's file — so the provider's key
+		// would be a file inside the volume it just handed over.
+		staging := t.TempDir()
+		if err := p.Mount(ctx, vol.ID, staging, common.MountOptions{}); err != nil {
+			t.Fatalf("Mount for staging: %v", err)
+		}
+		planted := filepath.Join(staging, "planted.key")
+		if err := os.WriteFile(planted, []byte("attacker-controlled"), 0o600); err != nil {
+			t.Fatalf("WriteFile into the volume: %v", err)
+		}
+		if err := p.Unmount(ctx, vol.ID, staging); err != nil {
+			t.Fatalf("Unmount: %v", err)
+		}
+
+		fresh := t.TempDir()
+		hostKey := filepath.Join(fresh, "planted.key")
+		if err := os.WriteFile(hostKey, []byte("correct-horse-battery-staple"), 0o600); err != nil {
+			t.Fatalf("WriteFile on the host: %v", err)
+		}
+		// Before the mount this path is the host's key; the fixture is only
+		// meaningful if that is true.
+		if got, _ := os.ReadFile(hostKey); string(got) != "correct-horse-battery-staple" {
+			t.Fatalf("the host key is not what the configuration names: %q", got)
+		}
+
+		err := build(t, hostKey).Mount(ctx, vol.ID, fresh, common.MountOptions{})
+		if !errors.Is(err, ErrKeyFileInsideVolume) {
+			t.Fatalf("Mount = %v, want the first mount refused", err)
+		}
+		// And nothing was mounted, so the volume's file never became the
+		// provider's key even briefly.
+		entries, loadErr := mountinfo.Load()
+		if loadErr != nil {
+			t.Fatalf("Load: %v", loadErr)
+		}
+		if _, mounted := mountinfo.EntryAt(entries, fresh); mounted {
+			t.Error("the refused mount happened anyway")
+		}
+	})
+
+	t.Run("a symlink into the volume is refused", func(t *testing.T) {
+		inside := filepath.Join(target, "real.key")
+		if err := os.WriteFile(inside, []byte("correct-horse-battery-staple"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		link := filepath.Join(keys, "looks-fine.key")
+		if err := os.Symlink(inside, link); err != nil {
+			t.Fatalf("Symlink: %v", err)
+		}
+
+		err := build(t, link).Mount(ctx, vol.ID, target, common.MountOptions{})
+		if !errors.Is(err, ErrKeyFileInsideVolume) {
+			t.Fatalf("Mount = %v, want the symlinked key file refused", err)
+		}
+		if !strings.Contains(err.Error(), inside) {
+			t.Errorf("the refusal does not name where the key really is: %v", err)
+		}
+	})
+}

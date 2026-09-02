@@ -171,6 +171,10 @@ func NewFromSettings(settings map[string]string) (*Provider, error) {
 
 	if path := settings[SettingLUKSKeyFile]; path != "" {
 		opts.KeyProvider = FileKeyProvider(path)
+		// Kept so the provider can prove the key file is outside the paths it
+		// hands to a workload. The KeyProvider closes over the path and cannot
+		// be asked for it afterwards.
+		opts.luksKeyFile = path
 	}
 
 	if raw, ok := settings[SettingSnapshotCoWPercent]; ok && raw != "" {

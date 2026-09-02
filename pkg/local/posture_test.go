@@ -132,3 +132,27 @@ func TestPostureNamesTheOrphanInspection(t *testing.T) {
 		}
 	}
 }
+
+// TestPostureDistinguishesAnUncheckableKeyPath covers a guard whose absence is
+// not a setting somebody forgot.
+//
+// A KeyProvider supplied as a func closes over whatever it reads, so there is
+// no path to check. Reporting that the same way as a disabled guard would send
+// an operator looking for a switch that does not exist.
+func TestPostureDistinguishesAnUncheckableKeyPath(t *testing.T) {
+	opaque := newTestProvider(t, newFakeRunner(), withKey).Posture().String()
+	if !strings.Contains(opaque, "NOT APPLICABLE") {
+		t.Errorf("an unseeable key path is not distinguished from a disabled guard:\n%s", opaque)
+	}
+	if !strings.Contains(opaque, SettingLUKSKeyFile) {
+		t.Errorf("the posture does not say how to make it checkable:\n%s", opaque)
+	}
+
+	checked := newTestProvider(t, newFakeRunner(), func(o *Options) {
+		o.KeyProvider = FileKeyProvider("/etc/keys/v.key")
+		o.luksKeyFile = "/etc/keys/v.key"
+	}).Posture().String()
+	if !strings.Contains(checked, "key-path containment: checked") {
+		t.Errorf("a checkable key path is not reported as checked:\n%s", checked)
+	}
+}

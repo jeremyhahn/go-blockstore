@@ -50,6 +50,7 @@ type Provider struct {
 	runner             CommandRunner
 	encrypted          bool
 	keyProvider        KeyProvider
+	keyFile            string
 	snapshotCoWPercent int
 	wipeOnDelete       bool
 	lockDir            string
@@ -206,6 +207,18 @@ type Options struct {
 	// plain one, and the header is this provider's problem rather than the
 	// caller's.
 	Encrypted bool
+
+	// luksKeyFile is the path SettingLUKSKeyFile named, when the KeyProvider was
+	// built from it.
+	//
+	// It is unexported and carried alongside the provider rather than derived
+	// from it because KeyProvider is a func: a caller that supplies its own
+	// closes over whatever it reads, and this package cannot see a path there
+	// at all. Where the path IS knowable — the settings route, which is the
+	// deployment this library is built for — the key file is checked against
+	// every path handed to a workload; where it is not, Posture says so rather
+	// than implying a check that did not happen.
+	luksKeyFile string
 
 	// KeyProvider supplies LUKS passphrases. It is required when Encrypted is
 	// set and when operating on volumes that are already encrypted.
@@ -389,6 +402,7 @@ func New(opts Options) (*Provider, error) {
 		runner:             runner,
 		encrypted:          opts.Encrypted,
 		keyProvider:        opts.KeyProvider,
+		keyFile:            opts.luksKeyFile,
 		snapshotCoWPercent: pct,
 		wipeOnDelete:       opts.WipeOnDelete,
 		lockDir:            lockDir,
@@ -1173,6 +1187,20 @@ func (p *Provider) Attach(ctx context.Context, volID string, node common.NodeID)
 // has nowhere else to live. A fleet provisioned before the tag existed heals
 // itself one attach at a time rather than needing a migration pass.
 func (p *Provider) unlockForAttach(ctx context.Context, volID string, lv lvInfo) (string, error) {
+	// Before anything is handed back. If the key file lives inside a path where
+	// this volume is already mounted, attaching publishes the volume's own
+	// unlock credential to whoever consumes that mount — the same exposure as
+	// mounting over the key, arriving from the other direction.
+	//
+	// It is HERE rather than where the key is read, because a volume whose
+	// mapping is already open never reads the key again: the exposure is in
+	// handing the volume over, not in the unlock. An integration test against a
+	// real mounted volume is what found that; the check read as working while
+	// sitting on a path the case never took.
+	if err := p.checkKeyFileOutsideVolume(ctx, volID); err != nil {
+		return "", err
+	}
+
 	fsType, err := p.probeFSType(ctx, p.lvPath(volID))
 	if err != nil {
 		return "", err
@@ -1436,6 +1464,38 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 	// and a volume with nothing on it has nothing to mount.
 	if fsType == "" {
 		return fmt.Errorf("%w: volume %q carries no filesystem to mount", common.ErrInvalidArgument, volID)
+	}
+
+	// Two checks, and the reason for the first is not the obvious one.
+	//
+	// A key path under the target is refused NOT because mounting publishes
+	// that file — it does not; mounting HIDES what is underneath, measured. It
+	// is refused because after the mount THE PATH MEANS SOMETHING ELSE, and
+	// which something depends on the volume's contents, which nobody has looked
+	// inside yet:
+	//
+	//   - the volume has no file there: the configured path now resolves to
+	//     nothing, and the provider can no longer read its own key;
+	//   - the volume HAS a file there: the configured path now resolves to the
+	//     volume's own file — so the key this provider reads is a file inside
+	//     the volume it just handed to a workload, which is the exposure this
+	//     guard exists to prevent, and it is attacker-controllable if the
+	//     volume's contents are. Measured: a path reading HOST-KEY before the
+	//     mount reads VOLUME-KEY after it.
+	//
+	// Both are wrong and they cannot be told apart from outside, so the whole
+	// class is refused rather than the pair distinguished by mounting somewhere
+	// private first and inspecting — machinery whose only purpose would be to
+	// permit the first case, which is broken anyway.
+	if err := p.checkKeyFileOutside(target, "the path this volume is being mounted on"); err != nil {
+		return err
+	}
+	// And against where this volume is already mounted, which is the key
+	// genuinely sitting inside the volume's filesystem. Asked on every Mount
+	// rather than only the first, so mounting the same volume elsewhere cannot
+	// republish it.
+	if err := p.checkKeyFileOutsideVolume(ctx, volID); err != nil {
+		return err
 	}
 
 	flags, data := mount.Arguments(opts.ReadOnly, opts.Flags)

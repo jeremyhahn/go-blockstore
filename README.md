@@ -346,6 +346,52 @@ the orphaned verdict cannot see the case that motivates it, an owner that exits
 while the host stays up. Issue #41 is where a liveness owner is decided. Until
 then this is a report, which is the half that works.
 
+### The key that must not cross with it
+
+The section below says only the mount crosses the boundary. That is a property
+somebody can break with one line of configuration: point `luks_key_file` at a
+path inside the volume, and it **works** — the volume unlocks, nothing errors,
+and the credential is published to the container that was specifically designed
+never to see it. From the workload's side it is an ordinary file in its own
+filesystem, so nothing downstream can notice.
+
+So the provider refuses it in two ways, and the second has a reason worth
+reading before changing it:
+
+- **The key must not be inside the volume.** Checked against every path where
+  the volume is already mounted, on attach and on every mount — so mounting the
+  same volume somewhere else cannot republish the key at a new path.
+- **The key must not be under a path this provider mounts on.** Not because
+  mounting publishes that file — it does not, it **hides** it — but because
+  after the mount the configured path *means something else*, and which
+  something depends on the volume's contents:
+
+  | the volume has | the configured path then resolves to | consequence |
+  |---|---|---|
+  | nothing at that path | nothing | the provider can no longer read its own key |
+  | a file at that path | the **volume's** file | the key is inside the volume just handed over, and is attacker-controllable if its contents are |
+
+  Neither is knowable before mounting, and both are wrong, so the whole class is
+  refused rather than the two distinguished by mounting somewhere private first
+  to look — machinery whose only purpose would be to permit the first case,
+  which is broken anyway.
+
+**Symlinks are resolved before comparing**, which is the half a string check
+misses: the configured path can read `/etc/keys/vol.key` while the bytes come
+from inside the volume. Comparison is by path component, so `/mnt/database` is
+not inside `/mnt/data`. A path containing `..` is refused rather than cleaned,
+because `Clean` collapses `link/..` to the parent of the *link* while the kernel
+goes up from its *target* — so a cleaned path can name a location the reader
+never touches.
+
+A path that cannot be resolved is refused rather than allowed, and a key file
+that does not exist yet is judged on the directory it would appear in.
+
+This is checkable only where the path is knowable — the `luks_key_file` setting.
+A caller supplying its own `KeyProvider` closes over whatever it reads, and this
+package cannot see a path there at all; `Provider.Posture()` reports that as
+**NOT APPLICABLE** rather than as a guard somebody forgot to switch on.
+
 ### What crosses the boundary
 
 Only the mount. Not the key — not by environment variable, not by a file in a

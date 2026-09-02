@@ -142,6 +142,11 @@ func (p *Provider) Posture() Posture {
 			Active: p.mountPropagation == MountPropagationShared,
 			Detail: propagationDetail(p.mountPropagation),
 		},
+		GuardStatus{
+			Name:   "key-path containment",
+			Active: p.keyFile != "",
+			Detail: keyPathDetail(p.keyFile != "", p.keyProvider != nil),
+		},
 		// The orphan inspection is always available and never acts, so it is
 		// reported as what it is rather than as on or off. Saying "checked"
 		// would imply something watches continuously — it runs when a component
@@ -174,4 +179,24 @@ func propagationDetail(policy MountPropagationPolicy) string {
 	}
 	return "a mount invisible to another namespace will NOT be refused; set " +
 		SettingMountPropagation + "=shared where a workload elsewhere consumes these mounts"
+}
+
+// keyPathDetail says whether the key file can be checked against the paths this
+// provider hands over, and why not when it cannot.
+//
+// The distinction is not on/off, it is KNOWABLE or not. A KeyProvider supplied
+// as a func closes over whatever it reads, so this package cannot see a path to
+// check — and reporting that as an unchecked guard would suggest a setting
+// somebody could turn on, when the honest statement is that the check does not
+// apply to how this provider was built.
+func keyPathDetail(haveKeyPath, haveProvider bool) string {
+	switch {
+	case haveKeyPath:
+		return "the key file is refused if it resolves inside any path handed to a workload, symlinks followed"
+	case haveProvider:
+		return "NOT APPLICABLE — the key comes from a KeyProvider this package cannot see a path in; " +
+			"use " + SettingLUKSKeyFile + " to have the containment checked"
+	default:
+		return "no key material is configured"
+	}
 }
