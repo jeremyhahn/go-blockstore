@@ -27,6 +27,7 @@ import (
 	enclave "github.com/jeremyhahn/go-enclave"
 
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
+	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
 )
 
 // fakeRunner is a CommandRunner scripted by exact argv.
@@ -261,6 +262,24 @@ func (f *fakeRunner) VisibleMountPointsFor(ctx context.Context, device string) (
 		visible = append(visible, target)
 	}
 	return visible, nil
+}
+
+// PropagationOf answers about this device at the path. This provider does not
+// use it yet — the seam carries it because the mount table does — so the fake
+// answers the way an ordinary host mount does rather than pretending the
+// question cannot be asked.
+func (f *fakeRunner) PropagationOf(_ context.Context, device, mountPoint string) (uint32, bool, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mountTableErr != nil {
+		return 0, false, "", f.mountTableErr
+	}
+	for _, target := range f.mounted[device] {
+		if target == mountPoint {
+			return 1, false, "private", nil
+		}
+	}
+	return 0, false, "", &mountinfo.MountPointError{MountPoint: mountPoint, Err: mountinfo.ErrNotMounted}
 }
 
 // overMount covers a path with another device's filesystem. What was mounted

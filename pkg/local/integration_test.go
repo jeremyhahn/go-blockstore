@@ -54,9 +54,12 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 	"github.com/jeremyhahn/go-luks2/pkg/luks2"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/jeremyhahn/go-blockstore/internal/blkdev"
 	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
+	"github.com/jeremyhahn/go-blockstore/pkg/preflight"
 )
 
 // backingSizeMB is the loopback file every test's volume group is carved from.
@@ -2399,4 +2402,154 @@ func TestIntegrationMountTableIdentifiesTheDeviceByNumber(t *testing.T) {
 			t.Errorf("MountPointsFor(%s) = %v, want it to include %q", name, targets, target)
 		}
 	}
+}
+
+// TestIntegrationMountPropagationGuard drives the propagation guard against the
+// real kernel, in both directions, because a guard is only as good as the two
+// answers it gives: it must refuse a mount the workload could not see, and it
+// must NOT refuse one it could.
+//
+// Neither half is reachable without root and a real mount. Propagation is
+// inherited from the parent at the moment mount(2) is called, so producing a
+// shared mount means making a parent shared first — which is exactly the
+// operator action the finding's remedy tells somebody to perform, exercised
+// here rather than described.
+func TestIntegrationMountPropagationGuard(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	p, err := New(Options{
+		VolumeGroup:      vg,
+		NodeID:           "test-node",
+		MountPropagation: MountPropagationShared,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	vol, err := p.Provision(ctx, common.VolumeSpec{Name: "data", SizeBytes: 64 << 20, FSType: "ext4"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Delete(ctx, vol.ID) })
+	if _, err := p.Attach(ctx, vol.ID, "test-node"); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Detach(ctx, vol.ID, "test-node") })
+
+	// A tmpfs of our own to be the parent, so the test never changes the
+	// propagation of anything on the host that it did not create.
+	parent := filepath.Join(t.TempDir(), "parent")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := unix.Mount("none", parent, "tmpfs", 0, ""); err != nil {
+		t.Fatalf("mounting the parent tmpfs: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Unmount(parent, unix.UMOUNT_NOFOLLOW) })
+
+	target := filepath.Join(parent, "target")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	t.Run("a private parent is refused, and the mount is unwound", func(t *testing.T) {
+		if err := unix.Mount("", parent, "", unix.MS_PRIVATE, ""); err != nil {
+			t.Fatalf("making the parent private: %v", err)
+		}
+
+		err := p.Mount(ctx, vol.ID, target, common.MountOptions{})
+		if err == nil {
+			_ = p.Unmount(ctx, vol.ID, target)
+			t.Fatal("Mount accepted a mount under a private parent")
+		}
+		if !errors.Is(err, preflight.ErrMountNotPropagated) {
+			t.Fatalf("Mount = %v, want ErrMountNotPropagated", err)
+		}
+		if !strings.Contains(err.Error(), "private") {
+			t.Errorf("the finding does not say what the mount actually is: %v", err)
+		}
+
+		// And nothing is left mounted: the caller was told the operation
+		// failed, and a mount it does not know about is one nothing unmounts.
+		entries, loadErr := mountinfo.Load()
+		if loadErr != nil {
+			t.Fatalf("Load: %v", loadErr)
+		}
+		if _, mounted := mountinfo.EntryAt(entries, target); mounted {
+			t.Error("a refused mount was left mounted")
+		}
+	})
+
+	t.Run("an unmounted path is refused rather than answered", func(t *testing.T) {
+		// The fail-closed half, which needs a real block device to ask ABOUT
+		// and so cannot live in the unit suite: CI runs that in a container,
+		// and a container has no device node to name. "Nothing is mounted
+		// there" is not an answer about propagation, and a guard reading it as
+		// one would pass the case where the mount is missing entirely.
+		_, _, _, err := (mountinfo.System{}).PropagationOf(ctx, p.lvPath(vol.ID), filepath.Join(t.TempDir(), "nowhere"))
+		if !errors.Is(err, mountinfo.ErrNotMounted) {
+			t.Fatalf("PropagationOf of an unmounted path = %v, want ErrNotMounted", err)
+		}
+	})
+
+	t.Run("a symlinked target never reaches the guard", func(t *testing.T) {
+		// The guard looks the target up in the kernel's table by the string it
+		// was given, which would be wrong if mount(2) could resolve that string
+		// to some other path. It cannot: the mounter pins the target with
+		// openat2 under RESOLVE_NO_SYMLINKS, so a symlink at the final
+		// component or at any parent is refused before anything is mounted.
+		// This pins the ORDERING — the refusal is the mounter's, not the
+		// guard's, and no mount is left behind for the guard to judge.
+		link := filepath.Join(t.TempDir(), "link")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatalf("Symlink: %v", err)
+		}
+
+		err := p.Mount(ctx, vol.ID, link, common.MountOptions{})
+		if err == nil {
+			_ = p.Unmount(ctx, vol.ID, link)
+			t.Fatal("Mount followed a symlinked target")
+		}
+		// The mounter's refusal, not a propagation finding: the guard never ran.
+		if errors.Is(err, preflight.ErrMountNotPropagated) || errors.Is(err, preflight.ErrIndeterminate) {
+			t.Errorf("the propagation guard judged a mount that was never made: %v", err)
+		}
+
+		entries, loadErr := mountinfo.Load()
+		if loadErr != nil {
+			t.Fatalf("Load: %v", loadErr)
+		}
+		if _, mounted := mountinfo.EntryAt(entries, target); mounted {
+			t.Error("a refused symlinked target left something mounted")
+		}
+	})
+
+	t.Run("a shared parent is accepted", func(t *testing.T) {
+		// This is the remedy the finding above prints, performed.
+		if err := unix.Mount("", parent, "", unix.MS_SHARED, ""); err != nil {
+			t.Fatalf("making the parent shared: %v", err)
+		}
+
+		if err := p.Mount(ctx, vol.ID, target, common.MountOptions{}); err != nil {
+			t.Fatalf("Mount under a shared parent = %v, want nil", err)
+		}
+		t.Cleanup(func() { _ = p.Unmount(ctx, vol.ID, target) })
+
+		// The kernel agrees the mount propagates, which is the property the
+		// guard passed it on.
+		id, propagates, spelling, err := (mountinfo.System{}).PropagationOf(ctx, p.lvPath(vol.ID), target)
+		if err != nil {
+			t.Fatalf("PropagationOf: %v", err)
+		}
+		if !propagates {
+			t.Errorf("the accepted mount is %q, which does not propagate", spelling)
+		}
+		// And the kernel hands back an identity for the mount instance, which
+		// is what tells this mount from a second mount of the same device at
+		// the same path — the thing (device, path) cannot distinguish.
+		if id == 0 {
+			t.Error("the mount has no identity, so a rollback could not tell it from a restacked one")
+		}
+	})
 }

@@ -80,6 +80,22 @@ const (
 	// that consequence should appear in the deployment's own configuration
 	// where a reviewer can see it. See PreflightMode.
 	SettingPreflight = "preflight"
+
+	// SettingMountPropagation selects whether Mount verifies that the mount it
+	// made is visible outside this mount namespace: "unchecked" (the default)
+	// or "shared".
+	//
+	// Set it to "shared" in the deployment this library was built for — a
+	// storage component mounting on behalf of a workload that lives in another
+	// mount namespace. Left unchecked, a wrong propagation setting is the
+	// quietest failure in that model: the mount succeeds here, the workload
+	// finds an empty directory, and nothing anywhere reports an error.
+	//
+	// It is not the default because a mount is private on an ordinary host and
+	// that is correct there; requiring propagation everywhere would refuse the
+	// deployments that have no workload namespace to reach. See
+	// MountPropagationPolicy.
+	SettingMountPropagation = "mount_propagation"
 )
 
 // knownSettings is every key NewFromSettings understands.
@@ -92,6 +108,7 @@ var knownSettings = map[string]struct{}{
 	SettingWipeOnDelete:       {},
 	SettingLockDir:            {},
 	SettingPreflight:          {},
+	SettingMountPropagation:   {},
 }
 
 // NewFromSettings builds a Provider from the string map the factory passes to a
@@ -141,6 +158,15 @@ func NewFromSettings(settings map[string]string) (*Provider, error) {
 				common.ErrInvalidArgument, SettingPreflight, raw, strings.Join(preflightModeSpellings(), ", "))
 		}
 		opts.Preflight = mode
+	}
+
+	if raw, ok := settings[SettingMountPropagation]; ok && raw != "" {
+		policy, known := mountPropagationNames[raw]
+		if !known {
+			return nil, fmt.Errorf("%w: %s=%q is not one of %s",
+				common.ErrInvalidArgument, SettingMountPropagation, raw, strings.Join(mountPropagationSpellings(), ", "))
+		}
+		opts.MountPropagation = policy
 	}
 
 	if path := settings[SettingLUKSKeyFile]; path != "" {

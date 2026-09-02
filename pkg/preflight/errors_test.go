@@ -14,6 +14,7 @@
 package preflight
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -276,5 +277,79 @@ func TestUnknownCapabilityErrorWithNothingRegisteredStillRenders(t *testing.T) {
 	err := &UnknownCapabilityError{Capability: CapabilityMount}
 	if msg := err.Error(); !strings.Contains(msg, "known capabilities are") {
 		t.Errorf("the message does not survive an empty Known list:\n%s", msg)
+	}
+}
+
+// TestMountPropagationVocabulary covers the capability added for the mount-time
+// guard. It has no probe on purpose — there is no mount to ask about at startup
+// — so what has to hold is that its findings classify, match and render like
+// every other one, and that passing it to Check still fails closed.
+func TestMountPropagationVocabulary(t *testing.T) {
+	err := &CapabilityError{
+		Capability: CapabilityMountPropagation,
+		Cause:      CauseMountNotPropagated,
+		Probe:      "reading the propagation of /mnt/data in /proc/self/mountinfo",
+	}
+
+	if !errors.Is(err, ErrMountNotPropagated) {
+		t.Error("the finding does not match its own sentinel")
+	}
+	if !errors.Is(err, ErrUnavailable) {
+		t.Error("the finding does not match the root sentinel")
+	}
+	if errors.Is(err, ErrIndeterminate) {
+		t.Error("the finding matches a sentinel for a different cause")
+	}
+
+	// The remedy is the whole artifact for this one: nothing about a capability
+	// or a syscall filter fixes it, and an operator told to grant CAP_SYS_ADMIN
+	// would change nothing and conclude the guard is wrong.
+	remedy := err.Remedy()
+	for _, want := range []string{"Bidirectional", "HostToContainer", "rshared", "make-rshared", "findmnt"} {
+		if !strings.Contains(remedy, want) {
+			t.Errorf("the remedy does not mention %q", want)
+		}
+	}
+	if !strings.Contains(remedy, "Do NOT use --privileged") {
+		t.Error("the remedy does not carry the --privileged warning")
+	}
+
+	// And the rendered error names what was actually looked at.
+	if !strings.Contains(err.Error(), "/mnt/data") {
+		t.Errorf("the finding does not name the mount: %v", err)
+	}
+}
+
+// TestMountPropagationHasNoProbe pins the deliberate absence. Check must refuse
+// it rather than silently pass a capability nothing can establish at startup.
+func TestMountPropagationHasNoProbe(t *testing.T) {
+	err := New().Check(context.Background(), CapabilityMountPropagation)
+	if err == nil {
+		t.Fatal("Check accepted a capability with no probe")
+	}
+
+	var unknown *UnknownCapabilityError
+	if !errors.As(err, &unknown) {
+		t.Fatalf("error is not an *UnknownCapabilityError: %v", err)
+	}
+	if unknown.Capability != CapabilityMountPropagation {
+		t.Errorf("the error names %q", unknown.Capability)
+	}
+}
+
+// TestIndeterminatePropagationHasItsOwnRemedy covers the case where the guard's
+// own check breaks: the remedy has to point at /proc rather than at the mount.
+func TestIndeterminatePropagationHasItsOwnRemedy(t *testing.T) {
+	err := &CapabilityError{
+		Capability: CapabilityMountPropagation,
+		Cause:      CauseIndeterminate,
+		Probe:      "reading /proc/self/mountinfo",
+		Err:        errors.New("no such file or directory"),
+	}
+	if !strings.Contains(err.Remedy(), "/proc") {
+		t.Errorf("the remedy does not point at /proc: %s", err.Remedy())
+	}
+	if !errors.Is(err, ErrIndeterminate) {
+		t.Error("an indeterminate propagation finding does not match ErrIndeterminate")
 	}
 }

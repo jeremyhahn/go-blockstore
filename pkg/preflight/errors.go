@@ -98,6 +98,17 @@ const (
 	// green light; every path in this package that cannot decide ends here and
 	// refuses.
 	CauseIndeterminate Cause = "indeterminate"
+
+	// CauseMountNotPropagated means a mount succeeded and is not visible
+	// outside the namespace that made it.
+	//
+	// It is its own cause because nothing else in this package describes a
+	// SUCCESSFUL operation whose result does not reach the consumer, and
+	// because its remedy is unlike every other one here: no capability, no
+	// seccomp rule and no LSM profile changes it. The propagation of the parent
+	// mount does, and that is set on the node and in the container's own mount
+	// configuration.
+	CauseMountNotPropagated Cause = "mount-not-propagated"
 )
 
 // The sentinels callers match with errors.Is. ErrUnavailable is the root and
@@ -139,6 +150,9 @@ var (
 	// ErrPlatformUnsupported matches CausePlatformUnsupported.
 	ErrPlatformUnsupported = errors.New("go-blockstore/preflight: this platform cannot provide a required capability")
 
+	// ErrMountNotPropagated matches CauseMountNotPropagated.
+	ErrMountNotPropagated = errors.New("go-blockstore/preflight: a mount is not visible outside the namespace that made it")
+
 	// ErrIndeterminate matches CauseIndeterminate — the probe could not
 	// establish an answer, which this package treats as a failure.
 	ErrIndeterminate = errors.New("go-blockstore/preflight: a probe could not determine whether a capability is available")
@@ -159,6 +173,7 @@ var causeSentinels = map[Cause]error{
 	CauseResourceExhausted:   ErrResourceExhausted,
 	CausePlatformUnsupported: ErrPlatformUnsupported,
 	CauseIndeterminate:       ErrIndeterminate,
+	CauseMountNotPropagated:  ErrMountNotPropagated,
 }
 
 // CapabilityError reports that one capability this deployment needs is not
@@ -275,8 +290,25 @@ var remedies = map[remedyKey]string{
 
 	{CapabilityMount, CausePrivilegeOrPolicy}: "mount(2) was refused with EPERM, which means EITHER that CAP_SYS_ADMIN is absent OR that a seccomp filter denies the syscall — the kernel returns the same errno for both, and the capability could not be demonstrated here because the device-mapper control node used to witness it is not reachable. CHECK BOTH: grant CAP_SYS_ADMIN to the storage component (docker: --cap-add SYS_ADMIN) and confirm the seccomp profile permits mount. " + neverPrivileged,
 
+	{CapabilityMountPropagation, CauseMountNotPropagated}: mountPropagationRemedy,
+
+	{CapabilityMountPropagation, CauseIndeterminate}: "The propagation of the mount could not be established, which is reported as a failure rather than assumed to be fine: " +
+		"this check reads /proc/self/mountinfo, and a container that does not have /proc mounted, or has it mounted with hidepid restrictions, cannot answer the question at all. " +
+		"Mount /proc in the storage component. A guard that passed here would be reporting a handoff it never verified, which is the failure it exists to prevent.",
+
 	{CapabilityMount, CauseLSMDenied}: "A security module is denying mount(2) — measured 2026-09-01: Docker's DEFAULT AppArmor profile denies it even with CAP_SYS_ADMIN granted and the syscall permitted by seccomp, so this is a third mechanism that must be relaxed independently. Give the storage component a profile that permits mount — docker: --security-opt apparmor=<profile>; Kubernetes: an annotation or a node-level profile. " + neverPrivileged,
 }
+
+var mountPropagationRemedy = "The mount succeeded and is PRIVATE, so it exists only in this mount namespace: " +
+	"a workload elsewhere walks to that path and finds the directory as it was before anything was mounted on it, " +
+	"with no error at any layer. No capability, seccomp rule or LSM profile changes this. " +
+	"A mount inherits its parent's propagation, so the fix is upstream of the mount: " +
+	"Kubernetes — set mountPropagation: Bidirectional on the volumeMount in the STORAGE component (it requires privileged: true on that container) " +
+	"and mountPropagation: HostToContainer on the workload that consumes it. " +
+	"Docker — the host directory must itself be a shared mount (mount --make-rshared <dir> on the node, once) " +
+	"and the bind must carry the propagation: --mount type=bind,source=<dir>,target=<dir>,bind-propagation=rshared. " +
+	"Note that -v <dir>:<dir> WITHOUT :rshared produces exactly this finding. " +
+	"Verify with: findmnt -o TARGET,PROPAGATION <dir>, or the shared: field in /proc/self/mountinfo. " + neverPrivileged
 
 // causeRemedies is the per-cause fallback, used when no (capability, cause) row
 // is more specific.
@@ -291,6 +323,7 @@ var causeRemedies = map[Cause]string{
 	CauseKernelUnsupported:   "The kernel does not provide this facility. It is fixed on the node, not in the container configuration.",
 	CauseResourceExhausted:   "A kernel resource limit is full. Raise the limit on the node or find what is consuming it.",
 	CausePlatformUnsupported: "This capability exists only on Linux. Run the storage component on Linux; the workload that consumes the mounted filesystem is unaffected.",
+	CauseMountNotPropagated:  mountPropagationRemedy,
 	CauseIndeterminate:       "The probe could not establish an answer, which is reported as a failure rather than assumed to be fine. Read the underlying error: the check itself broke, and a preflight that guessed here would be worse than none.",
 }
 

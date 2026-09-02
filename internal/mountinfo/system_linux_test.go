@@ -66,3 +66,30 @@ func TestSystemHonoursACancelledContext(t *testing.T) {
 		t.Errorf("MountPointsFor = %v, want it to wrap context.Canceled", err)
 	}
 }
+
+// TestSystemPropagationOfReadsTheLiveTable drives the propagation lookup
+// against this host's real table. The root filesystem is always mounted, so the
+// lookup has something to find on any Linux, container included — but it is
+// asked about by DEVICE, and a container has no device node to name, so the
+// device-backed half of this belongs to the integration suite. What is checked
+// here is the refusal a wrong device produces.
+func TestSystemPropagationOfRefusesAPathHoldingSomethingElse(t *testing.T) {
+	// A regular file has no device number at all, so the lookup cannot even
+	// begin — the identity step refuses before the table is consulted.
+	path := filepath.Join(t.TempDir(), "regular")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, _, _, err := (System{}).PropagationOf(context.Background(), path, "/"); !errors.Is(err, ErrNotBlockDevice) {
+		t.Fatalf("PropagationOf with a non-device = %v, want ErrNotBlockDevice", err)
+	}
+}
+
+func TestSystemPropagationOfHonoursACancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, _, _, err := (System{}).PropagationOf(ctx, "/dev/does-not-matter", "/"); !errors.Is(err, context.Canceled) {
+		t.Errorf("PropagationOf = %v, want it to wrap context.Canceled", err)
+	}
+}

@@ -177,11 +177,34 @@ func TestOpenWitnessAt(t *testing.T) {
 
 // TestLiveOpenWitness exercises the positive open test against the real kernel
 // and checks it leaves nothing behind.
+//
+// "Nothing behind" is measured on the witness's OWN directories, not on a
+// census of /tmp. Counting entries in a directory the whole machine writes to
+// measures every other process as well: this test failed intermittently on an
+// otherwise clean tree — measured on unmodified main, 3 runs in 10 — and one
+// failure reported "-1 entries", an entry that DISAPPEARED, which no leak by
+// this code could ever produce. A test whose subject is a shared resource
+// reports the neighbours' activity as the subject's defect.
 func TestLiveOpenWitness(t *testing.T) {
-	before, err := os.ReadDir(os.TempDir())
-	if err != nil {
-		t.Fatalf("reading %s: %v", os.TempDir(), err)
+	// The witness names its directories with a fixed prefix, so its own leavings
+	// are identifiable without counting anything else in the directory.
+	const prefix = "go-blockstore-preflight-open-"
+	witnessDirs := func() []string {
+		t.Helper()
+		entries, err := os.ReadDir(os.TempDir())
+		if err != nil {
+			t.Fatalf("reading %s: %v", os.TempDir(), err)
+		}
+		var mine []string
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), prefix) {
+				mine = append(mine, e.Name())
+			}
+		}
+		return mine
 	}
+
+	before := witnessDirs()
 
 	got := liveOpenWitness()
 	// This process demonstrably opened files to get here, so a wholesale filter
@@ -193,12 +216,9 @@ func TestLiveOpenWitness(t *testing.T) {
 		t.Errorf("liveOpenWitness = %v, want openWitnessWorks", got)
 	}
 
-	after, err := os.ReadDir(os.TempDir())
-	if err != nil {
-		t.Fatalf("reading %s: %v", os.TempDir(), err)
-	}
+	after := witnessDirs()
 	if len(after) != len(before) {
-		t.Errorf("the witness left %d entries behind in %s", len(after)-len(before), os.TempDir())
+		t.Errorf("the witness left %v behind in %s, up from %v", after, os.TempDir(), before)
 	}
 }
 

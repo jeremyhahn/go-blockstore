@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
+	"github.com/jeremyhahn/go-blockstore/pkg/preflight"
 
 	"github.com/jeremyhahn/go-blockstore/internal/blkdev"
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
@@ -54,8 +55,14 @@ type Provider struct {
 	lockDir            string
 	mounter            Mounter
 	mountTable         MountTable
-	blockDevices       BlockDevices
-	luks               luksBackend
+	mountPropagation   MountPropagationPolicy
+
+	// preflightChecked is the capabilities the startup checks covered for this
+	// configuration, kept so Posture can name them rather than reporting that
+	// "preflight ran" — which says nothing about which of them it covered.
+	preflightChecked []preflight.Capability
+	blockDevices     BlockDevices
+	luks             luksBackend
 }
 
 // ErrMountedBeneathAnother reports a volume still mounted at a path where
@@ -109,6 +116,16 @@ type Mounter = mount.Mounter
 // have the right things mounted.
 type MountTable = mountinfo.Table
 
+// MountPropagationReader is the optional half of the mount-table seam: the
+// question of whether a mount is visible outside this namespace.
+//
+// A MountTable that also implements it enables the mount-propagation guard; one
+// that does not is refused by a provider configured to require propagation,
+// rather than being quietly waved through. It is separate from MountTable so
+// that a caller injecting its own table is not forced to implement a method for
+// a guard it never turns on.
+type MountPropagationReader = mountinfo.PropagationReader
+
 // BlockDevices is the seam through which the provider copies and zeroes block
 // devices — what it used to reach for dd and blkdiscard to do.
 type BlockDevices = blkdev.Operator
@@ -132,6 +149,14 @@ type Options struct {
 	// Mounter mounts and unmounts. It defaults to the pinning implementation
 	// described on the Mounter interface; tests substitute a fake.
 	Mounter Mounter
+
+	// MountPropagation selects whether Mount verifies that the mount it made is
+	// visible outside this mount namespace. It defaults to
+	// MountPropagationUnchecked; a deployment that hands mounts to a workload in
+	// another namespace sets MountPropagationShared, which is the only way this
+	// provider can learn that a private mount is a failure rather than the
+	// ordinary state of a mount on a host.
+	MountPropagation MountPropagationPolicy
 
 	// MountTable answers what is mounted. It defaults to reading
 	// /proc/self/mountinfo; tests substitute a fake.
@@ -324,6 +349,25 @@ func New(opts Options) (*Provider, error) {
 	// configuration wrong should hear about the configuration, not about the
 	// container's capabilities. See runPreflight for why it is here at all
 	// rather than at the first privileged operation.
+	// A provider told to require propagation, over a mount table that cannot
+	// report it, is a configuration that cannot work — and discovering it after
+	// the first mount is worse than useless: the mount has already happened,
+	// the guard cannot judge it, and the rollback cannot identify it either, so
+	// Mount would return an error over a filesystem it left mounted. It is a
+	// startup refusal for the same reason the privilege checks are.
+	if opts.MountPropagation == MountPropagationShared && mountTable != nil {
+		if _, ok := mountTable.(MountPropagationReader); !ok {
+			return nil, fmt.Errorf("%w: %s is %s, and the configured MountTable cannot report propagation (it does not implement MountPropagationReader)",
+				common.ErrInvalidArgument, SettingMountPropagation, MountPropagationShared)
+		}
+	}
+
+	if !opts.MountPropagation.valid() {
+		return nil, fmt.Errorf("%w: MountPropagation is %s, not one of %s",
+			common.ErrInvalidArgument, opts.MountPropagation, strings.Join(mountPropagationSpellings(), ", "))
+	}
+
+	checked := requiredCapabilities(opts, opts.Preflight)
 	if err := runPreflight(opts, opts.Preflight); err != nil {
 		return nil, err
 	}
@@ -339,6 +383,8 @@ func New(opts Options) (*Provider, error) {
 		lockDir:            lockDir,
 		mounter:            mounter,
 		mountTable:         mountTable,
+		mountPropagation:   opts.MountPropagation,
+		preflightChecked:   checked,
 		blockDevices:       blockDevices,
 		luks:               luks,
 	}, nil
@@ -1347,7 +1393,17 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 	}
 
 	flags, data := mount.Arguments(opts.ReadOnly, opts.Flags)
-	return p.mounter.Mount(ctx, device, target, fsType, flags, data)
+	if err := p.mounter.Mount(ctx, device, target, fsType, flags, data); err != nil {
+		return err
+	}
+
+	// The mount exists in THIS namespace now. Whether it exists in the
+	// workload's is a different question, and the only moment it can be asked
+	// is this one.
+	if id, finding := p.verifyMountPropagation(ctx, device, target); finding != nil {
+		return p.unwindUnverifiedMount(ctx, device, target, id, finding)
+	}
+	return nil
 }
 
 // Unmount unmounts the volume from target, converging rather than failing when

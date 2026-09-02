@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
+	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
 )
 
 // fakeCall records one command the provider issued.
@@ -56,6 +57,21 @@ type fakeRunner struct {
 	// MountTable seam directly rather than scripting findmnt's output.
 	mounted       map[string][]string
 	mountTableErr error
+
+	// propagation is how the mount at a path propagates, for the tests that
+	// drive the mount-propagation guard.
+	propagation map[string]propagationFixture
+
+	// The kernel's identity for each mount, so a test can replace one in place.
+	mountIDs               map[string]uint32
+	nextMountID            uint32
+	afterPropagationLookup func()
+
+	// A mount table that starts answering and then fails, for the paths that
+	// read it twice: the guard, and the rollback after it.
+	mountTableLookups  int
+	mountTableErrAfter int
+	mountTableLateErr  error
 
 	// overMounted maps a path to the device now mounted ON TOP of whatever was
 	// there, which is how a test builds the shadowed case.
@@ -526,6 +542,29 @@ func (f *fakeRunner) overMount(target, device string) *fakeRunner {
 	return f
 }
 
+// failMountTableAfter makes the mount table unreadable from the Nth lookup on,
+// which is how a test drives a table that answers the guard and then fails the
+// rollback that follows it.
+func (f *fakeRunner) failMountTableAfter(lookups int, err error) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mountTableErrAfter, f.mountTableLateErr = lookups, err
+	return f
+}
+
+// mountTableFailure is the error this lookup should report, if any, counting
+// the lookups so a late failure can be scripted.
+func (f *fakeRunner) mountTableFailure() error {
+	if f.mountTableErr != nil {
+		return f.mountTableErr
+	}
+	f.mountTableLookups++
+	if f.mountTableLateErr != nil && f.mountTableLookups > f.mountTableErrAfter {
+		return f.mountTableLateErr
+	}
+	return nil
+}
+
 // failMountTable makes the mount table unreadable.
 //
 // Its own error, distinct from "nothing is mounted", because keeping those two
@@ -539,11 +578,14 @@ func (f *fakeRunner) failMountTable(err error) *fakeRunner {
 }
 
 // MountPointsFor answers as the kernel's mount table would.
-func (f *fakeRunner) MountPointsFor(_ context.Context, device string) ([]string, error) {
+func (f *fakeRunner) MountPointsFor(ctx context.Context, device string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.mountTableErr != nil {
-		return nil, f.mountTableErr
+	if err := f.mountTableFailure(); err != nil {
+		return nil, err
 	}
 	return append([]string(nil), f.mounted[device]...), nil
 }
@@ -553,11 +595,14 @@ func (f *fakeRunner) MountPointsFor(_ context.Context, device string) ([]string,
 // The distinction is the kernel's: mounting over an occupied directory leaves
 // both records in the table, the later one is what is visible there, and
 // umount(2) detaches what is visible. A test covers a path with overMount.
-func (f *fakeRunner) VisibleMountPointsFor(_ context.Context, device string) ([]string, error) {
+func (f *fakeRunner) VisibleMountPointsFor(ctx context.Context, device string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.mountTableErr != nil {
-		return nil, f.mountTableErr
+	if err := f.mountTableFailure(); err != nil {
+		return nil, err
 	}
 
 	var visible []string
@@ -568,6 +613,112 @@ func (f *fakeRunner) VisibleMountPointsFor(_ context.Context, device string) ([]
 		visible = append(visible, target)
 	}
 	return visible, nil
+}
+
+// propagationFixture is one path's propagation as the kernel would report it:
+// the spelling and the verdict, kept together so a test cannot script a mount
+// that reads private and propagates anyway.
+type propagationFixture struct {
+	spelling string
+	shared   bool
+}
+
+// PropagationOf answers about THIS DEVICE at the path, and hands back the
+// kernel's identity for the mount instance.
+//
+// The fake models the identity the way the kernel does: a mount gets an id when
+// it appears, and a mount made in its place gets a different one. restack is how
+// a test says "somebody replaced what is here" — the case (device, path) cannot
+// see. Propagation is modeled as the kernel presents it, a spelling and a
+// verdict that agree, so a test cannot arrange a mount reported private and
+// propagating.
+func (f *fakeRunner) PropagationOf(ctx context.Context, device, mountPoint string) (uint32, bool, string, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, "", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.mountTableFailure(); err != nil {
+		return 0, false, "", err
+	}
+
+	// What is VISIBLE at the path is what umount(2) would detach and whose
+	// propagation a reader would otherwise pick up.
+	if top, covered := f.overMounted[mountPoint]; covered && top != device {
+		return 0, false, "", &mountinfo.MountPointError{MountPoint: mountPoint, Err: mountinfo.ErrNotVisibleThere}
+	}
+	for _, target := range f.mounted[device] {
+		if target != mountPoint {
+			continue
+		}
+		p := f.propagation[target]
+		if p.spelling == "" {
+			// Unscripted means the ordinary state of a mount on a host:
+			// private, seen by nobody else.
+			p.spelling = "private"
+		}
+		id := f.mountIDLocked(device, target)
+		if hook := f.afterPropagationLookup; hook != nil {
+			f.afterPropagationLookup = nil
+			// Released so the hook can take it, the way a concurrent actor
+			// would rather than reentering under this call's lock.
+			f.mu.Unlock()
+			hook()
+			f.mu.Lock()
+		}
+		return id, p.shared, p.spelling, nil
+	}
+	return 0, false, "", &mountinfo.MountPointError{MountPoint: mountPoint, Err: mountinfo.ErrNotMounted}
+}
+
+// mountIDLocked hands each (device, path) mount a stable identity. The caller
+// holds the lock.
+func (f *fakeRunner) mountIDLocked(device, target string) uint32 {
+	if f.mountIDs == nil {
+		f.mountIDs = map[string]uint32{}
+	}
+	key := device + "\x00" + target
+	if id, ok := f.mountIDs[key]; ok {
+		return id
+	}
+	f.nextMountID++
+	f.mountIDs[key] = f.nextMountID
+	return f.nextMountID
+}
+
+// onUnmountTableLookup runs a function the NEXT time the mount table is asked
+// about a device at a path, which is how a test acts inside the window between
+// the guard's verdict and the rollback that follows it.
+func (f *fakeRunner) onUnmountTableLookup(hook func()) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.afterPropagationLookup = hook
+	return f
+}
+
+// restack replaces the mount at a path with another mount OF THE SAME DEVICE,
+// the way a second mount stacked on the same path does. Everything about it
+// matches except the kernel's identity for it, which is the whole point.
+func (f *fakeRunner) restack(device, target string) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mountIDs == nil {
+		f.mountIDs = map[string]uint32{}
+	}
+	f.nextMountID++
+	f.mountIDs[device+"\x00"+target] = f.nextMountID
+	return f
+}
+
+// withPropagation makes a mount propagate, the way a shared parent does.
+func (f *fakeRunner) withPropagation(target, spelling string) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.propagation == nil {
+		f.propagation = make(map[string]propagationFixture)
+	}
+	f.propagation[target] = propagationFixture{spelling: spelling, shared: strings.HasPrefix(spelling, "shared:")}
+	return f
 }
 
 // Copy records a device copy instead of performing one.

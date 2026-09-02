@@ -255,6 +255,61 @@ is not enough to tell them apart:
 | `mount(2)` → `EPERM`, with the capability witnessed held | a device-mapper ioctl succeeded | `syscall-blocked` |
 | `mount(2)` → `EPERM`, with no witness available | the control node is out of reach | `privilege-or-policy` |
 
+### The mount the workload cannot see
+
+The startup guard above proves the container *can* mount. It says nothing about
+whether the mount **reaches the workload**, which is a property of the individual
+mount and cannot be known before one exists.
+
+That is the quietest failure in this deployment model. `mount(2)` succeeds, this
+library reports success, and a workload in its own mount namespace walks to the
+path and finds the directory exactly as it was before anything was mounted on it.
+There is no error, no log line and no non-zero exit anywhere. The first evidence
+is a workload writing to its own filesystem, and the second is somebody asking
+where the data went.
+
+A mount inherits its parent's propagation, so `local.Mount` reads the propagation
+of the mount it just made out of `/proc/self/mountinfo` and refuses a private one:
+
+```
+mount_propagation = shared      # in settings, or Options.MountPropagation
+```
+
+The refusal names what the mount actually is and the setting each runtime needs —
+Kubernetes `mountPropagation: Bidirectional` on the storage component and
+`HostToContainer` on the consumer; Docker a host directory that is itself shared
+(`mount --make-rshared`) plus `bind-propagation=rshared` on the bind. A refused
+mount is **unwound**, so a caller told the operation failed is not left with a
+filesystem mounted that nothing will ever unmount.
+
+It is off by default and that is deliberate: a mount is private on an ordinary
+host, which is correct there, so requiring propagation everywhere would refuse
+every deployment that has no second namespace to reach. The check is also
+fail-closed in its own right — a `/proc` it cannot read is a refusal, not a pass,
+because a guard that reports success when its own check breaks is worse than no
+guard.
+
+A default that is off has its own failure mode: the deployment that most needs
+the guard is the one that forgets to enable it, and an operator who forgot sees
+exactly what an operator who does not need it sees — nothing. So the absence is
+made **sayable**. `Provider.Posture()` names every guard and whether it is
+checked, and a storage component prints it once at startup, beside where it
+would report a preflight failure:
+
+```
+go-blockstore/local guards:
+  device-mapper access: checked — verified at startup
+  kernel keyring: checked — verified at startup
+  mount(2) privilege: checked — verified at startup
+  mount propagation: NOT CHECKED — a mount invisible to another namespace will
+    NOT be refused; set mount_propagation=shared where a workload elsewhere
+    consumes these mounts
+```
+
+A guard that is off appears in that list rather than being omitted from it,
+which is the difference between a list an operator can act on and one they
+cannot tell from complete.
+
 ### What crosses the boundary
 
 Only the mount. Not the key — not by environment variable, not by a file in a

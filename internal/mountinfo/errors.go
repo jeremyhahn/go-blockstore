@@ -37,6 +37,28 @@ var (
 	// device number to match a mount against.
 	ErrNotBlockDevice = errors.New("mountinfo: path is not a block device")
 
+	// ErrNotMounted reports a path with nothing mounted at it, where the caller
+	// asked a question that only a mount can answer.
+	//
+	// Distinct from a false answer on purpose: "nothing is mounted here" and
+	// "what is mounted here does not propagate" are different findings with
+	// different fixes, and a guard that collapsed them would report the wrong
+	// one at the moment somebody is trying to fix a deployment.
+	ErrNotMounted = errors.New("mountinfo: nothing is mounted at that path")
+
+	// ErrNotVisibleThere reports a path where something IS mounted and it is not
+	// the device asked about.
+	//
+	// Distinct from ErrNotMounted because the fixes differ and so does the
+	// hazard: nothing mounted is a mount that failed or was removed, while
+	// something else mounted is another actor's filesystem on the same path —
+	// whose propagation must not be read as this device's, and which must never
+	// be unmounted on this device's behalf.
+	ErrNotVisibleThere = errors.New("mountinfo: another filesystem is visible at that path")
+
+	// ErrMalformedMountID reports a record whose mount id is not a number.
+	ErrMalformedMountID = errors.New("mountinfo: mount id is not a number")
+
 	// ErrUnsupportedPlatform reports that device numbers cannot be read here.
 	ErrUnsupportedPlatform = errors.New("mountinfo: reading device numbers requires Linux")
 )
@@ -48,6 +70,7 @@ var (
 	errNoSeparator             = ErrNoSeparator
 	errTruncatedAfterSeparator = ErrTruncatedAfterSeparator
 	errMalformedDeviceNumber   = ErrMalformedDeviceNumber
+	errMalformedMountID        = ErrMalformedMountID
 )
 
 // ReadError reports that the mount table could not be read at all.
@@ -88,6 +111,22 @@ func (e *ParseError) Error() string {
 }
 
 func (e *ParseError) Unwrap() error { return e.Err }
+
+// MountPointError reports a question about a path that the mount table could
+// not answer, carrying the path so the report names it.
+type MountPointError struct {
+	// MountPoint is the path that was asked about.
+	MountPoint string
+
+	// Err is the underlying failure, or one of the sentinels above.
+	Err error
+}
+
+func (e *MountPointError) Error() string {
+	return "mountinfo: " + e.MountPoint + ": " + e.Err.Error()
+}
+
+func (e *MountPointError) Unwrap() error { return e.Err }
 
 // DeviceError reports that a path's device number could not be determined, so
 // no mount could be attributed to it.

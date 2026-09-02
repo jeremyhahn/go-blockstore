@@ -143,17 +143,18 @@ func validateAbsPath(kind, target string) error {
 	if target == "" {
 		return fmt.Errorf("%w: %s is empty", common.ErrInvalidArgument, kind)
 	}
-	// Control characters are rejected, newline above all. mountpointsFor reads
-	// findmnt's output a line at a time, so a target containing a newline would
-	// arrive as two lines matching nothing — and Unmount, finding no match,
-	// reports the convergent "not mounted there" while the volume stays mounted.
+	// Control characters are rejected, newline above all. The kernel's mount
+	// table is a line-oriented file, and while the parser now undoes the octal
+	// escaping the kernel applies to a newline (\012), a target carrying one is
+	// still a target nothing else in the system handles well — and this
+	// provider passes it to tools that are line-oriented in their own right.
 	// Linux permits any byte but NUL and '/' in a path, so this has to be
 	// refused here rather than assumed away.
 	//
-	// A space is deliberately still allowed: findmnt's default output prints it
-	// literally (it is --raw that would escape it to \x20), so a target with a
-	// space round-trips correctly. TestMountpointsForHandlesSpacesInTargets
-	// pins that, because the obvious "fix" of switching to --raw would break it.
+	// A space is deliberately still allowed, and it round-trips: the kernel
+	// escapes it as \040 in /proc/self/mountinfo and internal/mountinfo unescapes
+	// it, which TestParseUnescapesPaths and the integration test that mounts at
+	// a path with a space both pin.
 	for i := 0; i < len(target); i++ {
 		if c := target[i]; c < 0x20 || c == 0x7f {
 			return fmt.Errorf("%w: %s %q contains control character %#x", common.ErrInvalidArgument, kind, target, c)
@@ -165,12 +166,12 @@ func validateAbsPath(kind, target string) error {
 	if filepath.Clean(target) != target {
 		return fmt.Errorf("%w: %s %q is not a clean path", common.ErrInvalidArgument, kind, target)
 	}
-	// Leading or trailing whitespace is refused because mountpointsFor trims
-	// each line of findmnt's output before comparing it. A target padded with a
-	// space would come back trimmed, match nothing, and make Unmount report the
-	// convergent "not mounted there" over a volume that is still mounted.
-	// Rejecting the target is better than dropping the trim, which is what
-	// separates a real record from the blank line findmnt ends on.
+	// Leading or trailing whitespace is refused because the kernel's own record
+	// would not carry it back the way it went in: the mount table is
+	// whitespace-separated, and a target padded with a space is a target this
+	// provider cannot match against its own record afterwards. Unmount would
+	// then report the convergent "not mounted there" over a volume that is
+	// still mounted, which is the fail-open the mount lookups exist to avoid.
 	if strings.TrimSpace(target) != target {
 		return fmt.Errorf("%w: %s %q has leading or trailing whitespace", common.ErrInvalidArgument, kind, target)
 	}

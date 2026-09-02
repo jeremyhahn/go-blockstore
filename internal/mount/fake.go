@@ -38,6 +38,7 @@ type Fake struct {
 	unmounts   []string
 	mountErr   error
 	unmountErr error
+	mountHook  func()
 }
 
 // Call is one recorded Mount, in the terms mount(2) takes rather than the
@@ -54,9 +55,25 @@ type Call struct {
 // Mount records a mount instead of performing one.
 func (f *Fake) Mount(_ context.Context, source, target, fsType string, flags uintptr, data string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.mounts = append(f.mounts, Call{Source: source, Target: target, FSType: fsType, Flags: flags, Data: data})
-	return f.mountErr
+	hook, err := f.mountHook, f.mountErr
+	f.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+	return err
+}
+
+// OnMount registers a function to run as a mount is made.
+//
+// It is how a test reaches the window after mount(2) has succeeded and before
+// whatever the caller does next — the window a compensating action has to
+// survive, since the most likely thing to happen in it is the caller giving up.
+func (f *Fake) OnMount(hook func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mountHook = hook
 }
 
 // Unmount records an unmount instead of performing one.

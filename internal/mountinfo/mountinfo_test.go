@@ -35,12 +35,19 @@ func TestParseReadsARealRecord(t *testing.T) {
 
 	got := entries[0]
 	want := Entry{
+		// The kernel's identity for this MOUNT, which is what distinguishes it
+		// from a second mount of the same device at the same path.
+		ID:         580,
 		Major:      252,
 		Minor:      3,
 		Root:       "/",
 		MountPoint: "/tmp/scratch/mi2",
 		FSType:     "ext4",
 		Source:     "/dev/mapper/bsmi-vol",
+		// The record carries shared:500, so the propagation comes with it. This
+		// is the field that decides whether a mount is visible in another
+		// namespace at all.
+		Propagation: Propagation{Shared: true, PeerGroup: 500},
 	}
 	if got != want {
 		t.Errorf("parsed %+v, want %+v", got, want)
@@ -288,5 +295,173 @@ func TestVisibleMountPointsForAnUnmountedDevice(t *testing.T) {
 	entries := []Entry{{Major: 8, Minor: 1, MountPoint: "/"}}
 	if got := VisibleMountPointsFor(entries, 252, 3); len(got) != 0 {
 		t.Errorf("VisibleMountPointsFor of an unmounted device = %v, want none", got)
+	}
+}
+
+// TestParsePropagation covers the optional fields, which are what decide
+// whether a mount made here can be seen anywhere else.
+//
+// A mount under a private parent exists only in the namespace that made it: a
+// workload in another namespace walks to the path and finds the directory as it
+// was before anything was mounted on it, with no error at any layer. These
+// fields are the only evidence of that, and they are the ones a parser is most
+// tempted to skip over on the way to the fields after the separator.
+func TestParsePropagation(t *testing.T) {
+	cases := map[string]struct {
+		optional string
+		want     Propagation
+		render   string
+	}{
+		"private": {
+			optional: "",
+			want:     Propagation{},
+			render:   "private",
+		},
+		"shared": {
+			optional: "shared:2",
+			want:     Propagation{Shared: true, PeerGroup: 2},
+			render:   "shared:2",
+		},
+		"slave": {
+			optional: "master:3",
+			want:     Propagation{Slave: true, MasterGroup: 3},
+			render:   "master:3",
+		},
+		"shared and slave": {
+			optional: "shared:2 master:3",
+			want:     Propagation{Shared: true, PeerGroup: 2, Slave: true, MasterGroup: 3},
+			render:   "shared:2 master:3",
+		},
+		"unbindable": {
+			optional: "unbindable",
+			want:     Propagation{Unbindable: true},
+			render:   "unbindable",
+		},
+		// propagate_from accompanies master: on a slave whose peer group is not
+		// reachable from this namespace. It says nothing this cares about, and
+		// the point is that an unrecognized tag does not disturb the rest.
+		"slave with propagate_from": {
+			optional: "master:3 propagate_from:5",
+			want:     Propagation{Slave: true, MasterGroup: 3},
+			render:   "master:3",
+		},
+		"a tag this kernel version invented": {
+			optional: "shared:2 something_new:9",
+			want:     Propagation{Shared: true, PeerGroup: 2},
+			render:   "shared:2",
+		},
+		// A malformed value is not a propagation claim, so it is not honored.
+		// Fail-closed here means NOT reporting a mount as shared on a field the
+		// parser could not read.
+		"shared with an unreadable peer group": {
+			optional: "shared:notanumber",
+			want:     Propagation{},
+			render:   "private",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			line := "1 2 8:1 / /mnt rw"
+			if tc.optional != "" {
+				line += " " + tc.optional
+			}
+			line += " - ext4 /dev/sda1 rw"
+
+			entries, err := Parse(strings.NewReader(line))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if entries[0].Propagation != tc.want {
+				t.Errorf("Propagation = %+v, want %+v", entries[0].Propagation, tc.want)
+			}
+			if got := entries[0].Propagation.String(); got != tc.render {
+				t.Errorf("String() = %q, want %q", got, tc.render)
+			}
+		})
+	}
+}
+
+// TestPropagationPrivate names the state that fails silently, so a caller can
+// ask for it directly rather than spelling out the absence of the others.
+func TestPropagationPrivate(t *testing.T) {
+	cases := map[string]struct {
+		p    Propagation
+		want bool
+	}{
+		"nothing set":  {Propagation{}, true},
+		"shared":       {Propagation{Shared: true, PeerGroup: 1}, false},
+		"slave":        {Propagation{Slave: true, MasterGroup: 1}, false},
+		"unbindable":   {Propagation{Unbindable: true}, false},
+		"shared+slave": {Propagation{Shared: true, Slave: true}, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.p.Private(); got != tc.want {
+				t.Errorf("Private() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPropagationSurvivesAVariableNumberOfOptionalFields is the interaction
+// between this and the separator search: the optional fields are where the
+// record's length varies, so reading them wrongly is also how the fields AFTER
+// the separator get misread.
+func TestPropagationSurvivesAVariableNumberOfOptionalFields(t *testing.T) {
+	line := `1 2 8:1 / /mnt rw shared:1 master:2 propagate_from:3 unbindable - ext4 /dev/sda1 rw`
+
+	entries, err := Parse(strings.NewReader(line))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	got := entries[0]
+	if got.FSType != "ext4" || got.Source != "/dev/sda1" {
+		t.Errorf("the fields after the separator were misread: %+v", got)
+	}
+	if !got.Propagation.Shared || got.Propagation.PeerGroup != 1 {
+		t.Errorf("Propagation = %+v, want shared:1 among the rest", got.Propagation)
+	}
+	if !got.Propagation.Unbindable {
+		t.Error("unbindable was not read")
+	}
+}
+
+// TestParseRejectsAMalformedMountID keeps the identity honest. The mount id is
+// what a caller compares to decide whether the mount it is about to act on is
+// still its own, so a record whose id cannot be read is not a record with a
+// missing field — it is one no such decision can be made from.
+func TestParseRejectsAMalformedMountID(t *testing.T) {
+	_, err := Parse(strings.NewReader(`x 2 8:1 / /mnt rw - ext4 /dev/sda1 rw`))
+	if !errors.Is(err, ErrMalformedMountID) {
+		t.Fatalf("Parse = %v, want ErrMalformedMountID", err)
+	}
+}
+
+// TestParseReadsDistinctMountIDsForStackedMounts is the case the id exists for:
+// one device, one path, two mounts. Nothing else in a record tells them apart.
+func TestParseReadsDistinctMountIDsForStackedMounts(t *testing.T) {
+	table := "31 1 252:3 / /mnt/data rw shared:1 - ext4 /dev/vg0/data rw\n" +
+		"87 1 252:3 / /mnt/data rw shared:2 - ext4 /dev/vg0/data rw\n"
+
+	entries, err := Parse(strings.NewReader(table))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("parsed %d entries, want 2", len(entries))
+	}
+	if entries[0].ID == entries[1].ID {
+		t.Fatal("two stacked mounts of one device share an id, so nothing distinguishes them")
+	}
+
+	// And the visible one is the later record, which is the one umount(2) would
+	// detach — so it is the id a caller has to compare against.
+	visible, ok := EntryAt(entries, "/mnt/data")
+	if !ok {
+		t.Fatal("EntryAt found nothing")
+	}
+	if visible.ID != entries[1].ID {
+		t.Errorf("the visible mount is id %d, want the later record %d", visible.ID, entries[1].ID)
 	}
 }

@@ -48,6 +48,18 @@ const (
 	// profile blocks add_key, keyctl and request_key and granting CAP_SYS_ADMIN
 	// does not lift that.
 	CapabilityKernelKeyring Capability = "kernel-keyring"
+
+	// CapabilityMountPropagation is a mount being visible outside the namespace
+	// that made it.
+	//
+	// Unlike the three above it has NO registered probe and is never passed to
+	// Check: nothing about it can be established at startup, because it is a
+	// property of an individual mount and there is no mount yet. It is checked
+	// after each mount, by the provider that made it, and it lives here so that
+	// finding reaches an operator in the same vocabulary as the startup ones —
+	// same type, same Cause, same remedy table. Passing it to Check yields
+	// UnknownCapabilityError, which is the fail-closed direction.
+	CapabilityMountPropagation Capability = "mount-propagation"
 )
 
 // Probe performs one capability check by ATTEMPTING the operation.

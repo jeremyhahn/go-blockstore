@@ -51,6 +51,16 @@ const ProcPath = "/proc/self/mountinfo"
 
 // Entry is one mounted filesystem.
 type Entry struct {
+	// ID is the kernel's identity for this MOUNT — not for the filesystem and
+	// not for the device, both of which several mounts can share.
+	//
+	// It is what distinguishes one mount of a device at a path from a SECOND
+	// mount of the same device at the same path, which (device, path) cannot.
+	// A mount that has been unmounted and remade has a different ID, so an ID
+	// that still matches is evidence the mount is the same one and not a
+	// replacement made in the meantime.
+	ID uint32
+
 	// Major and Minor identify the mounted device. They are the stable identity
 	// of a mount, unlike Source, which is whatever name it was mounted under.
 	Major uint32
@@ -70,6 +80,65 @@ type Entry struct {
 	// filesystem, and something arbitrary otherwise. Present for diagnostics;
 	// match on Major and Minor instead.
 	Source string
+
+	// Propagation is how mount and unmount events cross this mount into other
+	// namespaces, read from the optional fields.
+	Propagation Propagation
+}
+
+// Propagation is a mount's propagation state — the optional fields between the
+// mount options and the "-" separator.
+//
+// It decides whether a mount made here is VISIBLE anywhere else. A mount under
+// a private parent exists only in the namespace that made it: a workload in
+// another mount namespace walks to the path and finds the directory it was
+// before anything was mounted on it, with no error at any layer. That is why
+// the fields are parsed rather than skipped — they are the difference between
+// a working handoff and an empty directory nobody is told about.
+type Propagation struct {
+	// Shared reports the "shared:N" field: this mount belongs to a peer group
+	// and propagates its events to the rest of it. This is what a handoff to
+	// another namespace requires.
+	Shared bool
+
+	// PeerGroup is the N of "shared:N", meaningful only when Shared is set.
+	PeerGroup uint32
+
+	// Slave reports the "master:N" field: this mount RECEIVES events from peer
+	// group N. A mount can be both shared and a slave.
+	Slave bool
+
+	// MasterGroup is the N of "master:N", meaningful only when Slave is set.
+	MasterGroup uint32
+
+	// Unbindable reports the "unbindable" field: this mount cannot be bind
+	// mounted at all, which makes it unusable for a handoff by construction.
+	Unbindable bool
+}
+
+// Private reports a mount that propagates nothing: no peer group, no master.
+//
+// It is the default state of a mount in most namespaces and the one that fails
+// silently, so it is named rather than left as the absence of the others.
+func (p Propagation) Private() bool { return !p.Shared && !p.Slave && !p.Unbindable }
+
+// String renders the propagation the way /proc/self/mountinfo spells it, which
+// is what an operator will compare against when they go and look.
+func (p Propagation) String() string {
+	if p.Unbindable {
+		return "unbindable"
+	}
+	var parts []string
+	if p.Shared {
+		parts = append(parts, "shared:"+utoa(p.PeerGroup))
+	}
+	if p.Slave {
+		parts = append(parts, "master:"+utoa(p.MasterGroup))
+	}
+	if len(parts) == 0 {
+		return "private"
+	}
+	return strings.Join(parts, " ")
 }
 
 // Load reads and parses the kernel's mount table.
@@ -156,16 +225,54 @@ func parseLine(text string) (Entry, error) {
 	if err != nil {
 		return Entry{}, err
 	}
+	id, err := strconv.ParseUint(fields[0], 10, 32)
+	if err != nil {
+		return Entry{}, errMalformedMountID
+	}
 
 	return Entry{
-		Major:      major,
-		Minor:      minor,
-		Root:       unescape(fields[3]),
-		MountPoint: unescape(fields[4]),
-		FSType:     unescape(fields[sep+1]),
-		Source:     unescape(fields[sep+2]),
+		ID:          uint32(id),
+		Major:       major,
+		Minor:       minor,
+		Root:        unescape(fields[3]),
+		MountPoint:  unescape(fields[4]),
+		FSType:      unescape(fields[sep+1]),
+		Source:      unescape(fields[sep+2]),
+		Propagation: parsePropagation(fields[minFieldsBeforeSeparator:sep]),
 	}, nil
 }
+
+// parsePropagation reads the optional fields.
+//
+// They are a variable-length list of tags, which is why the separator has to be
+// found rather than counted to, and an unrecognized tag is IGNORED rather than
+// rejected: the kernel is free to add one, and a parser that refused a record
+// over a tag it did not know would fail closed on a mount table that is
+// perfectly valid. The fields this reads are fixed by the format and the ones
+// it does not recognize say nothing about propagation.
+func parsePropagation(optional []string) Propagation {
+	var p Propagation
+	for _, field := range optional {
+		tag, value, hasValue := strings.Cut(field, ":")
+		switch {
+		case tag == "unbindable":
+			p.Unbindable = true
+		case tag == "shared" && hasValue:
+			if n, err := strconv.ParseUint(value, 10, 32); err == nil {
+				p.Shared, p.PeerGroup = true, uint32(n)
+			}
+		case tag == "master" && hasValue:
+			if n, err := strconv.ParseUint(value, 10, 32); err == nil {
+				p.Slave, p.MasterGroup = true, uint32(n)
+			}
+		}
+	}
+	return p
+}
+
+// utoa keeps Propagation.String free of a fmt dependency, for the reason the
+// errors in this package are free of one.
+func utoa(n uint32) string { return strconv.FormatUint(uint64(n), 10) }
 
 // parseDeviceNumber reads the "major:minor" field.
 //
@@ -333,6 +440,44 @@ type Table interface {
 	VisibleMountPointsFor(ctx context.Context, device string) ([]string, error)
 }
 
+// PropagationReader is the OPTIONAL half of the mount-table seam: it answers
+// whether a mount can be seen outside the namespace that made it.
+//
+// It is separate from Table rather than another method on it because a caller
+// that injects its own mount table should not have to implement a method for a
+// guard it never turns on. Adding it to Table would stop such a caller
+// compiling over a feature left at its default. A provider that needs it asks
+// for it with a type assertion, and REFUSES when the table it was given cannot
+// answer — an optional interface that silently degraded would be the
+// guard-that-passes-when-it-cannot-check, which is the failure the guard exists
+// to remove.
+type PropagationReader interface {
+	// PropagationOf reports the propagation of the mount that DEVICE has
+	// visible at mountPoint, and the kernel's identity for that mount instance.
+	//
+	// It asks about a specific device at a specific path rather than about
+	// whatever is at the path, because those are different questions in exactly
+	// the case that matters. Another process can mount over the path in the
+	// window after mount(2) returns, and a guard that read "the propagation at
+	// this path" would then read the INTERLOPER's propagation — so a private
+	// mount passes because something shared landed on top of it. Naming the
+	// device makes that a refusal instead: ErrNotVisibleThere.
+	//
+	// The returned id identifies the mount instance. A caller that will act on
+	// this mount later — to unmount it — compares the id it saw then against
+	// the id it sees now, which is the only way to tell its own mount from a
+	// SECOND mount of the same device stacked on the same path.
+	//
+	// A path with nothing mounted at it is ErrNotMounted rather than a false:
+	// absence is not an answer about propagation, and a guard that read it as
+	// one would pass the case where the mount is missing entirely.
+	//
+	// The DECISION about what counts as propagating is made here rather than by
+	// the caller, because two call sites deciding it separately is how they end
+	// up with two answers to one question.
+	PropagationOf(ctx context.Context, device, mountPoint string) (id uint32, propagates bool, spelling string, err error)
+}
+
 // System is the Table backed by the running kernel.
 type System struct{}
 
@@ -357,6 +502,35 @@ func (System) VisibleMountPointsFor(ctx context.Context, device string) ([]strin
 		return nil, err
 	}
 	return VisibleMountPointsFor(entries, major, minor), nil
+}
+
+// PropagationOf reads the mount table and reports how this device's mount at
+// mountPoint propagates, and which mount instance it is.
+//
+// "Propagates" means shared: the mount belongs to a peer group and its events
+// reach the other members. A private mount is invisible outside the namespace
+// that made it, and an unbindable one cannot be handed over at all. A mount
+// that is only a slave RECEIVES events and does not send them, so it does not
+// carry a handoff either — which is why the answer is not "has any optional
+// field".
+//
+// The VISIBLE mount at the path is the one asked about, and it must be this
+// device's. A path where something else is on top is ErrNotVisibleThere rather
+// than an answer about that other thing.
+func (System) PropagationOf(ctx context.Context, device, mountPoint string) (uint32, bool, string, error) {
+	entries, major, minor, err := readFor(ctx, device)
+	if err != nil {
+		return 0, false, "", err
+	}
+
+	entry, ok := EntryAt(entries, mountPoint)
+	if !ok {
+		return 0, false, "", &MountPointError{MountPoint: mountPoint, Err: ErrNotMounted}
+	}
+	if entry.Major != major || entry.Minor != minor {
+		return 0, false, "", &MountPointError{MountPoint: mountPoint, Err: ErrNotVisibleThere}
+	}
+	return entry.ID, entry.Propagation.Shared, entry.Propagation.String(), nil
 }
 
 // readFor resolves a device to its number and reads the table, which is what
