@@ -136,11 +136,24 @@ func (p *Provider) Posture() Posture {
 		})
 	}
 
-	posture.Guards = append(posture.Guards, GuardStatus{
-		Name:   "mount propagation",
-		Active: p.mountPropagation == MountPropagationShared,
-		Detail: propagationDetail(p.mountPropagation),
-	})
+	posture.Guards = append(posture.Guards,
+		GuardStatus{
+			Name:   "mount propagation",
+			Active: p.mountPropagation == MountPropagationShared,
+			Detail: propagationDetail(p.mountPropagation),
+		},
+		// The orphan inspection is always available and never acts, so it is
+		// reported as what it is rather than as on or off. Saying "checked"
+		// would imply something watches continuously — it runs when a component
+		// calls it — and omitting it would leave an operator to discover by
+		// reading the code that nothing cleans up an abandoned mapping.
+		GuardStatus{
+			Name:   "orphaned dm-crypt mappings",
+			Active: false,
+			Detail: "REPORTED, NEVER REMOVED — InspectMappings names what this provider owns and " +
+				"cannot account for; nothing tears one down, because the fact that would make that safe does not exist yet (issue #41)",
+		},
+	)
 	return posture
 }
 

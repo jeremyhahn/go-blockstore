@@ -56,6 +56,7 @@ type Provider struct {
 	mounter            Mounter
 	mountTable         MountTable
 	mountPropagation   MountPropagationPolicy
+	bootID             func() (string, error)
 
 	// preflightChecked is the capabilities the startup checks covered for this
 	// configuration, kept so Posture can name them rather than reporting that
@@ -157,6 +158,11 @@ type Options struct {
 	// provider can learn that a private mount is a failure rather than the
 	// ordinary state of a mount on a host.
 	MountPropagation MountPropagationPolicy
+
+	// bootID reads this boot's identifier. It is unexported, like luks, because
+	// it is not a seam a caller has any reason to replace — only a test, which
+	// needs a boot that can be made to end.
+	bootID func() (string, error)
 
 	// MountTable answers what is mounted. It defaults to reading
 	// /proc/self/mountinfo; tests substitute a fake.
@@ -349,6 +355,11 @@ func New(opts Options) (*Provider, error) {
 	// configuration wrong should hear about the configuration, not about the
 	// container's capabilities. See runPreflight for why it is here at all
 	// rather than at the first privileged operation.
+	bootID := opts.bootID
+	if bootID == nil {
+		bootID = readBootID
+	}
+
 	// A provider told to require propagation, over a mount table that cannot
 	// report it, is a configuration that cannot work — and discovering it after
 	// the first mount is worse than useless: the mount has already happened,
@@ -385,6 +396,7 @@ func New(opts Options) (*Provider, error) {
 		mountTable:         mountTable,
 		mountPropagation:   opts.MountPropagation,
 		preflightChecked:   checked,
+		bootID:             bootID,
 		blockDevices:       blockDevices,
 		luks:               luks,
 	}, nil
@@ -1181,6 +1193,18 @@ func (p *Provider) unlockForAttach(ctx context.Context, volID string, lv lvInfo)
 	if err != nil {
 		return "", err
 	}
+	// The record is refreshed whether the mapping is opened here or ADOPTED
+	// already open. Adopting one and leaving a stale record behind hands a live
+	// mapping to a workload while the volume still says it was unlocked on a
+	// boot that ended — and the reaper, reading that record, would close it.
+	// The attach is what makes the mapping live, so the attach is what has to
+	// say so.
+	//
+	// It is best effort — see recordMappingOwner for why a failure here must
+	// not fail the attach, and why the cost is bounded to a mapping that has to
+	// be cleaned up by hand rather than one removed by mistake.
+	p.recordMappingOwner(ctx, volID, lv)
+
 	if !open {
 		if err := p.luksOpen(ctx, volID, p.lvPath(volID)); err != nil {
 			return "", err
@@ -1339,7 +1363,29 @@ func (p *Provider) closeMapping(ctx context.Context, volID, fsType string) error
 	if !open {
 		return nil
 	}
-	return p.luksClose(ctx, volID)
+	if err := p.luksClose(ctx, volID); err != nil {
+		return err
+	}
+
+	// AFTER the mapping is gone, mirroring the write. Between the close and
+	// this, the volume carries a record for a mapping that no longer exists,
+	// which the reaper reads as nothing to do; the reverse order would leave a
+	// window where a live mapping has no record and is unattributable.
+	//
+	// A failure to clear it does not fail the close: the mapping — the thing
+	// holding decrypted data — is gone, and a record with nothing behind it is
+	// inert. Reporting the close as failed would invite a caller to retry a
+	// teardown that already happened.
+	lvs, listErr := p.listLVs(ctx)
+	if listErr != nil {
+		return nil
+	}
+	if lv, found := lookupLV(lvs, volID); found {
+		//nolint:errcheck // the mapping is gone, which is what mattered; a stale
+		// record with nothing behind it is inert and read as nothing to do.
+		_ = p.clearMappingOwner(ctx, volID, lv)
+	}
+	return nil
 }
 
 // Mount mounts an attached volume at target.

@@ -113,3 +113,22 @@ func TestUncheckedIsTheActionablePart(t *testing.T) {
 		t.Error("the disabled guard is not in Unchecked()")
 	}
 }
+
+// TestPostureNamesTheOrphanInspection covers the guard that never acts.
+//
+// Reporting it as "checked" would imply something watches continuously, and
+// omitting it would leave an operator to discover by reading the code that
+// nothing cleans up an abandoned mapping. It is named, and the line says which
+// of those it is.
+func TestPostureNamesTheOrphanInspection(t *testing.T) {
+	rendered := newTestProvider(t, newFakeRunner()).Posture().String()
+
+	if !strings.Contains(rendered, "orphaned dm-crypt mappings") {
+		t.Errorf("the posture does not mention the orphan inspection:\n%s", rendered)
+	}
+	for _, want := range []string{"REPORTED, NEVER REMOVED", "#41"} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("the posture does not say %q:\n%s", want, rendered)
+		}
+	}
+}

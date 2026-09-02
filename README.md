@@ -310,6 +310,42 @@ A guard that is off appears in that list rather than being omitted from it,
 which is the difference between a list an operator can act on and one they
 cannot tell from complete.
 
+### The mapping nobody is left to tear down
+
+An init container attaches and mounts for a pod, then exits. Teardown has no
+owner in that shape, and what is left behind is a **live dm-crypt mapping
+holding decrypted data**, outliving everything that knew about it and reported
+by nothing. That is a security incident rather than untidiness, and it must not
+be discovered by accident.
+
+`InspectMappings` finds them and says what each one is. **It removes nothing.**
+
+The hard part is proving a mapping is **ours**. A name is not evidence — a
+mapping called `bs-vg0_data` is indistinguishable from foreign state that
+happens to share the name, and trusting one is how a cleanup destroys what it
+did not create. So this never enumerates device-mapper at all. It walks the
+volumes in its **own volume group**, asks whether a mapping exists under the
+name it would itself have chosen, and requires that mapping's backing device to
+be **that very volume**. Two independent facts that have to agree, both from
+mechanisms that already refuse rather than guess.
+
+Each mapping is then classified from a record written on the volume **before**
+the mapping was created — the node and the boot that unlocked it:
+
+| verdict | meaning |
+|---|---|
+| live | this node, this boot — something may be using it right now |
+| another node's | shared storage; that node's workload is using it |
+| orphaned | this node, on a boot that has ended |
+| unattributable | no record, an unreadable one, or a mapping over the wrong device |
+
+**Nothing acts on these.** Removing a mapping safely needs a fact this provider
+does not have — something that says the attachment's owner is gone — and the
+boot ID is not that fact: a device-mapper mapping does not survive a reboot, so
+the orphaned verdict cannot see the case that motivates it, an owner that exits
+while the host stays up. Issue #41 is where a liveness owner is decided. Until
+then this is a report, which is the half that works.
+
 ### What crosses the boundary
 
 Only the mount. Not the key — not by environment variable, not by a file in a

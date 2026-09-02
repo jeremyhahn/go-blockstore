@@ -2553,3 +2553,107 @@ func TestIntegrationMountPropagationGuard(t *testing.T) {
 		}
 	})
 }
+
+// TestIntegrationOrphanReaper drives the inspection against a real LUKS
+// container and a real device-mapper mapping, which is the only place the
+// identity proof can be checked: it reads /dev and /sys, and the mapping it
+// judges was made by a real unlock.
+//
+// The boot that "ended" is supplied rather than waited for — a test cannot
+// reboot the host — but everything else is real: a real volume, a real mapping,
+// and a real record written on it before the mapping existed.
+//
+// Nothing here removes anything, because the code no longer can. What is
+// verified is that each verdict is reached correctly against real state, and
+// that every one of them leaves the mapping exactly where it was.
+func TestIntegrationOrphanReaper(t *testing.T) {
+	vg := testVG(t)
+	ctx := context.Background()
+
+	const priorBoot = "00000000-0000-0000-0000-0000deadbeef"
+	base := Options{
+		VolumeGroup: vg,
+		NodeID:      "test-node",
+		Encrypted:   true,
+		KeyProvider: mustStaticKeyIT(t, "correct-horse-battery-staple"),
+	}
+
+	live, err := New(base)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	vol, err := live.Provision(ctx, common.VolumeSpec{Name: "secrets", SizeBytes: 64 << 20, FSType: "ext4"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { _ = live.Delete(ctx, vol.ID) })
+
+	info, err := live.Attach(ctx, vol.ID, "test-node")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	t.Cleanup(func() { _ = live.Detach(ctx, vol.ID, "test-node") })
+	if !strings.HasPrefix(info.DevicePath, "/dev/mapper/") {
+		t.Fatalf("DevicePath = %q, want a plaintext mapping", info.DevicePath)
+	}
+
+	inspect := func(t *testing.T, p *Provider) MappingFinding {
+		t.Helper()
+		findings, err := p.InspectMappings(ctx)
+		if err != nil {
+			t.Fatalf("InspectMappings: %v", err)
+		}
+		return onlyFinding(t, findings)
+	}
+
+	// The attach wrote the record before it created the mapping, which is what
+	// makes any verdict possible at all.
+	t.Run("this boot's mapping is live", func(t *testing.T) {
+		if v := inspect(t, live).Verdict; v != VerdictLive {
+			t.Fatalf("verdict = %q, want %q", v, VerdictLive)
+		}
+	})
+
+	t.Run("another node sees it as that node's, not as an orphan", func(t *testing.T) {
+		// Same volume, same record, a provider that believes it is a different
+		// node — the shared-storage case. Keying on the boot alone would call
+		// this orphaned, because another node's boot never matches this one's.
+		elsewhere := base
+		elsewhere.NodeID = "some-other-node"
+		elsewhere.bootID = func() (string, error) { return priorBoot, nil }
+		p, err := New(elsewhere)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if v := inspect(t, p).Verdict; v != VerdictForeignNode {
+			t.Fatalf("verdict = %q, want %q", v, VerdictForeignNode)
+		}
+	})
+
+	t.Run("a mapping from an ended boot is reported, and left alone", func(t *testing.T) {
+		rebooted := base
+		rebooted.bootID = func() (string, error) { return priorBoot, nil }
+		p, err := New(rebooted)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if v := inspect(t, p).Verdict; v != VerdictOrphaned {
+			t.Fatalf("verdict = %q, want %q", v, VerdictOrphaned)
+		}
+	})
+
+	// Whatever was concluded, the real mapping is still there. This is the
+	// property that makes the whole thing safe to run anywhere.
+	if _, err := os.Stat(info.DevicePath); err != nil {
+		t.Errorf("the inspection removed a live mapping: %v", err)
+	}
+}
+
+func onlyFinding(t *testing.T, findings []MappingFinding) MappingFinding {
+	t.Helper()
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want one: %+v", len(findings), findings)
+	}
+	return findings[0]
+}
