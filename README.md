@@ -358,9 +358,11 @@ filesystem, so nothing downstream can notice.
 So the provider refuses it in two ways, and the second has a reason worth
 reading before changing it:
 
-- **The key must not be inside the volume.** Checked against every path where
-  the volume is already mounted, on attach and on every mount — so mounting the
-  same volume somewhere else cannot republish the key at a new path.
+- **The key must not be inside ANY volume this provider manages.** `luks_key_file`
+  is provider-global, so a key stored inside volume A is readable by whoever
+  consumes A — including while this provider is handing over volume B. Checked
+  against every path where any of its volumes is mounted, on attach and on every
+  mount, so mounting one somewhere else cannot republish the key at a new path.
 - **The key must not be under a path this provider mounts on.** Not because
   mounting publishes that file — it does not, it **hides** it — but because
   after the mount the configured path *means something else*, and which

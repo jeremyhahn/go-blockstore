@@ -340,3 +340,97 @@ func TestAKeyFileUnderTheMountPointIsRefused(t *testing.T) {
 		t.Errorf("mounted %v despite refusing", got)
 	}
 }
+
+// TestAKeyInsideAnotherVolumeIsRefused covers the exposure that survives a
+// check scoped to the volume being operated on.
+//
+// luks_key_file is PROVIDER-GLOBAL: one setting serves the whole volume group.
+// A key stored inside volume A is readable by whoever consumes A, and that
+// stays true while this provider attaches or mounts volume B — B's own devices
+// are innocent, so a check that looks only at them hands B over while A's
+// workload reads the credential.
+func TestAKeyInsideAnotherVolumeIsRefused(t *testing.T) {
+	mountOfA := t.TempDir()
+	keyFile := filepath.Join(mountOfA, "shared.key")
+	if err := os.WriteFile(keyFile, []byte("passphrase"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	runner := newFakeRunner().
+		withLVs(
+			lvFixture{Name: "a", SizeBytes: gib, Active: true},
+			lvFixture{Name: "b", SizeBytes: gib, Active: true},
+		).
+		withBlkid(map[string]string{"/dev/vg0/a": "ext4", "/dev/vg0/b": "ext4"}).
+		// Volume A is mounted, and the key lives inside it. Volume B is the one
+		// being handed over.
+		withMounts(map[string][]string{"/dev/vg0/a": {mountOfA}})
+	p := keyed(t, runner, keyFile)
+
+	err := p.Mount(context.Background(), "b", t.TempDir(), common.MountOptions{})
+	if !errors.Is(err, ErrKeyFileInsideVolume) {
+		t.Fatalf("Mount of B = %v, want the key inside A refused", err)
+	}
+	if !strings.Contains(err.Error(), "volume a") {
+		t.Errorf("the refusal does not name which volume holds the key: %v", err)
+	}
+	if got := runner.mountCalls(); len(got) != 0 {
+		t.Errorf("mounted %v despite refusing", got)
+	}
+}
+
+// TestAttachRefusesAKeyInsideAnotherVolume is the cross-volume refusal on the
+// ATTACH path, which the Mount test above does not reach.
+//
+// Attach is a different sequence, not a second caller of the same one: it takes
+// the volume lock, ACTIVATES the volume, unlocks it, and rolls the activation
+// back when anything downstream fails. The containment check sits inside
+// unlockForAttach specifically because a volume whose mapping is already open
+// never re-reads the key — the exposure is in the handover, not in the unlock —
+// and that placement was got wrong once already. A reordering that moved the
+// check after the unlock, or dropped it, would restore a fail-open credential
+// exposure while the Mount test stayed green.
+//
+// Volume B is INACTIVE in the fixture so the activation is newly performed and
+// the rollback is a real one. A test with B already active would assert the
+// deactivation never happens, which is the branch that skips the rollback
+// because the activation belongs to whoever attached it first.
+func TestAttachRefusesAKeyInsideAnotherVolume(t *testing.T) {
+	mountOfA := t.TempDir()
+	keyFile := filepath.Join(mountOfA, "shared.key")
+	if err := os.WriteFile(keyFile, []byte("passphrase"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	runner := newFakeRunner().
+		withLVs(
+			lvFixture{Name: "a", SizeBytes: gib, Active: true},
+			lvFixture{Name: "b", SizeBytes: gib, Active: false},
+		).
+		withBlkid(map[string]string{"/dev/vg0/a": "ext4", "/dev/vg0/b": "crypto_LUKS"}).
+		withMounts(map[string][]string{"/dev/vg0/a": {mountOfA}})
+	p := keyed(t, runner, keyFile)
+
+	_, err := p.Attach(context.Background(), "b", "node-a")
+	if !errors.Is(err, ErrKeyFileInsideVolume) {
+		t.Fatalf("Attach of B = %v, want the key inside A refused", err)
+	}
+	if !strings.Contains(err.Error(), "volume a") {
+		t.Errorf("the refusal does not name which volume holds the key: %v", err)
+	}
+
+	// The credential must not have been read, and B must not have been opened.
+	// Refusing after the container is unlocked would hand back nothing while
+	// leaving the plaintext mapping in place for anyone who looks.
+	assertNoLine(t, runner, "cryptsetup open /dev/vg0/b bs-vg0_b")
+	if _, opened := runner.find("cryptsetup"); opened {
+		t.Errorf("B's container was opened despite the refusal:\n  %s",
+			strings.Join(runner.lines(), "\n  "))
+	}
+
+	// And the activation this Attach performed is rolled back. A volume left
+	// active after an error the caller saw as a failure is state nobody knows
+	// to clean up.
+	assertLine(t, runner, "lvchange --activate y --yes vg0/b")
+	assertLine(t, runner, "lvchange --activate n --yes vg0/b")
+}

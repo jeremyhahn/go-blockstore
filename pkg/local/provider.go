@@ -1160,7 +1160,7 @@ func (p *Provider) Attach(ctx context.Context, volID string, node common.NodeID)
 		return common.AttachInfo{}, activateErr
 	}
 
-	device, err := p.unlockForAttach(ctx, volID, lv)
+	device, err := p.unlockForAttach(ctx, volID, lv, lvs)
 	if err != nil {
 		// A failed Attach leaves nothing behind. Unlocking can fail after
 		// activation succeeded — a wrong key, a device-mapper that will not
@@ -1186,18 +1186,21 @@ func (p *Provider) Attach(ctx context.Context, volID string, node common.NodeID)
 // the volume is a container by probing it, so the repair costs nothing here and
 // has nowhere else to live. A fleet provisioned before the tag existed heals
 // itself one attach at a time rather than needing a migration pass.
-func (p *Provider) unlockForAttach(ctx context.Context, volID string, lv lvInfo) (string, error) {
+func (p *Provider) unlockForAttach(ctx context.Context, volID string, lv lvInfo, lvs []lvInfo) (string, error) {
 	// Before anything is handed back. If the key file lives inside a path where
-	// this volume is already mounted, attaching publishes the volume's own
-	// unlock credential to whoever consumes that mount — the same exposure as
-	// mounting over the key, arriving from the other direction.
+	// ANY of this provider's volumes is mounted, attaching publishes the
+	// group's unlock credential to whoever consumes that mount — the same
+	// exposure as mounting over the key, arriving from the other direction.
+	// Any volume, not just this one: luks_key_file is provider-global, so the
+	// volume being handed over can be entirely innocent while the key sits
+	// inside a different one somebody already mounted.
 	//
 	// It is HERE rather than where the key is read, because a volume whose
 	// mapping is already open never reads the key again: the exposure is in
 	// handing the volume over, not in the unlock. An integration test against a
 	// real mounted volume is what found that; the check read as working while
 	// sitting on a path the case never took.
-	if err := p.checkKeyFileOutsideVolume(ctx, volID); err != nil {
+	if err := p.checkKeyFileOutsideOurVolumes(ctx, lvs); err != nil {
 		return "", err
 	}
 
@@ -1494,7 +1497,7 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 	// genuinely sitting inside the volume's filesystem. Asked on every Mount
 	// rather than only the first, so mounting the same volume elsewhere cannot
 	// republish it.
-	if err := p.checkKeyFileOutsideVolume(ctx, volID); err != nil {
+	if err := p.checkKeyFileOutsideOurVolumes(ctx, lvs); err != nil {
 		return err
 	}
 

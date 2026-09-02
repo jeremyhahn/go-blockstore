@@ -157,45 +157,61 @@ func (p *Provider) checkKeyFileOutside(target, why string) error {
 	return nil
 }
 
-// checkKeyFileOutsideVolume refuses a key file that lives inside a path where
-// this volume is currently mounted.
+// checkKeyFileOutsideOurVolumes refuses a key file that lives inside a path
+// where ANY volume this provider manages is mounted.
+//
+// Every volume, not just the one being operated on, because the key file is
+// PROVIDER-GLOBAL: one luks_key_file serves the whole volume group. A key
+// stored inside volume A is readable by whoever consumes A, and that is true
+// while this provider is attaching volume B — B's own devices are innocent and
+// checking only them hands B over while A's workload reads the credential.
 //
 // It is the Mount check from the other side. Mount refuses a target that would
-// contain the key; this refuses a key that is already inside a target — the
+// come to contain the key; this refuses a key already inside a volume — the
 // order a deployment reaches when the volume is mounted first and the key file
-// is written into it afterwards, which is exactly what somebody does when they
-// think of the shared volume as a convenient place to keep it.
+// written into it afterwards, which is what somebody does when the shared
+// volume looks like a convenient place to keep it.
 //
 // A mount table that cannot be read is a refusal, not a pass. The question is
-// whether the credential is exposed, and an unanswerable question about a
+// whether a credential is exposed, and an unanswerable question about a
 // credential is answered no.
-func (p *Provider) checkKeyFileOutsideVolume(ctx context.Context, volID string) error {
+// The caller passes the volume list it already holds. Both call sites — Mount
+// and the attach path — have just read it, and re-reading would add an LVM exec
+// to every one of those operations for nothing. What remains is /proc reads,
+// which touch neither LVM nor udev.
+func (p *Provider) checkKeyFileOutsideOurVolumes(ctx context.Context, lvs []lvInfo) error {
 	if p.keyFile == "" {
 		return nil
 	}
 
-	// BOTH devices, because which one carries the filesystem depends on whether
-	// the volume is encrypted: a plaintext volume is mounted from the logical
-	// volume, and an encrypted one from the plaintext MAPPING over it. Looking
-	// only at the logical volume finds no mounts for exactly the volumes this
-	// guard exists to protect — measured, by an integration test against a real
-	// encrypted volume that the check read as passing.
-	for _, device := range []string{p.lvPath(volID), p.cryptPath(volID)} {
-		mounts, err := p.mountpointsFor(ctx, device)
-		if err != nil {
-			// A device that is not there has no mounts to be inside of, which is
-			// the ordinary case for whichever of the two this volume is not
-			// using. Anything else is a table this provider could not read.
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return fmt.Errorf("%w: checking whether %s is inside %q's mounts: %w",
-				ErrKeyFileUnresolvable, SettingLUKSKeyFile, volID, err)
+	for i := range lvs {
+		if lvs[i].isSnapshot() {
+			continue
 		}
+		// BOTH devices, because which one carries the filesystem depends on
+		// whether the volume is encrypted: a plaintext volume is mounted from
+		// the logical volume, and an encrypted one from the plaintext MAPPING
+		// over it. Looking only at the logical volume finds no mounts for
+		// exactly the volumes this guard protects — measured, by an integration
+		// test against a real encrypted volume that the check read as passing.
+		for _, device := range []string{p.lvPath(lvs[i].Name), p.cryptPath(lvs[i].Name)} {
+			mounts, err := p.mountpointsFor(ctx, device)
+			if err != nil {
+				// A device that is not there has no mounts to be inside of,
+				// which is the ordinary case for whichever of the two a volume
+				// is not using. Anything else is a table this provider could
+				// not read.
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				return fmt.Errorf("%w: checking whether %s is inside %q's mounts: %w",
+					ErrKeyFileUnresolvable, SettingLUKSKeyFile, lvs[i].Name, err)
+			}
 
-		for _, target := range mounts {
-			if err := p.checkKeyFileOutside(target, "a path this volume is mounted at"); err != nil {
-				return err
+			for _, target := range mounts {
+				if err := p.checkKeyFileOutside(target, "a path volume "+lvs[i].Name+" is mounted at"); err != nil {
+					return err
+				}
 			}
 		}
 	}
