@@ -49,6 +49,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jeremyhahn/go-enclave"
@@ -76,13 +77,28 @@ const backingSizeMB = 512
 // pkg/drbd), e.g. `sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 make integration-test-local`.
 const envDestructive = "GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE"
 
+// vgSeq numbers the volume groups within one run so each test gets its own.
+var vgSeq atomic.Uint64
+
 // testVG builds a throwaway volume group on a loopback file and returns its
 // name, tearing the whole thing down when the test ends.
+//
+// THE NAME IS UNIQUE PER TEST, and that is load-bearing rather than tidy. Every
+// test in this file calls this, and the name used to be derived from the pid
+// alone — so all 28 of them shared one volume group name. One test whose
+// teardown could not remove its volume group (a LUKS mapping still holding a
+// logical volume open, which is a standing flake in the close path) left that
+// name in place, and every later test in the same run died in vgcreate with
+// "already exists in filesystem". A run with one real failure reported
+// seventeen, and the first one was the only one worth reading.
+//
+// The pid still leads the name so that debris is attributable to a run, and the
+// sequence number makes one test's wreckage that test's own problem.
 func testVG(t *testing.T) string {
 	t.Helper()
 	requireDestructiveEnv(t)
 
-	vg := fmt.Sprintf("bsit%d", os.Getpid())
+	vg := fmt.Sprintf("bsit%dx%d", os.Getpid(), vgSeq.Add(1))
 	backing := filepath.Join(t.TempDir(), "backing.img")
 
 	run(t, "truncate", "-s", fmt.Sprintf("%dM", backingSizeMB), backing)
@@ -99,9 +115,56 @@ func testVG(t *testing.T) string {
 
 	run(t, "pvcreate", "--force", "--yes", loop)
 	run(t, "vgcreate", vg, loop)
+
+	// ORDER MATTERS, and t.Cleanup is LIFO: the LAST registered runs FIRST.
+	// vgremove cannot remove a volume group whose logical volume a dm-crypt
+	// mapping still holds open — which is exactly the state a failed test
+	// leaves — so the mapping close is registered second and therefore runs
+	// first. Written the other way round it still removes the mapping, just
+	// after the vgremove that needed it gone, and the volume group survives the
+	// run. Measured: with the registrations swapped, a deliberately abandoned
+	// mapping was cleaned up and its volume group still leaked.
 	t.Cleanup(func() { _ = exec.Command("vgremove", "--force", vg).Run() })
+	t.Cleanup(func() { closeMappingsOf(t, vg) })
 
 	return vg
+}
+
+// closeMappingsOf removes the plaintext mappings belonging to one volume group.
+//
+// Scoped by CONSTRUCTION rather than by pattern-matching something that looks
+// like ours: the provider names a mapping "bs-<vg>_<lv>", the volume group name
+// is unique to this test, so everything under that prefix was created by this
+// test and nothing else can be. go-luks2 #96 refuses cleanup that infers
+// ownership from a name; this infers nothing, because the namespace is one this
+// test made up moments ago.
+//
+// It runs BEFORE vgremove and it is best effort. A mapping that will not close
+// is reported rather than retried into a hang — the run has already failed by
+// the time this matters, and what an operator needs then is to know which
+// mapping is stuck.
+func closeMappingsOf(t *testing.T, vg string) {
+	t.Helper()
+
+	out, err := exec.Command("dmsetup", "ls").Output()
+	if err != nil {
+		t.Logf("listing device-mapper state to clean up %s: %v", vg, err)
+		return
+	}
+
+	prefix := mappingPrefix + vg + "_"
+	for _, line := range strings.Split(string(out), "\n") {
+		name := strings.Fields(line)
+		if len(name) == 0 || !strings.HasPrefix(name[0], prefix) {
+			continue
+		}
+		if err := exec.Command("dmsetup", "remove", name[0]).Run(); err != nil {
+			t.Logf("LEAKED: mapping %s could not be removed (%v); "+
+				"it holds a logical volume open and will block this volume group's removal", name[0], err)
+			continue
+		}
+		t.Logf("cleaned up mapping %s, which the test left behind", name[0])
+	}
 }
 
 // mustStaticKeyIT builds a passphrase provider for the integration suite. A

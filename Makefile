@@ -240,6 +240,54 @@ integration-test-local:
 	$(GO) test -tags=local_integration -count=1 -timeout=$(TEST_TIMEOUT) -run Integration ./pkg/local/
 	@echo "$(GREEN)✓ local provider real suite complete$(RESET)"
 
+.PHONY: integration-clean-local
+## integration-clean-local: Remove state a KILLED local integration run left behind
+# The suite cleans up after itself on every exit path Go can see — pass, fail
+# and panic all run t.Cleanup. This is the backstop for the one it cannot: a
+# SIGKILL, or a container torn down mid-run, where no deferred code executes at
+# all and a live dm-crypt mapping is simply abandoned.
+#
+# It is SCOPED, and the scoping is the whole point. It touches only names this
+# suite generates — mappings `bs-bsit<pid>x<n>_*` and volume groups
+# `bsit<pid>x<n>` — and never `dmsetup remove_all` or `losetup -D`, which is how
+# a cleanup destroys a developer's own encrypted root. go-luks2 PR #85 removed
+# exactly those two commands from that repo after an unrelated host was found
+# with test litter and a LIVE system volume in the same `dmsetup ls`.
+#
+# The LOOP DEVICES go too, and they are the reason this matters more than tidiness.
+# A killed run skips the detach as well as the close, and loop devices are a
+# finite pool: enough killed runs and the suite cannot allocate one at all, at
+# which point every branch's verification fails for a reason that looks nothing
+# like its cause. They are found through the volume group rather than by
+# pattern — `pvs --select vg_name=<vg>` names the device backing a volume group
+# this suite created — and captured BEFORE the vgremove that would otherwise
+# make them unfindable. Most of the time the kernel releases the loop device on
+# its own when the last thing holding it goes — the suite attaches with
+# autoclear — so the usual outcome is a line saying it was already released,
+# which is worth printing rather than a warning that reads like a failure.
+#
+# It prints what it would remove before removing it, so an operator sees whether
+# the pattern matched something it should not have.
+integration-clean-local:
+	@echo "$(CYAN)$(BOLD)→ Removing state a killed local integration run left behind...$(RESET)"
+	@mappings=$$(dmsetup ls 2>/dev/null | awk '$$1 ~ /^bs-bsit[0-9]+x[0-9]+_/ {print $$1}'); \
+	vgs=$$(vgs --noheadings -o vg_name 2>/dev/null | tr -d ' ' | grep -E '^bsit[0-9]+x[0-9]+$$' || true); \
+	loops=""; \
+	for v in $$vgs; do \
+		loops="$$loops $$(pvs --noheadings -o pv_name --select vg_name=$$v 2>/dev/null | tr -d ' ')"; \
+	done; \
+	if [ -z "$$mappings" ] && [ -z "$$vgs" ] && [ -z "$$(echo $$loops)" ]; then \
+		echo "  nothing to clean"; \
+	else \
+		for m in $$mappings; do echo "  mapping $$m"; dmsetup remove "$$m" || echo "$(YELLOW)    still busy: $$m$(RESET)"; done; \
+		for v in $$vgs; do echo "  volume group $$v"; vgremove --force "$$v" >/dev/null || echo "$(YELLOW)    could not remove: $$v$(RESET)"; done; \
+		for l in $$loops; do \
+			if ! losetup "$$l" >/dev/null 2>&1; then echo "  loop device $$l (already released with its volume group)"; continue; fi; \
+			echo "  loop device $$l"; losetup -d "$$l" || echo "$(YELLOW)    could not detach: $$l$(RESET)"; \
+		done; \
+	fi
+	@echo "$(GREEN)✓ scoped cleanup complete$(RESET)"
+
 # The Go toolchain the container suite runs under, read from go.mod so it cannot
 # drift from what this module declares.
 GO_VERSION := $(shell awk '/^go /{print $$2}' go.mod)
