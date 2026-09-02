@@ -17,6 +17,7 @@ package preflight
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -122,6 +123,8 @@ func platformProbes() map[Capability]Probe {
 		CapabilityDeviceMapper:  deviceMapperProbe(liveDeviceMapperSteps()),
 		CapabilityMount:         mountProbe(liveMountSteps()),
 		CapabilityKernelKeyring: keyringProbe(luks2.CheckKeyringAvailable),
+		CapabilityNetAdmin:      netAdminProbe(liveNetAdminSteps()),
+		CapabilityDRBDControl:   drbdControlProbe(liveDRBDControlSteps()),
 	}
 }
 
@@ -649,3 +652,407 @@ func causeForErrno(err error, table map[unix.Errno]Cause) Cause {
 	}
 	return CauseIndeterminate
 }
+
+// -----------------------------------------------------------------------------
+// CAP_NET_ADMIN, and the DRBD control interface
+// -----------------------------------------------------------------------------
+
+// netAdminSteps is the CAP_NET_ADMIN probe broken into its two real operations:
+// a privileged read, and an UNPRIVILEGED read on the same syscall that says
+// whether the path is reachable at all.
+type netAdminSteps struct {
+	// privileged issues ETHTOOL_GWOL, which the kernel gates on CAP_NET_ADMIN.
+	privileged func(ifname string) error
+
+	// witness issues ETHTOOL_GDRVINFO, which the kernel's ethtool allow-list
+	// permits WITHOUT the capability. It answers one question: is this ioctl
+	// path reachable? See netAdminProbe.
+	witness func(ifname string) error
+}
+
+// drbdControlSteps is the DRBD control-interface probe.
+type drbdControlSteps struct {
+	// family resolves a generic-netlink family by name, the way drbdsetup does
+	// before it can talk to the module at all.
+	family func(name string) error
+}
+
+// probeInterface is the network interface the CAP_NET_ADMIN probe addresses.
+//
+// Loopback, and the choice is load-bearing rather than arbitrary. The kernel
+// looks the interface UP BEFORE it checks the capability, so an interface that
+// does not exist answers ENODEV and the probe learns nothing — measured: on a
+// host with no eth0, ETHTOOL_GWOL(eth0) returns ENODEV while ETHTOOL_GWOL(lo)
+// returns EPERM in the same process. lo exists in every network namespace,
+// including an empty one, so it is the only name that cannot produce that
+// false reading.
+const probeInterface = "lo"
+
+// drbdGenlFamily is the generic-netlink family the drbd kernel module registers.
+const drbdGenlFamily = "drbd"
+
+// netAdminProbe builds the CAP_NET_ADMIN probe over a set of steps.
+//
+// ETHTOOL_GWOL reports an interface's wake-on-LAN settings. It is READ-ONLY —
+// it configures nothing and leaves nothing behind — and the kernel refuses it
+// with EPERM to a caller without CAP_NET_ADMIN, before the driver is reached.
+// So loopback, which implements no wake-on-LAN, answers:
+//
+//	EOPNOTSUPP  the driver was reached — the capability is HELD
+//	EPERM       the kernel refused before the driver — the capability, or a
+//	            filter on the syscall
+//
+// The witness resolves that EPERM the same way the mount probe resolves its
+// own: by measuring rather than choosing. ETHTOOL_GDRVINFO is on the kernel's
+// unprivileged ethtool allow-list, so it reaches the driver WITHOUT the
+// capability and answers EOPNOTSUPP on loopback too. If the witness gets that
+// far, the ioctl path is demonstrably live and the EPERM above is the
+// capability and nothing else. If the witness fails as well, the path itself is
+// filtered and the capability is not what an operator should be told to fix.
+func netAdminProbe(steps netAdminSteps) Probe {
+	return func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return &CapabilityError{
+				Capability: CapabilityNetAdmin,
+				Cause:      CauseIndeterminate,
+				Probe:      "starting the CAP_NET_ADMIN probe",
+				Err:        err,
+			}
+		}
+		// Assigned and tested rather than returned directly: classifyNetAdmin
+		// returns a *CapabilityError, and returning a nil one straight into an
+		// error interface makes a non-nil error holding a nil pointer. That
+		// exact trap shipped in this package once already (the keyring probe,
+		// #29) and its own test caught it here again.
+		if failure := classifyNetAdmin(steps.privileged(probeInterface), func() error {
+			return steps.witness(probeInterface)
+		}); failure != nil {
+			return failure
+		}
+		return nil
+	}
+}
+
+// classifyNetAdmin turns the privileged read's answer into a typed finding, or
+// nil when CAP_NET_ADMIN is held.
+func classifyNetAdmin(err error, witness func() error) *CapabilityError {
+	const probe = "issuing the read-only ETHTOOL_GWOL ioctl on " + probeInterface +
+		", which the kernel gates on CAP_NET_ADMIN and which configures nothing"
+
+	// The driver was reached, so the capability check was passed. Loopback
+	// implements no wake-on-LAN, which is why the success case is EOPNOTSUPP
+	// rather than a nil error; a kernel that answered nil would be telling us
+	// the same thing.
+	if err == nil || errors.Is(err, unix.EOPNOTSUPP) {
+		return nil
+	}
+
+	if errors.Is(err, unix.EPERM) {
+		if witness == nil {
+			// No witness means the refusal cannot be attributed, and the two
+			// candidates have opposite fixes. Reported as the ambiguity rather
+			// than resolved by assuming the likelier one.
+			return &CapabilityError{
+				Capability: CapabilityNetAdmin,
+				Cause:      CausePrivilegeOrPolicy,
+				Probe:      probe + ", with no witness available to say whether the ioctl path is reachable",
+				Err:        err,
+			}
+		}
+		if !isEthtoolReachable(witness()) {
+			return &CapabilityError{
+				Capability: CapabilityNetAdmin,
+				Cause:      CauseSyscallBlocked,
+				Probe: probe + ", and an UNPRIVILEGED ethtool read on the same socket was refused too, " +
+					"so the ioctl path itself is filtered rather than the capability being absent",
+				Err: err,
+			}
+		}
+		return &CapabilityError{
+			Capability: CapabilityNetAdmin,
+			Cause:      CausePrivilegeMissing,
+			Probe: probe + ", and an UNPRIVILEGED ethtool read on the same socket succeeded, " +
+				"so the ioctl path is live and the refusal is the capability itself",
+			Err: err,
+		}
+	}
+
+	return &CapabilityError{
+		Capability: CapabilityNetAdmin,
+		Cause:      CauseIndeterminate,
+		Probe:      probe,
+		Err:        err,
+	}
+}
+
+// isEthtoolReachable reports whether the unprivileged witness got as far as the
+// driver.
+//
+// EOPNOTSUPP is the expected answer on loopback and means the whole path —
+// socket, ioctl, ethtool dispatch — worked. A nil error means the same thing on
+// an interface that does implement the call. Anything else, including EPERM
+// from a filter and any failure to create the socket at all, means the path
+// could not be exercised, and the fail-closed reading of that is "cannot
+// attribute the refusal", not "the capability is missing".
+func isEthtoolReachable(err error) bool {
+	return err == nil || errors.Is(err, unix.EOPNOTSUPP)
+}
+
+// drbdControlProbe builds the DRBD control-interface probe.
+//
+// It resolves the drbd generic-netlink family by name, which is the first thing
+// drbdsetup does and the thing that fails when the module is not loaded. It
+// creates nothing: resolving a family is a read of the kernel's own registry.
+func drbdControlProbe(steps drbdControlSteps) Probe {
+	return func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return &CapabilityError{
+				Capability: CapabilityDRBDControl,
+				Cause:      CauseIndeterminate,
+				Probe:      "starting the DRBD control-interface probe",
+				Err:        err,
+			}
+		}
+		// See netAdminProbe: a nil *CapabilityError is not a nil error.
+		if failure := classifyDRBDControl(steps.family(drbdGenlFamily)); failure != nil {
+			return failure
+		}
+		return nil
+	}
+}
+
+// drbdControlCauses maps the errno resolving the family reports onto a cause.
+//
+// ENOENT is the one that matters and it is NOT a privilege problem: the family
+// is absent because the module is not loaded, and no capability grant loads it.
+var drbdControlCauses = map[unix.Errno]Cause{
+	unix.ENOENT:          CauseKernelUnsupported,
+	unix.EPERM:           CauseSyscallBlocked,
+	unix.EACCES:          CauseSyscallBlocked,
+	unix.EAFNOSUPPORT:    CauseKernelUnsupported,
+	unix.EPROTONOSUPPORT: CauseKernelUnsupported,
+}
+
+// classifyDRBDControl turns the family lookup's answer into a typed finding, or
+// nil when the control interface is present.
+func classifyDRBDControl(err error) *CapabilityError {
+	if err == nil {
+		return nil
+	}
+	return &CapabilityError{
+		Capability: CapabilityDRBDControl,
+		Cause:      causeForErrno(err, drbdControlCauses),
+		Probe: "resolving the " + drbdGenlFamily + " generic-netlink family, which is the first thing " +
+			"drbdsetup does and which reads the kernel's own registry without creating anything",
+		Err: err,
+	}
+}
+
+// liveNetAdminSteps talks to the real kernel.
+func liveNetAdminSteps() netAdminSteps {
+	return netAdminSteps{
+		privileged: func(ifname string) error {
+			var wol ethtoolWolInfo
+			wol.cmd = unix.ETHTOOL_GWOL
+			// #nosec G103 -- the kernel's ethtool interface is defined by memory
+			// layout; the struct is stack-allocated here and outlives the call.
+			return ethtoolIoctl(ifname, unsafe.Pointer(&wol))
+		},
+		witness: func(ifname string) error {
+			// x/sys/unix's own helper, which builds the ifreq correctly and is
+			// maintained upstream. Using it here means only ONE hand-rolled
+			// ethtool path exists in this package instead of two.
+			fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = unix.Close(fd) }()
+			_, err = unix.IoctlGetEthtoolDrvinfo(fd, ifname)
+			return err
+		},
+	}
+}
+
+// ethtoolWolInfo is the kernel's struct ethtool_wolinfo, the buffer
+// ETHTOOL_GWOL reports into.
+type ethtoolWolInfo struct {
+	cmd       uint32
+	supported uint32
+	wolopts   uint32
+	sopass    [6]byte
+	_         [2]byte
+}
+
+// ifreqSizes are the kernel's struct ifreq dimensions. struct ifreq is a
+// 16-byte name followed by a 24-byte union, and the WHOLE 40 bytes are what the
+// kernel reads and may copy back.
+const (
+	ifreqUnionBytes = 24
+	ifreqTotalBytes = unix.IFNAMSIZ + ifreqUnionBytes
+)
+
+// ifreqData is struct ifreq for the ioctls whose union carries a POINTER.
+//
+// The layout is copied from x/sys/unix's own unexported ifreqData, padding
+// included, and the padding is the point rather than tidiness: SIOCETHTOOL
+// takes a full 40-byte ifreq and the kernel may copy all 40 back to this
+// address. A struct sized to just the name plus a pointer is 24 bytes on a
+// 64-bit platform, so the copy-back would write 16 bytes past it, over whatever
+// the Go stack has there. Caught in review before it shipped.
+//
+// The pointer is a real unsafe.Pointer field rather than a uintptr for the same
+// reason x/sys does it: casting it into a byte array would lose its
+// pointer-ness and let the collector move the target out from under the kernel.
+type ifreqData struct {
+	name [unix.IFNAMSIZ]byte
+	data unsafe.Pointer
+	_    [ifreqUnionBytes - unix.SizeofPtr]byte
+}
+
+// A build-time assertion that the struct really is the size the kernel expects.
+// A silently short ifreq is exactly the defect this replaced, so the size is
+// checked by the compiler rather than by the next reader.
+var _ [1]struct{} = [unsafe.Sizeof(ifreqData{}) - ifreqTotalBytes + 1]struct{}{}
+
+// ethtoolIoctl issues one ethtool command against an interface.
+func ethtoolIoctl(ifname string, data unsafe.Pointer) error {
+	if len(ifname) >= unix.IFNAMSIZ {
+		return unix.EINVAL
+	}
+
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(fd) }()
+
+	ifr := ifreqData{data: data}
+	copy(ifr.name[:], ifname)
+
+	// #nosec G103 -- ifr is the kernel's struct ifreq at its full size, stack
+	// allocated above and live across the call.
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.SIOCETHTOOL, uintptr(unsafe.Pointer(&ifr))); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// liveDRBDControlSteps talks to the real kernel.
+func liveDRBDControlSteps() drbdControlSteps {
+	return drbdControlSteps{family: resolveGenlFamily}
+}
+
+// Generic-netlink constants. They are part of the kernel's stable uapi and are
+// spelled out because x/sys/unix does not export the control-protocol ones.
+const (
+	genlIDCtrl           = 16 // GENL_ID_CTRL
+	genlCtrlCmdGetFamily = 3  // CTRL_CMD_GETFAMILY
+	genlCtrlAttrName     = 2  // CTRL_ATTR_FAMILY_NAME
+	genlVersion          = 1
+	genlNameSize         = 16 // GENL_NAMSIZ
+	nlmsgError           = 2  // NLMSG_ERROR
+	nlmsgHdrLen          = 16
+	genlHdrLen           = 4
+	nlAttrHdrLen         = 4
+)
+
+// resolveGenlFamily asks the kernel whether a generic-netlink family is
+// registered, by name.
+//
+// Every integer in the message is NATIVE endian, not little endian. Netlink is
+// a kernel-to-userspace interface on the same machine, so the kernel reads and
+// writes these fields in the host's own byte order — and hard-coding little
+// endian would byte-swap the whole request on s390x or ppc64. The failure that
+// produces is the worst shape a guard can have: the lookup fails on a node
+// where the module IS loaded, so a CORRECTLY configured deployment is refused
+// at startup. Caught in review before it shipped; this host is little endian,
+// so no local test would have distinguished the two.
+//
+// It is the same question drbdsetup asks before it can issue a single DRBD
+// command, and it is a pure read: the control family's GETFAMILY is a registry
+// lookup that creates nothing and needs no privilege. A family that is not
+// registered answers ENOENT, which is what an unloaded module looks like.
+func resolveGenlFamily(name string) error {
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_GENERIC)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(fd) }()
+
+	// The kernel's GENL_NAMSIZ. A longer name cannot name a registered family,
+	// and refusing it here keeps the length arithmetic below provably in range
+	// by construction rather than by assertion.
+	if len(name) == 0 || len(name) >= genlNameSize {
+		return unix.EINVAL
+	}
+
+	payload := []byte(name)
+	payload = append(payload, 0)
+	// #nosec G115 -- len(payload) is at most genlNameSize+1, refused above, so
+	// the sum is a small constant and cannot overflow uint16.
+	attrLen := uint16(nlAttrHdrLen + len(payload))
+	for len(payload)%4 != 0 {
+		payload = append(payload, 0)
+	}
+	// #nosec G115 -- same bound: three compile-time constants plus a payload
+	// capped at genlNameSize, so the total is well under uint32.
+	msgLen := uint32(nlmsgHdrLen + genlHdrLen + nlAttrHdrLen + len(payload))
+
+	msg := make([]byte, 0, nlmsgHdrLen+genlHdrLen+nlAttrHdrLen+len(payload))
+	msg = binary.NativeEndian.AppendUint32(msg, msgLen)
+	msg = binary.NativeEndian.AppendUint16(msg, genlIDCtrl)
+	msg = binary.NativeEndian.AppendUint16(msg, unix.NLM_F_REQUEST|unix.NLM_F_ACK)
+	msg = binary.NativeEndian.AppendUint32(msg, 1) // sequence
+	msg = binary.NativeEndian.AppendUint32(msg, 0) // port: kernel assigns
+	msg = append(msg, genlCtrlCmdGetFamily, genlVersion, 0, 0)
+	msg = binary.NativeEndian.AppendUint16(msg, attrLen)
+	msg = binary.NativeEndian.AppendUint16(msg, genlCtrlAttrName)
+	msg = append(msg, payload...)
+
+	if sendErr := unix.Sendto(fd, msg, 0, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); sendErr != nil {
+		return sendErr
+	}
+
+	reply := make([]byte, 8192)
+	n, _, err := unix.Recvfrom(fd, reply, 0)
+	if err != nil {
+		return err
+	}
+	if n < nlmsgHdrLen {
+		return errShortNetlinkReply
+	}
+
+	// An NLMSG_ERROR carries a negative errno; zero is the ACK for success.
+	if binary.NativeEndian.Uint16(reply[4:6]) == nlmsgError {
+		if n < nlmsgHdrLen+4 {
+			return errShortNetlinkReply
+		}
+		// The kernel writes a NEGATIVE errno here, so it is read as a signed
+		// 32-bit quantity and negated back. Zero is the ACK for success.
+		raw := binary.NativeEndian.Uint32(reply[nlmsgHdrLen : nlmsgHdrLen+4])
+		if raw == 0 {
+			return nil
+		}
+		// #nosec G115 -- the kernel writes its errno into this field as a signed
+		// 32-bit value; reinterpreting the same four bytes as int32 is reading
+		// it in the type it was written in, not a narrowing conversion.
+		code := int32(raw)
+		if code > 0 {
+			return errUnexpectedNetlinkError
+		}
+		// #nosec G115 -- code is negative here (the positive case returned
+		// above), so -code is positive and within errno range.
+		return unix.Errno(-code)
+	}
+	return nil
+}
+
+// errShortNetlinkReply reports a netlink reply too short to interpret. It fails
+// closed: a reply that cannot be read is not evidence the family is present.
+var errShortNetlinkReply = errors.New("the kernel's netlink reply was too short to interpret")
+
+// errUnexpectedNetlinkError reports an NLMSG_ERROR carrying a positive value,
+// which the kernel does not produce. It fails closed for the same reason
+// errShortNetlinkReply does: a reply this code cannot interpret is not evidence
+// that the family is present.
+var errUnexpectedNetlinkError = errors.New("the kernel's netlink error carried a value that is not a negative errno")

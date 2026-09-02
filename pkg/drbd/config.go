@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
@@ -74,6 +75,15 @@ const (
 	// what an unwiped delete leaves behind, and what this option does and does
 	// not reach.
 	SettingWipeOnDelete = "wipe_on_delete"
+
+	// SettingPreflight selects which startup privilege checks New performs:
+	// "configured" (the default), "all", or "off".
+	//
+	// It is spelled out in configuration rather than inferred because "off" is
+	// the value that re-enables the silent failure the checks removed — a
+	// provider that constructs happily on a node that cannot bring a resource
+	// up — and a choice with that consequence belongs where a reviewer sees it.
+	SettingPreflight = "preflight"
 )
 
 // Defaults for the optional settings.
@@ -188,6 +198,12 @@ type Config struct {
 	// It defaults to false, matching LVM's own behavior rather than imposing a
 	// full-volume zero-fill on every deletion in every deployment.
 	WipeOnDelete bool
+
+	// Preflight selects which startup privilege checks New performs. It
+	// defaults to PreflightConfigured, which checks exactly the capabilities
+	// this configuration will exercise — a set that is NOT the local
+	// provider's; see requiredCapabilities.
+	Preflight PreflightMode
 }
 
 // ParseConfig validates a settings map and fills in defaults.
@@ -203,6 +219,7 @@ func ParseConfig(settings map[string]string) (Config, error) {
 		SettingMinorBase: {}, SettingPortBase: {}, SettingSnapshotSizePercent: {},
 		SettingReplicationSecretFile: {}, SettingAllowUnauthenticatedPeers: {},
 		SettingWipeOnDelete: {},
+		SettingPreflight:    {},
 	}
 	for k := range settings {
 		if _, ok := known[k]; !ok {
@@ -293,6 +310,15 @@ func ParseConfig(settings map[string]string) (Config, error) {
 	if cfg.AllowUnauthenticatedPeers, err = optionalBool(settings, SettingAllowUnauthenticatedPeers); err != nil {
 		return Config{}, err
 	}
+	if raw, ok := settings[SettingPreflight]; ok && raw != "" {
+		mode, known := preflightModeNames[raw]
+		if !known {
+			return Config{}, fmt.Errorf("%w: %s=%q is not one of %s",
+				common.ErrInvalidArgument, SettingPreflight, raw, strings.Join(preflightModeSpellings(), ", "))
+		}
+		cfg.Preflight = mode
+	}
+
 	if cfg.WipeOnDelete, err = optionalBool(settings, SettingWipeOnDelete); err != nil {
 		return Config{}, err
 	}

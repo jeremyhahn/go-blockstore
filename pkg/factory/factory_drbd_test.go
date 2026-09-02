@@ -41,6 +41,14 @@ func drbdSettings(t *testing.T) map[string]string {
 	// this is the settings map a caller writes, and the test is worth failing
 	// if a key is renamed without the callers being told.
 	return map[string]string{
+		// The startup privilege checks are off because these tests are about
+		// REGISTRATION and the settings-driven path, not about whether this
+		// machine has a drbd kernel module and CAP_NET_ADMIN. The checks that
+		// this disables are exercised on their own in the drbd package's
+		// preflight tests, which assert New refuses exactly when the checker
+		// does.
+		"preflight": "off",
+
 		"volume_group": "vg0",
 		"config_dir":   filepath.Join(dir, "drbd.d"),
 		"state_dir":    filepath.Join(dir, "state"),

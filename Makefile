@@ -302,6 +302,13 @@ GO_VERSION := $(shell awk '/^go /{print $$2}' go.mod)
 # repo's preflight work exists to remove, so the container run is a target
 # rather than a thing to remember.
 #
+# It carries $(TAG_FLAGS), the SAME tags `make test` uses. Without them this
+# target compiles none of the tag-gated packages and reports success anyway —
+# which is the build-tag half of the same trap: a partial-tag run is
+# indistinguishable from a clean one. Measured: the first version of this target
+# ran untagged and never compiled pkg/drbd at all, while printing ok for
+# everything it did compile.
+#
 # The module cache is mounted read-only; nothing is fetched.
 test-container:
 	@echo "$(CYAN)$(BOLD)→ Running the unit suite inside a container...$(RESET)"
@@ -310,7 +317,7 @@ test-container:
 		-w /src --user 0 \
 		-e GOFLAGS=-mod=mod -e GOPATH=/tmp/gopath -e GOMODCACHE=/gomod \
 		-e GOPROXY=off -e GOCACHE=/tmp/gocache \
-		golang:$(GO_VERSION) go test -count=1 -timeout=$(TEST_TIMEOUT) ./...
+		golang:$(GO_VERSION) go test $(TAG_FLAGS) -count=1 -timeout=$(TEST_TIMEOUT) ./...
 	@echo "$(GREEN)✓ Container suite complete$(RESET)"
 
 .PHONY: preflight-matrix

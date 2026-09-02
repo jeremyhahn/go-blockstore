@@ -991,3 +991,359 @@ func requireClassified(t *testing.T, err error) {
 		t.Error("the refusal carries no remedy")
 	}
 }
+
+// -----------------------------------------------------------------------------
+// CAP_NET_ADMIN and the DRBD control interface
+// -----------------------------------------------------------------------------
+
+// TestTheNewProbesReturnATrueNilOnSuccess is a regression test for a trap this
+// package has now hit twice: a probe that returns a *CapabilityError directly
+// hands back a non-nil error holding a nil pointer on the success path, which
+// is neither a pass nor renderable.
+//
+// The Checker has a backstop for it, but a probe called directly does not, and
+// these two were written with the bug. Their own tests found it.
+func TestTheNewProbesReturnATrueNilOnSuccess(t *testing.T) {
+	netAdmin := netAdminProbe(netAdminSteps{
+		privileged: func(string) error { return unix.EOPNOTSUPP },
+		witness:    func(string) error { return unix.EOPNOTSUPP },
+	})
+	if err := netAdmin(context.Background()); err != nil {
+		t.Errorf("the net-admin probe returned %v (%T) on success, want an untyped nil", err, err)
+	}
+
+	drbd := drbdControlProbe(drbdControlSteps{family: func(string) error { return nil }})
+	if err := drbd(context.Background()); err != nil {
+		t.Errorf("the drbd-control probe returned %v (%T) on success, want an untyped nil", err, err)
+	}
+}
+
+// TestClassifyNetAdmin is the three-way split the ethtool witness produces.
+//
+// EPERM is the answer BOTH a missing CAP_NET_ADMIN and a filtered ioctl give,
+// so it is decided by whether an UNPRIVILEGED read on the same path got
+// through — not by picking the likelier cause. Measured 2026-09-02: on
+// loopback the privileged read answers EOPNOTSUPP when the capability is held
+// and EPERM when it is not, while the unprivileged read answers EOPNOTSUPP in
+// both cases because it reaches the driver without the capability.
+func TestClassifyNetAdmin(t *testing.T) {
+	answering := func(err error) func() error { return func() error { return err } }
+
+	cases := map[string]struct {
+		err      error
+		witness  func() error
+		wantPass bool
+		want     Cause
+	}{
+		"the driver was reached, so the capability is held": {
+			unix.EOPNOTSUPP, answering(unix.EOPNOTSUPP), true, "",
+		},
+		"an outright success is also the capability being held": {
+			nil, answering(unix.EOPNOTSUPP), true, "",
+		},
+		"refused, and the unprivileged read got through": {
+			unix.EPERM, answering(unix.EOPNOTSUPP), false, CausePrivilegeMissing,
+		},
+		"refused, and the unprivileged read got through with nil": {
+			unix.EPERM, answering(nil), false, CausePrivilegeMissing,
+		},
+		"refused, and the unprivileged read was refused too": {
+			unix.EPERM, answering(unix.EPERM), false, CauseSyscallBlocked,
+		},
+		"refused, and the socket could not even be created": {
+			unix.EPERM, answering(errors.New("socket: operation not permitted")), false, CauseSyscallBlocked,
+		},
+		"refused, with no witness to attribute it": {
+			unix.EPERM, nil, false, CausePrivilegeOrPolicy,
+		},
+		"an errno neither case explains": {
+			unix.EIO, answering(unix.EOPNOTSUPP), false, CauseIndeterminate,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := classifyNetAdmin(tc.err, tc.witness)
+			if tc.wantPass {
+				if got != nil {
+					t.Fatalf("classifyNetAdmin(%v) = %v, want a pass", tc.err, got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("classifyNetAdmin(%v) reported a pass", tc.err)
+			}
+			if got.Cause != tc.want {
+				t.Errorf("Cause = %q, want %q", got.Cause, tc.want)
+			}
+			if got.Capability != CapabilityNetAdmin {
+				t.Errorf("Capability = %q, want %q", got.Capability, CapabilityNetAdmin)
+			}
+		})
+	}
+}
+
+// TestNetAdminRemedyMatchesTheWitness is the point of the witness: an operator
+// must be told to fix the mechanism that is actually broken.
+func TestNetAdminRemedyMatchesTheWitness(t *testing.T) {
+	missing := classifyNetAdmin(unix.EPERM, func() error { return unix.EOPNOTSUPP })
+	if !strings.Contains(missing.Remedy(), "--cap-add NET_ADMIN") {
+		t.Errorf("a missing capability was not answered with the capability grant:\n%s", missing.Remedy())
+	}
+	if !strings.Contains(missing.Remedy(), "CAP_SYS_ADMIN does NOT confer it") {
+		t.Errorf("the remedy does not say the two capabilities are independent:\n%s", missing.Remedy())
+	}
+
+	filtered := classifyNetAdmin(unix.EPERM, func() error { return unix.EPERM })
+	if strings.Contains(filtered.Remedy(), "--cap-add NET_ADMIN;") {
+		t.Errorf("a filtered syscall was answered with a capability grant:\n%s", filtered.Remedy())
+	}
+	if !strings.Contains(filtered.Remedy(), "seccomp") {
+		t.Errorf("a filtered syscall was not answered with a profile change:\n%s", filtered.Remedy())
+	}
+}
+
+// TestIsEthtoolReachable pins what counts as the witness having got through.
+func TestIsEthtoolReachable(t *testing.T) {
+	cases := map[string]struct {
+		err  error
+		want bool
+	}{
+		"loopback implements no driver info, which means the driver was reached": {unix.EOPNOTSUPP, true},
+		"an outright success":            {nil, true},
+		"refused by a filter":            {unix.EPERM, false},
+		"the socket could not be made":   {errors.New("socket: refused"), false},
+		"any other errno is unreachable": {unix.EIO, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := isEthtoolReachable(tc.err); got != tc.want {
+				t.Errorf("isEthtoolReachable(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNetAdminProbeWithInjectedSteps drives the probe end to end, including the
+// canceled context.
+func TestNetAdminProbeWithInjectedSteps(t *testing.T) {
+	t.Run("the capability is held", func(t *testing.T) {
+		probe := netAdminProbe(netAdminSteps{
+			privileged: func(string) error { return unix.EOPNOTSUPP },
+			witness:    func(string) error { return unix.EOPNOTSUPP },
+		})
+		if err := probe(context.Background()); err != nil {
+			t.Fatalf("probe: %v", err)
+		}
+	})
+
+	t.Run("the probe addresses loopback, which always exists", func(t *testing.T) {
+		var seen string
+		probe := netAdminProbe(netAdminSteps{
+			privileged: func(ifname string) error { seen = ifname; return unix.EOPNOTSUPP },
+			witness:    func(string) error { return unix.EOPNOTSUPP },
+		})
+		_ = probe(context.Background())
+		if seen != "lo" {
+			t.Errorf("the probe addressed %q; anything but lo can answer ENODEV and teach the guard nothing", seen)
+		}
+	})
+
+	t.Run("the context is already canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		probe := netAdminProbe(netAdminSteps{
+			privileged: func(string) error { t.Fatal("the probe ran with a canceled context"); return nil },
+		})
+		if err := probe(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("probe = %v, want it to carry context.Canceled", err)
+		}
+	})
+}
+
+// TestClassifyDRBDControl keeps a missing kernel module from being reported as
+// anything a container flag could fix.
+func TestClassifyDRBDControl(t *testing.T) {
+	cases := map[string]struct {
+		err      error
+		wantPass bool
+		want     Cause
+	}{
+		"the family resolves":               {nil, true, ""},
+		"the module is not loaded":          {unix.ENOENT, false, CauseKernelUnsupported},
+		"netlink itself is filtered":        {unix.EPERM, false, CauseSyscallBlocked},
+		"netlink is denied":                 {unix.EACCES, false, CauseSyscallBlocked},
+		"the address family is unsupported": {unix.EAFNOSUPPORT, false, CauseKernelUnsupported},
+		"the protocol is unsupported":       {unix.EPROTONOSUPPORT, false, CauseKernelUnsupported},
+		"an errno with no row":              {unix.EIO, false, CauseIndeterminate},
+		"a reply too short to interpret":    {errShortNetlinkReply, false, CauseIndeterminate},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := classifyDRBDControl(tc.err)
+			if tc.wantPass {
+				if got != nil {
+					t.Fatalf("classifyDRBDControl(nil) = %v, want a pass", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("classifyDRBDControl(%v) reported a pass", tc.err)
+			}
+			if got.Cause != tc.want {
+				t.Errorf("Cause = %q, want %q", got.Cause, tc.want)
+			}
+		})
+	}
+}
+
+// TestDRBDControlRemedyDoesNotSendAnOperatorAfterPrivileges is the whole reason
+// this is a separate capability: a module that is not loaded cannot be loaded
+// by any container configuration, and saying otherwise wastes the outage.
+func TestDRBDControlRemedyDoesNotSendAnOperatorAfterPrivileges(t *testing.T) {
+	remedy := classifyDRBDControl(unix.ENOENT).Remedy()
+
+	if !strings.Contains(remedy, "modprobe drbd") {
+		t.Errorf("the remedy does not name the fix:\n%s", remedy)
+	}
+	if !strings.Contains(remedy, "CANNOT load a module") {
+		t.Errorf("the remedy does not say a container cannot fix this itself:\n%s", remedy)
+	}
+	if strings.Contains(remedy, "--cap-add NET_ADMIN") {
+		t.Errorf("an unloaded module was answered with a capability grant:\n%s", remedy)
+	}
+}
+
+// TestDRBDControlProbeWithInjectedSteps drives the probe and its cancellation.
+func TestDRBDControlProbeWithInjectedSteps(t *testing.T) {
+	t.Run("the family resolves", func(t *testing.T) {
+		var asked string
+		probe := drbdControlProbe(drbdControlSteps{family: func(n string) error { asked = n; return nil }})
+		if err := probe(context.Background()); err != nil {
+			t.Fatalf("probe: %v", err)
+		}
+		if asked != "drbd" {
+			t.Errorf("the probe resolved %q, want the drbd family", asked)
+		}
+	})
+
+	t.Run("the module is absent", func(t *testing.T) {
+		probe := drbdControlProbe(drbdControlSteps{family: func(string) error { return unix.ENOENT }})
+		if err := probe(context.Background()); !errors.Is(err, ErrKernelUnsupported) {
+			t.Fatalf("probe = %v, want ErrKernelUnsupported", err)
+		}
+	})
+
+	t.Run("the context is already canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		probe := drbdControlProbe(drbdControlSteps{
+			family: func(string) error { t.Fatal("the probe ran with a canceled context"); return nil },
+		})
+		if err := probe(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("probe = %v, want it to carry context.Canceled", err)
+		}
+	})
+}
+
+// TestLiveGenlFamilyResolutionCanSayYes is the positive control this package
+// insists on everywhere else: before trusting that "drbd is absent" means the
+// module is not loaded, prove the query can report a family that IS present.
+//
+// nlctrl is the generic-netlink control family itself. It is registered on every
+// kernel with CONFIG_GENERIC_NETLINK, so a resolver that cannot find it is
+// broken rather than reporting an absent module — and without this assertion,
+// a resolver that returned ENOENT for everything would look exactly like a
+// correct one on a host with no DRBD.
+func TestLiveGenlFamilyResolutionCanSayYes(t *testing.T) {
+	// Short enough to be a legal family name: the kernel's GENL_NAMSIZ is 16,
+	// and an over-long name answers EINVAL, which would prove nothing about
+	// whether the family exists. Measured while writing this.
+	const absent = "nosuchfam"
+
+	control := resolveGenlFamily("nlctrl")
+
+	// Where netlink itself is refused — a seccomp profile with no AF_NETLINK
+	// socket, which is a real deployment and was reproduced in review — the
+	// resolver cannot say yes about ANYTHING, and this test asserts the
+	// property that actually matters there instead.
+	//
+	// It is NOT skipped. A skip would report success for an environment in
+	// which the interesting question is live: does a BLOCKED netlink get
+	// reported as a blocked syscall, or misreported as an absent module? The
+	// second would send an operator to modprobe something already loaded, so it
+	// is worth more than the positive control here.
+	if errors.Is(control, unix.EPERM) || errors.Is(control, unix.EACCES) {
+		got := resolveGenlFamily(absent)
+		if errors.Is(got, unix.ENOENT) {
+			t.Fatalf("netlink is blocked (%v) and an absent family still reported ENOENT; a blocked path must never look like an unloaded module", control)
+		}
+		if cause := classifyDRBDControl(got).Cause; cause != CauseSyscallBlocked {
+			t.Errorf("netlink is blocked and the cause is %q, want %q — an operator must not be sent to modprobe a module that is already there",
+				cause, CauseSyscallBlocked)
+		}
+		return
+	}
+
+	// Netlink is reachable, so the positive control applies: nlctrl is the
+	// generic-netlink control family itself, registered on every kernel with
+	// CONFIG_GENERIC_NETLINK. A resolver that cannot find it is broken rather
+	// than reporting an absent module — and without this, a resolver that
+	// returned ENOENT for everything would look exactly like a correct one on a
+	// host with no DRBD.
+	if control != nil {
+		t.Fatalf("resolving nlctrl, which every kernel registers: %v — the resolver cannot say yes, so its noes mean nothing", control)
+	}
+
+	if err := resolveGenlFamily(absent); !errors.Is(err, unix.ENOENT) {
+		t.Fatalf("resolving a family that cannot exist = %v, want ENOENT", err)
+	}
+}
+
+// TestLiveNetAdminProbeAgreesWithTheEnvironment is the two-sided check on a real
+// kernel, against an independent reading of the capability bit.
+func TestLiveNetAdminProbeAgreesWithTheEnvironment(t *testing.T) {
+	err := netAdminProbe(liveNetAdminSteps())(context.Background())
+
+	if hasCapability(t, capNetAdmin) {
+		if err != nil {
+			t.Fatalf("CAP_NET_ADMIN is held and the probe refused: %v", err)
+		}
+		return
+	}
+	if err == nil {
+		t.Fatal("CAP_NET_ADMIN is absent and the probe passed")
+	}
+	requireClassified(t, err)
+	if !errors.Is(err, ErrPrivilegeMissing) && !errors.Is(err, ErrSyscallBlocked) && !errors.Is(err, ErrPrivilegeOrPolicy) {
+		t.Errorf("the probe said %v; with the capability absent the refusal must name the capability or the filter", err)
+	}
+}
+
+// capNetAdmin is bit 12 of the capability bitmask.
+const capNetAdmin = 12
+
+// hasCapability reads the effective capability set as an INDEPENDENT oracle.
+// The guard itself must never do this — that is the whole doctrine — but a test
+// checking the guard should, because it is a second unrelated source of truth
+// for the same fact.
+func hasCapability(t *testing.T, bit uint) bool {
+	t.Helper()
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		t.Fatalf("reading /proc/self/status, which this test needs as its oracle: %v", err)
+	}
+	for _, line := range strings.Split(string(status), "\n") {
+		if !strings.HasPrefix(line, "CapEff:") {
+			continue
+		}
+		effective, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "CapEff:")), 16, 64)
+		if err != nil {
+			t.Fatalf("parsing CapEff: %v", err)
+		}
+		return effective&(1<<bit) != 0
+	}
+	t.Fatal("/proc/self/status carried no CapEff line")
+	return false
+}

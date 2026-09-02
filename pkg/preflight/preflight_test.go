@@ -240,7 +240,13 @@ func TestCheckPropagatesContextCancellation(t *testing.T) {
 // would be an UnknownCapabilityError at the worst possible moment.
 func TestNewRegistersEveryKnownCapability(t *testing.T) {
 	known := New().Capabilities()
-	want := []Capability{CapabilityDeviceMapper, CapabilityKernelKeyring, CapabilityMount}
+	want := []Capability{
+		CapabilityDeviceMapper,
+		CapabilityDRBDControl,
+		CapabilityKernelKeyring,
+		CapabilityMount,
+		CapabilityNetAdmin,
+	}
 
 	if len(known) != len(want) {
 		t.Fatalf("Capabilities() = %v, want %v", known, want)
@@ -248,6 +254,15 @@ func TestNewRegistersEveryKnownCapability(t *testing.T) {
 	for i := range want {
 		if known[i] != want[i] {
 			t.Fatalf("Capabilities() = %v, want %v (sorted)", known, want)
+		}
+	}
+
+	// CapabilityMountPropagation is deliberately absent: it has no startup
+	// probe, because there is no mount yet to inspect. Passing it to Check must
+	// stay an UnknownCapabilityError rather than quietly checking nothing.
+	for _, c := range known {
+		if c == CapabilityMountPropagation {
+			t.Error("mount-propagation has a registered probe; it cannot be established at startup")
 		}
 	}
 }
@@ -265,8 +280,10 @@ func TestWithProbeReplacesRatherThanAdds(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("the replacement probe ran %d times, want 1 — the live probe was used instead", calls)
 	}
-	if got := len(checker.Capabilities()); got != 3 {
-		t.Errorf("Capabilities() has %d entries, want 3: replacing must not add a fourth", got)
+	// Replacing must REPLACE, not add: the inventory is whatever the live
+	// constructor registers, unchanged.
+	if got, want := len(checker.Capabilities()), len(New().Capabilities()); got != want {
+		t.Errorf("Capabilities() has %d entries, want %d: replacing must not add one", got, want)
 	}
 }
 

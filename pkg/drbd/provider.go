@@ -158,8 +158,14 @@ type Provider struct {
 	mounter      Mounter
 	mountTable   MountTable
 	blockDevices BlockDevices
-	secrets      SecretProvider
-	mu           sync.Mutex
+
+	// injected records which seams the caller replaced, so runPreflight checks
+	// exactly the operations this provider will actually perform. A seam that
+	// was replaced is not checked: that is a derivation from the configuration,
+	// not a guess — a provider given its own Mounter does not call mount(2).
+	injected injectedSeams
+	secrets  SecretProvider
+	mu       sync.Mutex
 }
 
 // Compile-time proof that the provider satisfies the replicated contract, not
@@ -194,7 +200,7 @@ type Option func(*Provider)
 // WithRunner replaces the command runner. Tests use it to script the system
 // tooling; production leaves it alone and gets a plain exec.
 func WithRunner(r CommandRunner) Option {
-	return func(p *Provider) { p.runner = r }
+	return func(p *Provider) { p.runner = r; p.injected.runner = true }
 }
 
 // WithSecretProvider supplies the shared secret DRBD authenticates the peer
@@ -214,19 +220,19 @@ func WithSecretProvider(s SecretProvider) Option {
 // or a real filesystem; production leaves it alone and gets the pinning
 // implementation from internal/mount.
 func WithMounter(m Mounter) Option {
-	return func(p *Provider) { p.mounter = m }
+	return func(p *Provider) { p.mounter = m; p.injected.mounter = true }
 }
 
 // WithMountTable replaces the mount table. Tests use it to describe what is
 // mounted without mounting anything.
 func WithMountTable(m MountTable) Option {
-	return func(p *Provider) { p.mountTable = m }
+	return func(p *Provider) { p.mountTable = m; p.injected.mountTable = true }
 }
 
 // WithBlockDevices replaces the block-device operations. Tests use them to
 // record copies and zeroing without a device to perform them on.
 func WithBlockDevices(b BlockDevices) Option {
-	return func(p *Provider) { p.blockDevices = b }
+	return func(p *Provider) { p.blockDevices = b; p.injected.blockDevices = true }
 }
 
 // New builds a DRBD provider from a settings map. See the Setting constants for
@@ -284,6 +290,17 @@ func New(settings map[string]string, opts ...Option) (*Provider, error) {
 	}
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
 		return nil, fmt.Errorf("creating %s %q: %w", SettingStateDir, cfg.StateDir, err)
+	}
+
+	// Last, after every setting has been validated: a caller who got the
+	// configuration wrong should hear about the configuration, not about the
+	// node's capabilities. And at construction rather than at the first
+	// Provision, because what it detects is fixed when the process starts —
+	// discovering it at the first volume operation turns a deployment mistake
+	// into an outage. The capability set is derived, and it is NOT the local
+	// provider's; see requiredCapabilities.
+	if err := runPreflight(p.injected, cfg.Preflight); err != nil {
+		return nil, err
 	}
 	return p, nil
 }

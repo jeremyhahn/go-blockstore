@@ -32,11 +32,15 @@ const DeviceMapperControl = "/dev/mapper/control"
 // platform, and a preflight that passed on darwin would be a preflight that
 // lies in the one direction that costs something.
 func platformProbes() map[Capability]Probe {
-	return map[Capability]Probe{
+	probes := map[Capability]Probe{
 		CapabilityDeviceMapper:  unsupportedProbe(CapabilityDeviceMapper, "device-mapper exists only in the Linux kernel"),
 		CapabilityMount:         unsupportedProbe(CapabilityMount, "the mount(2) semantics this stack relies on exist only on Linux"),
 		CapabilityKernelKeyring: unsupportedProbe(CapabilityKernelKeyring, "the kernel keyring syscalls exist only on Linux"),
 	}
+	for capability, why := range platformExtras {
+		probes[capability] = unsupportedProbe(capability, why)
+	}
+	return probes
 }
 
 // unsupportedProbe builds a probe that always refuses, naming why.
@@ -49,3 +53,17 @@ func unsupportedProbe(capability Capability, why string) Probe {
 		}
 	}
 }
+
+// The replicated backend's capabilities refuse here for the same reason the
+// rest do: DRBD is a Linux kernel module reached over generic netlink, and
+// CAP_NET_ADMIN is a Linux capability. Neither exists on this platform, so the
+// honest answer is a typed refusal naming it.
+func init() {
+	platformExtras = map[Capability]string{
+		CapabilityNetAdmin:    "CAP_NET_ADMIN is a Linux capability",
+		CapabilityDRBDControl: "DRBD is a Linux kernel module reached over generic netlink",
+	}
+}
+
+// platformExtras is merged into platformProbes.
+var platformExtras map[Capability]string

@@ -299,6 +299,10 @@ func TestListMetaFailsClosedOnAnUnreadableRecord(t *testing.T) {
 		SettingNodeAddress: "10.10.0.1",
 		SettingPeerNode:    testPeer,
 		SettingPeerAddress: "10.10.0.2",
+
+		// Same reason as testSettings: this test is about record handling, not
+		// about whether this host has a drbd module and CAP_NET_ADMIN.
+		SettingPreflight: "off",
 	}, WithRunner(r), WithSecretProvider(testSecretProvider))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -340,6 +344,10 @@ func TestRecordsFromAnotherVolumeGroupAreRefused(t *testing.T) {
 		SettingNodeAddress: "10.10.0.1",
 		SettingPeerNode:    testPeer,
 		SettingPeerAddress: "10.10.0.2",
+
+		// Same reason as testSettings: this test is about record handling, not
+		// about whether this host has a drbd module and CAP_NET_ADMIN.
+		SettingPreflight: "off",
 	}, WithRunner(r), WithSecretProvider(testSecretProvider))
 	if err != nil {
 		t.Fatalf("New: %v", err)

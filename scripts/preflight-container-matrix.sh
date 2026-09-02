@@ -39,6 +39,10 @@
 #   10-11. opening the node can fail for reasons that are neither the capability
 #      nor a filter — a node made visible without being allowed by the device
 #      cgroup, and a node whose own 0600 permissions refuse a non-root uid.
+#   12-14. the REPLICATED backend, whose capability set is not the local one's:
+#      CAP_NET_ADMIN refused and then granted (device-mapper working proves
+#      nothing about it), and the drbd module absent — which no capability
+#      grant can fix, so the remedy names modprobe rather than a flag.
 #
 # The narrow profile is generated here rather than committed, so it cannot rot
 # against the syscalls the binary actually makes, and so that nothing in this
@@ -89,8 +93,13 @@ func main() {
 		preflight.CapabilityDeviceMapper,
 		preflight.CapabilityKernelKeyring,
 	}
-	if len(os.Args) > 1 && os.Args[1] == "mount" {
+	switch {
+	case len(os.Args) > 1 && os.Args[1] == "mount":
 		wanted = []preflight.Capability{preflight.CapabilityMount}
+	case len(os.Args) > 1 && os.Args[1] == "net-admin":
+		wanted = []preflight.Capability{preflight.CapabilityNetAdmin}
+	case len(os.Args) > 1 && os.Args[1] == "drbd-control":
+		wanted = []preflight.Capability{preflight.CapabilityDRBDControl}
 	}
 
 	err := preflight.Check(context.Background(), wanted...)
@@ -122,6 +131,14 @@ cp "$WORK/cmd/main.go" "$STAGE/main.go"
 # Default-DENY with an explicit allow list: narrow in the direction that
 # matters, and small enough to read. The syscalls are the ones the probe binary
 # and the container's own start-up make.
+#
+# The socket family at the end is NOT decoration. The replicated backend reaches
+# the DRBD module over generic netlink and tests CAP_NET_ADMIN with an ethtool
+# ioctl on an AF_INET socket, so a profile sized for the LOCAL provider denies
+# both — measured, when these rows were first added and the guard correctly
+# reported syscall-blocked against a profile this script called "correct". An
+# operator copying the local component's profile onto a replicated one walks
+# into the same thing.
 KEYRING_SYSCALLS='"add_key","keyctl","request_key",'
 BASE_SYSCALLS='
 "arch_prctl","brk","capget","capset","chdir","clone","clone3","close","dup","dup2","dup3",
@@ -133,7 +150,8 @@ BASE_SYSCALLS='
 "rt_sigprocmask","rt_sigreturn","sched_getaffinity","sched_yield","set_robust_list",
 "set_tid_address","setgid","setgroups","sethostname","setsid","setuid","sigaltstack","statfs",
 "statx","tgkill","timer_create","timer_delete","timer_settime","umask","umount2","uname",
-"unlinkat","wait4","write","writev"'
+"unlinkat","wait4","write","writev",
+"socket","socketpair","bind","connect","sendto","recvfrom","getsockname","getsockopt","setsockopt"'
 
 profile() { # $1 = output path, $2 = extra syscalls (may be empty)
 	cat >"$1" <<EOF
@@ -275,6 +293,27 @@ run_case "the node is allowed but the storage component runs as a non-root uid" 
 	REFUSED "[device-not-readable]" dm-keyring \
 	--cap-add SYS_ADMIN --device /dev/mapper/control \
 	--security-opt seccomp="$WORK/narrow.json" --user 65534
+
+# The REPLICATED backend needs a capability the local one does not, and the two
+# are independent bits. A container that can drive device-mapper all day still
+# cannot bring a DRBD resource up without CAP_NET_ADMIN — which is exactly the
+# shape of the trap in rows 2-3, one capability over.
+run_case "CAP_SYS_ADMIN but no CAP_NET_ADMIN: device-mapper works, DRBD cannot" \
+	REFUSED "[privilege-missing]" net-admin \
+	--cap-add SYS_ADMIN --device /dev/mapper/control \
+	--security-opt seccomp="$WORK/narrow.json"
+
+run_case "--cap-add NET_ADMIN, which is what the replicated backend needs" \
+	PASS "" net-admin \
+	--cap-add NET_ADMIN \
+	--security-opt seccomp="$WORK/narrow.json"
+
+# And the module, which is NOT a privilege: no capability grant loads it, so the
+# refusal must send an operator to the node rather than to a container flag.
+run_case "the drbd module is not loaded, which no capability can fix" \
+	REFUSED "modprobe drbd" drbd-control \
+	--cap-add NET_ADMIN --cap-add SYS_ADMIN \
+	--security-opt seccomp="$WORK/narrow.json"
 
 echo
 if [ "$failures" -ne 0 ]; then

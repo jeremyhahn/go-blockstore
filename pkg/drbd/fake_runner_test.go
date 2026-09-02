@@ -454,6 +454,17 @@ func testSettings(t *testing.T) map[string]string {
 		SettingNodeAddress: "10.10.0.1",
 		SettingPeerNode:    testPeer,
 		SettingPeerAddress: "10.10.0.2",
+
+		// The startup privilege checks are off across the unit suite because
+		// these tests are about CONFIGURATION, RESOURCE RENDERING and the
+		// scripted runner — not about whether the machine running them has a
+		// drbd module and CAP_NET_ADMIN. With them on, every one of these would
+		// pass or fail depending on the host.
+		//
+		// The checks themselves are exercised on their own, against the real
+		// kernel, in preflight_test.go — including the two-sided assertion that
+		// New refuses exactly when the checker refuses.
+		SettingPreflight: "off",
 	}
 }
 

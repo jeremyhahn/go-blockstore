@@ -60,6 +60,36 @@ const (
 	// same type, same Cause, same remedy table. Passing it to Check yields
 	// UnknownCapabilityError, which is the fail-closed direction.
 	CapabilityMountPropagation Capability = "mount-propagation"
+
+	// CapabilityNetAdmin is the ability to perform privileged network
+	// operations — CAP_NET_ADMIN.
+	//
+	// A replicated backend needs it and a local one does not: DRBD's control
+	// path is generic netlink to the drbd kernel module, and the module's
+	// administrative operations are gated on CAP_NET_ADMIN rather than on
+	// CAP_SYS_ADMIN. The two are independent bits, so a container granted the
+	// device-mapper privilege and nothing else can create logical volumes all
+	// day and fail the moment it brings a DRBD resource up.
+	//
+	// Measured 2026-09-02, ETHTOOL_GWOL on lo, which the kernel gates on this
+	// capability and which reads rather than writes:
+	//
+	//	container, root, no --cap-add     EPERM       (CapEff …a80425fb)
+	//	container, root, --cap-add NET_ADMIN  EOPNOTSUPP  (CapEff …a80435fb)
+	//
+	// The differing bit is 12, CAP_NET_ADMIN.
+	CapabilityNetAdmin Capability = "net-admin"
+
+	// CapabilityDRBDControl is the presence of the DRBD control interface: the
+	// drbd kernel module loaded, and its generic-netlink family registered.
+	//
+	// It is NOT a privilege, which is why it is not folded into
+	// CapabilityNetAdmin. A container cannot load a kernel module for itself
+	// however it is privileged — this is fixed on the NODE — so reporting it as
+	// a missing capability would send an operator to add flags that cannot
+	// possibly help. Separating them is the difference between "modprobe drbd
+	// on the host" and "grant CAP_NET_ADMIN", which are not substitutes.
+	CapabilityDRBDControl Capability = "drbd-control"
 )
 
 // Probe performs one capability check by ATTEMPTING the operation.
