@@ -32,6 +32,12 @@
 // /dev/mapper/<vg>-<lv>, or the /dev/dm-N underneath. Comparing those strings
 // was the source of the spelling problem; comparing device numbers does not
 // have one.
+//
+// The table is a TREE, not a list. Each record names its own mount id and its
+// parent's, and which mounts a walk to a path crosses is a fact about that tree
+// — not about the mount-point strings, and not about the order of the records.
+// Both of those shortcuts were measured against a running kernel and both give
+// wrong answers; see VisibleMountPointsFor.
 package mountinfo
 
 import (
@@ -60,6 +66,25 @@ type Entry struct {
 	// that still matches is evidence the mount is the same one and not a
 	// replacement made in the meantime.
 	ID uint32
+
+	// ParentID is the ID of the mount this one is mounted ON — the mount owning
+	// the directory it covers. It is the edge that makes the table a tree, and
+	// the tree is the only thing that says which mounts a walk to a path
+	// crosses.
+	//
+	// It is not recoverable from the mount points. A parent's mount point is a
+	// path prefix of its child's, but so are the mount points of many records
+	// that are not the parent, and prefix matching cannot tell them apart —
+	// measured on an ordinary 28-record host, a prefix rule flags 6 pairs as
+	// covered with nothing overmounted at all. Reading the edge the kernel
+	// wrote has no such failure mode.
+	//
+	// A record whose ParentID names no record in the table is the root of what
+	// this table can see: the file shows one mount namespace, and that
+	// namespace's root mount hangs off a mount outside it. That is normal, not
+	// an error — an ordinary host's root record reads "562 438 ..." with no
+	// record 438 anywhere in the file.
+	ParentID uint32
 
 	// Major and Minor identify the mounted device. They are the stable identity
 	// of a mount, unlike Source, which is whatever name it was mounted under.
@@ -229,9 +254,20 @@ func parseLine(text string) (Entry, error) {
 	if err != nil {
 		return Entry{}, errMalformedMountID
 	}
+	// The parent id is refused rather than defaulted, for the reason the super
+	// options are: a record whose tree edge could not be read is a record whose
+	// visibility cannot be decided, and a zero substituted here would make it
+	// look like a record with no parent — the one shape that is treated as the
+	// top of the table and therefore always reachable. Failing open on a field
+	// the format guarantees is how a wrong answer gets a confident one.
+	parentID, err := strconv.ParseUint(fields[1], 10, 32)
+	if err != nil {
+		return Entry{}, errMalformedParentID
+	}
 
 	return Entry{
 		ID:          uint32(id),
+		ParentID:    uint32(parentID),
 		Major:       major,
 		Minor:       minor,
 		Root:        unescape(fields[3]),
@@ -342,68 +378,305 @@ func MountPointsFor(entries []Entry, major, minor uint32) []string {
 	return targets
 }
 
+// ambiguousID marks a mount id claimed by more than one record, which no
+// kernel-produced table contains and which therefore identifies nothing.
+const ambiguousID = -1
+
+// indexByID maps each mount id to its record.
+//
+// An id that appears twice is recorded as ambiguous rather than resolved to
+// either claimant. A tree edge into an ambiguous id is followed nowhere, which
+// makes the record look parentless and so REACHABLE — the fail-open direction,
+// chosen because the cost of the two errors is not symmetric: a mount wrongly
+// called hidden is a volume Delete refuses with no way past it, while a mount
+// wrongly called reachable is the behavior callers already have today.
+func indexByID(entries []Entry) map[uint32]int {
+	byID := make(map[uint32]int, len(entries))
+	for i, e := range entries {
+		if _, seen := byID[e.ID]; seen {
+			byID[e.ID] = ambiguousID
+			continue
+		}
+		byID[e.ID] = i
+	}
+	return byID
+}
+
+// parentOf returns the index of a record's parent, and whether there is one to
+// follow.
+//
+// Three shapes are not edges, and all three end the chain the same way — as the
+// top of what this table describes, which leaves the record reachable:
+//
+//   - A parent id naming NO record. Every mount namespace's root has it; the
+//     file shows one namespace and its root hangs off a mount outside it.
+//   - A parent id claimed by more than one record, which identifies nothing.
+//   - A record that is its OWN parent. Not a shape a kernel writes, but Parse
+//     is fed text; it is also what an Entry built in code rather than parsed
+//     looks like, since a zero-valued Entry has ID and ParentID both zero.
+//     Following that edge would make such a record its own ancestor, and
+//     covering its own mount point, so a table assembled by a caller would
+//     report every one of its mounts hidden.
+func parentOf(entries []Entry, byID map[uint32]int, i int) (int, bool) {
+	p, ok := byID[entries[i].ParentID]
+	if !ok || p == ambiguousID || p == i {
+		return 0, false
+	}
+	return p, true
+}
+
+// topAtOwnMountPoint marks, for each record, whether it is the mount that a
+// walk arriving at its mount point lands on — assuming the walk gets there at
+// all, which is the separate question reachableAt answers.
+//
+// Two rules, in this order.
+//
+// The TREE rule: a record is covered when another record is its CHILD mounted
+// at its own mount point. That is what the kernel writes when a directory that
+// already has a mount on it is mounted over — path lookup follows into the
+// mount that is there, so the new mount's parent is the mount it covers and its
+// mount point renders as the same string. Measured, mounting tmpfs over an
+// existing tmpfs at /tmp/bs33/x gives "624 562 ... /tmp/bs33/x" followed by
+// "625 624 ... /tmp/bs33/x": parent 624, same path. This rule states the
+// covering relation the kernel itself recorded, so it neither invents one nor
+// misses one.
+//
+// The ORDER rule, applied only to records the tree rule left standing: among
+// records naming one mount point, the last in the table wins. This is the rule
+// this function used to apply alone. It is kept because a table can be built in
+// code rather than parsed — an Entry with no ids has no tree to consult — and
+// because two records on one path with no edge between them would otherwise
+// both be called visible, which is the dangerous direction: it would hand
+// umount(2) a path where this device is not on top.
+//
+// The order rule is second rather than first because file order is not mount
+// order. mount --move re-parents a mount and leaves its record where it was:
+// moving the first-created of two mounts on top of the second produces
+// "624 625 ... /y" BEFORE "625 562 ... /y", where the record listed first is
+// the one on top. Reading order alone there names the wrong filesystem, in both
+// directions at once.
+//
+// The order rule cannot then wrongly hide the survivor of an ancestor
+// overmount. Two records can share a mount point with no edge between them —
+// one under a mount that was covered, the other under the mount that covered it
+// — and there the earlier record is always the covered one: the later mount
+// exists only because the cover was already in place, and a mount made at that
+// path after the cover lands INSIDE the covering filesystem and takes it for a
+// parent. Measured on a live kernel; the table is compositeOvermountTable.
+func topAtOwnMountPoint(entries []Entry, byID map[uint32]int) []bool {
+	top := make([]bool, len(entries))
+	for i := range top {
+		top[i] = true
+	}
+
+	for i := range entries {
+		p, ok := parentOf(entries, byID, i)
+		if ok && entries[p].MountPoint == entries[i].MountPoint {
+			top[p] = false
+		}
+	}
+
+	lastAtPath := make(map[string]int, len(entries))
+	for i, e := range entries {
+		if top[i] {
+			lastAtPath[e.MountPoint] = i
+		}
+	}
+	for i, e := range entries {
+		if top[i] && lastAtPath[e.MountPoint] != i {
+			top[i] = false
+		}
+	}
+	return top
+}
+
+// The states a record passes through while its reachability is resolved.
+const (
+	unresolved uint8 = iota
+	resolving
+	isReachable
+	isHidden
+)
+
+// stackBase climbs from a record to the BOTTOM of the stack sharing its mount
+// point, and is the distinction between "an ancestor" and "an ancestor in the
+// way".
+//
+// Mounting over a mount point that already has a mount on it makes the new
+// mount a CHILD of the one it covers, at the same mount point — measured, not
+// assumed. So the covering mount's own parent is a mount that is, correctly,
+// not top at its mount point. A walk to that path does not traverse the covered
+// mount and then the covering one; it arrives at the path once and lands on the
+// top of the stack. Treating the stack below as ancestors to check would hide
+// every mount that is on top of anything, which is the opposite of the truth.
+//
+// The climb is bounded by the size of the table because a cycle cannot come
+// from a kernel but can come from text.
+func stackBase(entries []Entry, byID map[uint32]int, i int) int {
+	for steps := 0; steps <= len(entries); steps++ {
+		p, ok := parentOf(entries, byID, i)
+		if !ok || entries[p].MountPoint != entries[i].MountPoint {
+			return i
+		}
+		i = p
+	}
+	return i
+}
+
+// reachableAt marks, for each record, whether its mount point PATH resolves to
+// it — which is the question umount(2) turns on, since it detaches whatever the
+// path it is handed resolves to.
+//
+// A record is reachable when it is top at its own mount point AND the mount its
+// stack hangs off is itself reachable, applied all the way up. The chain of
+// parents is exactly the set of mounts a walk down the path crosses, which is
+// why it is the right chain and a path-prefix scan is not: the kernel renders
+// each mount point as a full path from the process root by walking that same
+// chain, so a parent's mount point is always a prefix of its child's — but the
+// converse does not hold, and prefix matching flags unrelated mounts.
+//
+// This is what catches the case a comparison of mount points cannot: a volume
+// at /mnt/base/vol with another filesystem later mounted at /mnt/base. No
+// second record names /mnt/base/vol, so nothing about that path has changed —
+// but /mnt/base now has a child mounted at /mnt/base, so the volume's parent is
+// not top at its own mount point, and the volume is not reachable.
+//
+// A chain ends at a record with no parent in the table, which is normal: the
+// file describes one mount namespace and its root mount hangs off a mount
+// outside it. A chain that loops — impossible from a kernel, reachable from
+// hand-written text — ends there too, and is treated as reachable rather than
+// left to recurse: refusing to unmount a volume over a malformed table would
+// leave an operator with no way forward.
+func reachableAt(entries []Entry, byID map[uint32]int, top []bool) []bool {
+	state := make([]uint8, len(entries))
+	chain := make([]int, 0, len(entries))
+
+	for start := range entries {
+		if state[start] != unresolved {
+			continue
+		}
+
+		chain = chain[:0]
+		verdict := isReachable
+		for i := start; ; {
+			if s := state[i]; s != unresolved {
+				// Either an answer computed on an earlier walk, which the whole
+				// chain below it inherits, or the walk meeting itself.
+				verdict = s
+				if s == resolving {
+					verdict = isReachable
+				}
+				break
+			}
+			state[i] = resolving
+			chain = append(chain, i)
+
+			if !top[i] {
+				verdict = isHidden
+				break
+			}
+			p, ok := parentOf(entries, byID, stackBase(entries, byID, i))
+			if !ok {
+				break
+			}
+			i = p
+		}
+
+		// Everything walked shares the verdict: each was top at its own mount
+		// point, so a hidden ancestor hides all of them and a reachable one
+		// leaves all of them reachable.
+		for _, i := range chain {
+			state[i] = verdict
+		}
+	}
+
+	reachable := make([]bool, len(entries))
+	for i, s := range state {
+		reachable[i] = s == isReachable
+	}
+	return reachable
+}
+
+// visibility reports, per record, whether that mount is what its mount point
+// resolves to.
+func visibility(entries []Entry) []bool {
+	byID := indexByID(entries)
+	return reachableAt(entries, byID, topAtOwnMountPoint(entries, byID))
+}
+
 // VisibleMountPointsFor returns the paths where the device is the filesystem
 // that is CURRENTLY VISIBLE, which is a smaller set than MountPointsFor.
 //
-// Mounting over an occupied directory leaves both records in the table, and the
-// later one is what a process walking to that path reaches. The earlier mount
-// is still there and still this device's — MountPointsFor is right to report it
-// — but it is hidden, and that distinction decides who gets unmounted:
-// umount(2) takes the path and detaches whatever is visible at it. Handing it a
-// path where this device has been over-mounted unmounts SOMEBODY ELSE'S
-// filesystem while leaving this one exactly where it was.
+// A mount can stop being what a path resolves to without going anywhere. Mount
+// over an occupied directory and both records stay in the table; the one a
+// process walking there reaches is the new one. The earlier mount is still
+// mounted and still this device's — MountPointsFor is right to report it — but
+// it is hidden, and that distinction decides who gets unmounted: umount(2)
+// takes a path and detaches whatever is visible at it. Handing it a path where
+// this device has been covered unmounts SOMEBODY ELSE'S filesystem while
+// leaving this one exactly where it was.
 //
 // So anything that unmounts by path asks this, and anything asking "is it
 // mounted at all" — a teardown deciding whether the volume is busy, a status —
 // asks MountPointsFor, where a hidden mount still counts.
 //
-// WHAT THIS DOES NOT CATCH: a mount hidden by an overmount of one of its
-// ANCESTOR directories — this volume at /mnt/base/vol, another filesystem later
-// mounted at /mnt/base. The volume stops being reachable by that path without
-// any second record naming it, so no comparison of mount points can see it.
+// Visibility is decided from the mount TREE, which catches two cases that
+// comparing mount points cannot:
 //
-// Deciding that properly means reconstructing the mount tree from the mount and
-// parent IDs and asking which mount is visible at each ancestor, which is a
-// different piece of work from this one; the tempting shortcut — treat a later
-// record whose mount point is an ancestor as hiding this one — was MEASURED
-// against an ordinary host's table and is wrong: 4 of that host's 28 records
-// list their parent AFTER themselves, and 5 pairs would be called hidden with
-// nothing overmounted at all. Refusing to delete a volume that is perfectly
-// deletable is not an improvement over the rare case it would catch, and where
-// that case does happen the path simply does not resolve, so the unmount fails
-// loudly rather than taking the wrong filesystem down. Tracked in #33.
+//   - An ANCESTOR overmount. This volume at /mnt/base/vol, another filesystem
+//     later mounted at /mnt/base. The volume is no longer reachable by that
+//     path and no second record names it, so no comparison of mount-point
+//     strings can see it.
+//   - A mount re-parented by mount --move, which leaves the record where it was
+//     in the file. The covering mount can then be listed FIRST, and "the last
+//     record on a path wins" names the wrong filesystem.
+//
+// The shortcut this deliberately does not take is treating a later record whose
+// mount point is a path PREFIX of this one as covering it. That was measured
+// against an ordinary host's 28-record table: it flags 6 pairs with nothing
+// overmounted at all, and 4 of the host's records list their parent after
+// themselves, so order does not rescue it either. Every one of those is a
+// volume Delete would refuse to remove with no way for an operator past it. The
+// tree rule flags exactly one pair on that same host — a real double mount of
+// /proc/sys/fs/binfmt_misc, which the old string rule found too.
+//
+// A bind mount is a separate record with its own place in the tree, so it gets
+// its own answer; binding a path reaches whatever is visible there, so a bind
+// of a covered mount is a mount of the COVERING device, and this reports it
+// under that device rather than this one. A mount that was moved is reported
+// where it is now, because the table describes the tree as it stands.
+//
+// The paths returned are the kernel's, in the kernel's order.
 func VisibleMountPointsFor(entries []Entry, major, minor uint32) []string {
-	// The last record for a path is the visible one, so the table is read
-	// through once to find each path's last record, keeping the kernel's order
-	// for the answer.
-	top := make(map[string]Entry, len(entries))
-	var order []string
-	for _, e := range entries {
-		if _, seen := top[e.MountPoint]; !seen {
-			order = append(order, e.MountPoint)
-		}
-		top[e.MountPoint] = e
-	}
+	visible := visibility(entries)
 
 	var targets []string
-	for _, mountPoint := range order {
-		if e := top[mountPoint]; e.Major == major && e.Minor == minor {
-			targets = append(targets, mountPoint)
+	for i, e := range entries {
+		if visible[i] && e.Major == major && e.Minor == minor {
+			targets = append(targets, e.MountPoint)
 		}
 	}
 	return targets
 }
 
-// EntryAt returns the entry mounted at a path.
+// EntryAt returns the mount that a path resolves to.
 //
-// The LAST match wins, which is what the kernel means: mounting over an
-// occupied directory leaves both records in the table, and the later one is
-// what is visible there now.
+// It answers from the mount tree, for the reasons VisibleMountPointsFor does:
+// the record a path reaches is the one that is top at that mount point with an
+// unbroken chain of top mounts above it, which is neither "the last record
+// naming the path" nor "the last record whose path is a prefix".
+//
+// A path whose every record is hidden behind an overmounted ancestor reports
+// NOTHING found, which is the honest answer: a walk to that path does not reach
+// any of them. It lands inside the covering filesystem, where either something
+// else is mounted — with its own record, which this would find — or nothing is.
 func EntryAt(entries []Entry, mountPoint string) (Entry, bool) {
+	visible := visibility(entries)
+
 	found := false
 	var match Entry
-	for _, e := range entries {
-		if e.MountPoint == mountPoint {
+	for i, e := range entries {
+		if visible[i] && e.MountPoint == mountPoint {
 			match, found = e, true
 		}
 	}
@@ -437,6 +710,10 @@ type Table interface {
 	// by path has to ask: umount(2) detaches what is visible at the path it is
 	// given, so a path where this device has been over-mounted would unmount
 	// somebody else's filesystem.
+	//
+	// Covered means covered by anything on the way: a mount over the path
+	// itself, or a mount over any DIRECTORY ABOVE it, which takes the path out
+	// of reach without leaving a second record naming it.
 	VisibleMountPointsFor(ctx context.Context, device string) ([]string, error)
 }
 
@@ -470,7 +747,9 @@ type PropagationReader interface {
 	//
 	// A path with nothing mounted at it is ErrNotMounted rather than a false:
 	// absence is not an answer about propagation, and a guard that read it as
-	// one would pass the case where the mount is missing entirely.
+	// one would pass the case where the mount is missing entirely. A path whose
+	// mounts are all behind an overmounted ancestor reports ErrNotMounted too,
+	// because a walk to that path reaches none of them.
 	//
 	// The DECISION about what counts as propagating is made here rather than by
 	// the caller, because two call sites deciding it separately is how they end

@@ -37,7 +37,11 @@ func TestParseReadsARealRecord(t *testing.T) {
 	want := Entry{
 		// The kernel's identity for this MOUNT, which is what distinguishes it
 		// from a second mount of the same device at the same path.
-		ID:         580,
+		ID: 580,
+		// The mount this one is mounted ON. It is the edge that makes the table
+		// a tree, and the tree is what decides whether a path reaches this
+		// mount at all.
+		ParentID:   30,
 		Major:      252,
 		Minor:      3,
 		Root:       "/",

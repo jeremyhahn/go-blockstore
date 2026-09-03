@@ -59,6 +59,17 @@ var (
 	// ErrMalformedMountID reports a record whose mount id is not a number.
 	ErrMalformedMountID = errors.New("mountinfo: mount id is not a number")
 
+	// ErrMalformedParentID reports a record whose parent mount id is not a
+	// number.
+	//
+	// Refused rather than defaulted to zero: the parent id is the edge that
+	// makes the table a tree, and a record with no readable edge is one whose
+	// visibility cannot be decided. A zero would not read as "unknown", it
+	// would read as "no parent" — the shape treated as the top of the table and
+	// therefore always reachable, which is the answer a caller acts on by
+	// unmounting.
+	ErrMalformedParentID = errors.New("mountinfo: parent mount id is not a number")
+
 	// ErrUnsupportedPlatform reports that device numbers cannot be read here.
 	ErrUnsupportedPlatform = errors.New("mountinfo: reading device numbers requires Linux")
 )
@@ -71,6 +82,7 @@ var (
 	errTruncatedAfterSeparator = ErrTruncatedAfterSeparator
 	errMalformedDeviceNumber   = ErrMalformedDeviceNumber
 	errMalformedMountID        = ErrMalformedMountID
+	errMalformedParentID       = ErrMalformedParentID
 )
 
 // ReadError reports that the mount table could not be read at all.
