@@ -102,6 +102,27 @@ TEST_TIMEOUT := 900s
 # file as a strict semver before it fetches anything, so install fails loud too.)
 TRIVY_VERSION := $(shell awk '{for(i=1;i<=NF;i++){n++;v=$$i}} END{if(n==1)print v}' .trivy-version 2>/dev/null)
 
+# THE ANALYSER VERSIONS, IN ONE PLACE (#30). These are the SAME numbers the
+# ci-runner image bakes (infra/gitea/ci-runner/Dockerfile) and the same ones
+# .github/workflows/ci.yml carries as its floors — devops.md §8 makes `make
+# security` and `make lint` the contract CI mirrors, so a developer's tools and
+# CI's tools must not be different builds.
+#
+# golangci-lint was pinned at v2.12.2 here and in CI. That pin is not survivable
+# past the 1.27 wave: golangci-lint refuses to load a config when the Go it was
+# BUILT with is older than the module's target, and `go install` builds it with
+# whatever Go is on the developer's box. v2.13.2 is what the image ships, built
+# against the portfolio maximum. A developer left on v2.12.2 gets no local lint
+# signal at all on a 1.27 module — it fails to start rather than degrading —
+# while CI stays green, which is how a misspell shipped twice in go-enclave.
+#
+# The rest were `@latest`, which made scans unreproducible: the same commit gets
+# a different analyser on a different day (go-luks2 #21).
+GOLANGCI_LINT_VERSION := v2.13.2
+GOSEC_VERSION         := v2.29.0
+GOVULNCHECK_VERSION   := v1.7.0
+ACTIONLINT_VERSION    := v1.7.7
+
 RESET := \033[0m
 BOLD := \033[1m
 RED := \033[31m
@@ -387,21 +408,34 @@ lint: fmt-check vet golangci-lint actionlint
 
 .PHONY: golangci-lint
 ## golangci-lint: Run golangci-lint (config is version "2" — needs the v2 binary)
+# The probe demands a MINIMUM VERSION, not merely "major 2" (#30). GOPATH/bin is
+# searched first, so on a box that has ever run `make install-tools` an old
+# binary there SHADOWS the newer one the ci-runner image ships at
+# /usr/local/bin — silently, because both are v2. That is the local half of the
+# defect this target's CI counterpart had: the developer lints with one tool and
+# CI with another, and past the 1.27 wave the old one does not lint at all.
+# Anything below the floor is now named and refused rather than selected.
 golangci-lint:
 	@echo "$(CYAN)$(BOLD)→ Running golangci-lint...$(RESET)"
 	@GOPATH=$$($(GO) env GOPATH); \
-	BIN=""; \
+	MIN="$(GOLANGCI_LINT_VERSION)"; MIN="$${MIN#v}"; \
+	BIN=""; FOUND=""; SEEN=""; \
 	for cand in "$$GOPATH/bin/golangci-lint" $$(command -v golangci-lint 2>/dev/null) /usr/local/bin/golangci-lint /usr/bin/golangci-lint; do \
 		[ -x "$$cand" ] || continue; \
-		ver=$$("$$cand" version 2>/dev/null | grep -oE 'version v?[0-9]+' | grep -oE '[0-9]+' | head -1); \
-		if [ "$$ver" = "2" ]; then BIN="$$cand"; break; fi; \
+		ver=$$("$$cand" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1); \
+		[ -n "$$ver" ] || continue; \
+		SEEN="$$SEEN $$cand($$ver)"; \
+		if [ "$$(printf '%s\n%s\n' "$$MIN" "$$ver" | sort -V | head -1)" = "$$MIN" ]; then \
+			BIN="$$cand"; FOUND="$$ver"; break; \
+		fi; \
 	done; \
 	if [ -z "$$BIN" ]; then \
-		echo "$(RED)✗ golangci-lint v2 not found (.golangci.yml is version: \"2\")$(RESET)"; \
+		echo "$(RED)✗ no golangci-lint >= $$MIN found (.golangci.yml is version: \"2\")$(RESET)"; \
+		echo "$(YELLOW)  probed:$${SEEN:- none}$(RESET)"; \
 		echo "$(YELLOW)  Install the pinned version: make install-tools$(RESET)"; \
 		exit 1; \
 	fi; \
-	echo "$(CYAN)  Using $$BIN$(RESET)"; \
+	echo "$(CYAN)  Using $$BIN ($$FOUND)$(RESET)"; \
 	"$$BIN" run --timeout=5m ./...
 	@echo "$(GREEN)✓ golangci-lint passed$(RESET)"
 
@@ -468,14 +502,16 @@ actionlint:
 # effect of a build or test (devops.md §4).
 install-tools:
 	@echo "$(CYAN)$(BOLD)→ Installing tools...$(RESET)"
-	@echo "$(CYAN)  golangci-lint v2.12.2 (pinned — see .github/workflows/ci.yml)$(RESET)"
-	@$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
-	@echo "$(CYAN)  gosec$(RESET)"
-	@$(GO) install github.com/securego/gosec/v2/cmd/gosec@latest
-	@echo "$(CYAN)  govulncheck$(RESET)"
-	@$(GO) install golang.org/x/vuln/cmd/govulncheck@latest
-	@echo "$(CYAN)  actionlint$(RESET)"
-	@$(GO) install github.com/rhysd/actionlint/cmd/actionlint@latest
+	@echo "$(CYAN)  golangci-lint $(GOLANGCI_LINT_VERSION) (pinned — see the versions block above)$(RESET)"
+	@$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	@echo "$(CYAN)  gosec $(GOSEC_VERSION)$(RESET)"
+	@# -ldflags is not decoration: without it gosec reports "Version: dev" and no
+	@# log — here or in CI — can say which analyser produced a finding.
+	@$(GO) install -ldflags "-X main.Version=$(GOSEC_VERSION)" github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION)
+	@echo "$(CYAN)  govulncheck $(GOVULNCHECK_VERSION)$(RESET)"
+	@$(GO) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
+	@echo "$(CYAN)  actionlint $(ACTIONLINT_VERSION)$(RESET)"
+	@$(GO) install github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
 	@echo "$(CYAN)  shellcheck (pinned, checksum-verified)$(RESET)"
 	@./scripts/install-shellcheck.sh "$$($(GO) env GOPATH)/bin"
 	@echo "$(CYAN)  trivy $(TRIVY_VERSION) (pinned, checksum-verified)$(RESET)"

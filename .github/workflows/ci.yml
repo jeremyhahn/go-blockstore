@@ -5,6 +5,14 @@
 # fetched from github.com. Divergence outside the CUSTOMIZE blocks below is a
 # defect.
 #
+# ONE DELIBERATE DIVERGENCE, AHEAD OF THE TEMPLATE (#30): the four tool-install
+# steps (golangci-lint, actionlint, gosec, govulncheck) no longer install over
+# the binaries the ci-runner image bakes. Template v1.12 still installs all four
+# unconditionally, so a straight re-copy of the template WOULD REVERT THIS and
+# re-break lint the moment this repo's `go` directive reaches 1.27. Carry this
+# forward on the next template sync, or take it from the template once the
+# template adopts it.
+#
 # v1.9 is a FAIL-FAST STAGED PIPELINE. Gitea cannot cancel in-flight jobs (no
 # cancel route — measured, task #90), so fail-fast comes from ORDERING:
 #
@@ -82,23 +90,79 @@ jobs:
       - name: Vet
         run: go vet -tags="${BUILD_TAGS}" ./...
 
-      - name: Install golangci-lint
-        # PINNED (devops.md §9 documented-pin clause; go-qrdb#42, 2026-08-19):
-        # @latest moved to v2.13.0, which panics under Go 1.26 ("nilness:
-        # internal error: unhandled builtin recover" in honnef.co/go/tools
-        # v0.8.0-rc.1) and took the whole gate down — and under the staged
-        # pipeline, with it every job that needs lint. Unpin when an upstream
-        # release passes across the portfolio (tracked on go-qrdb#42).
-        # RETRIED (2026-08-20): sum.golang.org tile fetches during this install
-        # flake with HTTP/2 INTERNAL_ERROR, and a linter-INSTALL flake must not
-        # block the pipeline. Full sumdb verification kept — do NOT "fix" this
-        # with GOSUMDB=off, which trades a flake for a supply-chain hole.
+      # PREFER THE BAKED BINARY; NEVER INSTALL OVER IT (#30).
+      #
+      # `runs-on: ubuntu-latest` resolves to jeremyhahn/ci-runner on every Gitea
+      # runner host, and that image BAKES golangci-lint at /usr/local/bin. The
+      # step this replaces ran `go install ...@v2.12.2` unconditionally, so the
+      # baked binary was overwritten on every single run by an older one built
+      # with whatever Go setup-go had just provisioned.
+      #
+      # That is not a cosmetic downgrade. golangci-lint REFUSES to load a config
+      # when the Go it was BUILT with is older than the module's target:
+      #
+      #   can't load config: the Go language version (go1.26) used to build
+      #   golangci-lint is lower than the targeted Go version (1.27.0)
+      #
+      # A `go install` here is always built with GO_VERSION, so on the day this
+      # repo's `go` directive moves to 1.27 the install path can never satisfy
+      # it — no pin fixes that, only using the image's copy does. The image
+      # builds its tools with the portfolio MAXIMUM Go for exactly this reason.
+      #
+      # A FLOOR, NOT AN EXACT PIN. Requiring equality would make every image
+      # bump a fleet-wide red gate until each repo edits this line; requiring a
+      # minimum lets the image move ahead while a STALE image (or a fallback
+      # install that resolved something older) still fails loudly. Measured
+      # 2026-09-03 on this tree at v2.13.2 built with go1.27.0: 0 issues, and
+      # none of the v2.13.0 Go-1.26 panic recorded in the note this replaces.
+      #
+      # The install is the ABSENT case only — the GitHub mirror's hosted
+      # runners bake nothing. It is pinned to the floor rather than @latest so
+      # that path is reproducible, and the floor is re-asserted afterwards, so
+      # no path can end with a tool below it.
+      - name: Provide golangci-lint
+        env:
+          GOLANGCI_LINT_MIN: "2.13.2"    # keep in step with ci-runner/Dockerfile
         run: |
-          for i in 1 2 3; do
-            go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 && exit 0
-            echo "install attempt $i failed; retrying"; sleep 10
-          done
-          echo "golangci-lint install failed after 3 attempts"; exit 1
+          set -eu
+          if command -v golangci-lint > /dev/null 2>&1; then
+            echo "using the image's golangci-lint: $(command -v golangci-lint)"
+          else
+            echo "golangci-lint absent (expected on the GitHub mirror, NOT on ci-runner)"
+            # RETRIED: sum.golang.org tile fetches flake with HTTP/2
+            # INTERNAL_ERROR on this fleet (every host resolves AAAA and has no
+            # v6 route), and a tool-INSTALL flake must not block the pipeline.
+            # Full sumdb verification kept — do NOT "fix" this with GOSUMDB=off,
+            # which trades a flake for a supply-chain hole.
+            ok=0
+            for i in 1 2 3; do
+              if go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v${GOLANGCI_LINT_MIN}"; then ok=1; break; fi
+              echo "install attempt $i failed; retrying"; sleep 10
+            done
+            [ "$ok" = 1 ] || { echo "golangci-lint install failed after 3 attempts"; exit 1; }
+          fi
+
+          # Recorded in the job log on purpose: the workflow file says what was
+          # ASKED for, this says what will actually run — and it carries the Go
+          # the binary was built with, which is the half that decides whether a
+          # 1.27 module can be linted at all.
+          echo "golangci-lint reports: $(golangci-lint --version 2>&1 | head -1)"
+          if [ -r /etc/ci-runner-tools.txt ]; then
+            echo "ci-runner tool manifest:"; cat /etc/ci-runner-tools.txt
+          fi
+
+          # `--version` prints "...has version 2.13.2 built with go1.27.0...";
+          # head -1 of the semver matches takes the TOOL's version, not the Go
+          # one that follows it.
+          GOT=$(golangci-lint --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          [ -n "$GOT" ] || { echo "::error::could not read a golangci-lint version"; exit 1; }
+          LOWEST=$(printf '%s\n%s\n' "$GOLANGCI_LINT_MIN" "$GOT" | sort -V | head -1)
+          if [ "$LOWEST" != "$GOLANGCI_LINT_MIN" ]; then
+            echo "::error::golangci-lint ${GOT} is below the required ${GOLANGCI_LINT_MIN}."
+            echo "The ci-runner image is stale — rebuild and push it; do not lower this floor."
+            exit 1
+          fi
+          echo "OK: golangci-lint ${GOT} >= ${GOLANGCI_LINT_MIN}"
 
       # .golangci.yml enables staticcheck, errcheck, unused, ineffassign,
       # misspell and gocritic (devops.md §8) — the umbrella with the security
@@ -119,16 +183,36 @@ jobs:
       # what keeps self-hosted labels from reading as unknown runners, which is
       # what trains people to ignore linter output.
       #
-      # Unpinned, like gosec and govulncheck above: the documented-pin clause
-      # (devops.md §9) is for tools with a specific reason to freeze, which is
-      # golangci-lint's panic under Go 1.26, not a default.
-      - name: Install actionlint
+      # Same shape as golangci-lint above (#30): the ci-runner image bakes
+      # actionlint too, and `@latest` both overwrote it and made the gate
+      # non-reproducible — the same commit gets linted by a different actionlint
+      # on a different day, so a red gate can appear with no commit behind it.
+      # Prefer the baked copy; install only when absent, pinned to the floor.
+      - name: Provide actionlint
+        env:
+          ACTIONLINT_MIN: "1.7.7"       # keep in step with ci-runner/Dockerfile
         run: |
-          for i in 1 2 3; do
-            go install github.com/rhysd/actionlint/cmd/actionlint@latest && exit 0
-            echo "install attempt $i failed; retrying"; sleep 10
-          done
-          echo "actionlint install failed after 3 attempts"; exit 1
+          set -eu
+          if command -v actionlint > /dev/null 2>&1; then
+            echo "using the image's actionlint: $(command -v actionlint)"
+          else
+            echo "actionlint absent (expected on the GitHub mirror, NOT on ci-runner)"
+            ok=0
+            for i in 1 2 3; do
+              if go install "github.com/rhysd/actionlint/cmd/actionlint@v${ACTIONLINT_MIN}"; then ok=1; break; fi
+              echo "install attempt $i failed; retrying"; sleep 10
+            done
+            [ "$ok" = 1 ] || { echo "actionlint install failed after 3 attempts"; exit 1; }
+          fi
+          echo "actionlint reports: $(actionlint -version 2>&1 | head -1)"
+          GOT=$(actionlint -version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          [ -n "$GOT" ] || { echo "::error::could not read an actionlint version"; exit 1; }
+          LOWEST=$(printf '%s\n%s\n' "$ACTIONLINT_MIN" "$GOT" | sort -V | head -1)
+          if [ "$LOWEST" != "$ACTIONLINT_MIN" ]; then
+            echo "::error::actionlint ${GOT} is below the required ${ACTIONLINT_MIN} — rebuild the ci-runner image."
+            exit 1
+          fi
+          echo "OK: actionlint ${GOT} >= ${ACTIONLINT_MIN}"
 
       # actionlint delegates every SC-prefixed rule to shellcheck, invoked BY
       # NAME from PATH. With shellcheck absent it DISABLES those rules and still
@@ -138,6 +222,16 @@ jobs:
       # through the same scripts/install-shellcheck.sh that `make install-tools`
       # runs, so the shellcheck in CI and on a dev box are the same binary. It
       # installs to GOPATH/bin, which setup-go has already put on PATH.
+      #
+      # DELIBERATELY NOT GUARDED like the four steps above (#30). This one is
+      # not in that class: it installs to GOPATH/bin and so overwrites nothing
+      # the image bakes, and it is version-pinned AND SHA-256-verified against
+      # the extracted binary — strictly stronger than trusting whatever is on
+      # PATH. Adding a `command -v shellcheck` skip here would reinstate the
+      # trust-on-sight fast path that ci-template v1.12 removed from
+      # install-shellcheck.sh on purpose (this repo's #22). The cost is one
+      # pinned download per run; the benefit is that the SC* rules run against
+      # a known binary.
       - name: Install shellcheck
         run: ./scripts/install-shellcheck.sh "$(go env GOPATH)/bin"
 
@@ -194,16 +288,42 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Install gosec
-        # RETRIED: same sum.golang.org flake class as the lint install — a
-        # tool-install network failure must not fail a job that never ran its
-        # analysis. Full sumdb verification kept.
+      # Prefer the baked binary (#30). `@latest` made this gate
+      # non-reproducible — the same commit gets scanned by a different analyser
+      # on a different day — and it overwrote the image's PINNED copy to do it.
+      #
+      # gosec CANNOT BE VERSION-ASSERTED FROM ITS OWN OUTPUT. `go install`
+      # builds it without the release ldflags, so `gosec --version` prints
+      # "Version: dev" whatever was selected (go-luks2 #21). So `dev` in this
+      # log must NOT be read as "unpinned", and no floor check is possible here
+      # the way it is for golangci-lint. What is possible: never install over
+      # the image's ldflags-built copy, print /etc/ci-runner-tools.txt so the
+      # log carries the version that actually scanned, and give the fallback the
+      # same -ldflags the image uses so the mirror self-reports too.
+      - name: Provide gosec
+        env:
+          GOSEC_VERSION: "v2.29.0"      # keep in step with ci-runner/Dockerfile
         run: |
-          for i in 1 2 3; do
-            go install github.com/securego/gosec/v2/cmd/gosec@latest && exit 0
-            echo "install attempt $i failed; retrying"; sleep 10
-          done
-          echo "tool install failed after 3 attempts"; exit 1
+          set -eu
+          if command -v gosec > /dev/null 2>&1; then
+            echo "using the image's gosec: $(command -v gosec)"
+          else
+            echo "gosec absent (expected on the GitHub mirror, NOT on ci-runner)"
+            # RETRIED: same sum.golang.org flake class as the lint install — a
+            # tool-install network failure must not fail a job that never ran
+            # its analysis. Full sumdb verification kept.
+            ok=0
+            for i in 1 2 3; do
+              if go install -ldflags "-X main.Version=${GOSEC_VERSION}" \
+                   "github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}"; then ok=1; break; fi
+              echo "install attempt $i failed; retrying"; sleep 10
+            done
+            [ "$ok" = 1 ] || { echo "gosec install failed after 3 attempts"; exit 1; }
+          fi
+          echo "gosec reports: $(gosec --version 2>&1 | head -1)"
+          if [ -r /etc/ci-runner-tools.txt ]; then
+            echo "ci-runner tool manifest:"; cat /etc/ci-runner-tools.txt
+          fi
 
       # CUSTOMIZE (with justification): this repo carries NO -exclude rules,
       # and adding one means writing the reason here, checked against the code,
@@ -260,13 +380,38 @@ jobs:
           sarif_file: gosec.sarif
           category: gosec
 
-      - name: Install govulncheck
+      # Prefer the baked binary (#30), same reasoning as gosec above. Unlike
+      # gosec, govulncheck DOES report its own version truthfully whichever way
+      # it was built ("Scanner: govulncheck@v1.7.0"), so the floor is checkable.
+      - name: Provide govulncheck
+        env:
+          GOVULNCHECK_MIN: "1.7.0"      # keep in step with ci-runner/Dockerfile
         run: |
-          for i in 1 2 3; do
-            go install golang.org/x/vuln/cmd/govulncheck@latest && exit 0
-            echo "install attempt $i failed; retrying"; sleep 10
-          done
-          echo "tool install failed after 3 attempts"; exit 1
+          set -eu
+          if command -v govulncheck > /dev/null 2>&1; then
+            echo "using the image's govulncheck: $(command -v govulncheck)"
+          else
+            echo "govulncheck absent (expected on the GitHub mirror, NOT on ci-runner)"
+            ok=0
+            for i in 1 2 3; do
+              if go install "golang.org/x/vuln/cmd/govulncheck@v${GOVULNCHECK_MIN}"; then ok=1; break; fi
+              echo "install attempt $i failed; retrying"; sleep 10
+            done
+            [ "$ok" = 1 ] || { echo "govulncheck install failed after 3 attempts"; exit 1; }
+          fi
+          # The whole preamble goes in the log; the version is then read by
+          # ANCHORING ON "govulncheck@v" rather than matching a bare semver.
+          # Line 1 is "Go: go1.27.0" — the Go the SCAN runs under — and a bare
+          # semver match would take that instead of the scanner's version.
+          govulncheck -version 2>&1 | head -4
+          GOT=$(govulncheck -version 2>&1 | sed -n 's/.*govulncheck@v\([0-9.]*\).*/\1/p' | head -1)
+          [ -n "$GOT" ] || { echo "::error::could not read a govulncheck version"; exit 1; }
+          LOWEST=$(printf '%s\n%s\n' "$GOVULNCHECK_MIN" "$GOT" | sort -V | head -1)
+          if [ "$LOWEST" != "$GOVULNCHECK_MIN" ]; then
+            echo "::error::govulncheck ${GOT} is below the required ${GOVULNCHECK_MIN} — rebuild the ci-runner image."
+            exit 1
+          fi
+          echo "OK: govulncheck ${GOT} >= ${GOVULNCHECK_MIN}"
 
       # Also the toolchain-currency forcing function: fails on stdlib vulns in
       # an outdated Go (devops.md §9). Exit code triaged for the same reason as
