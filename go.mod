@@ -4,7 +4,7 @@ go 1.26.7
 
 require (
 	github.com/jeremyhahn/go-enclave v0.4.0-alpha
-	github.com/jeremyhahn/go-luks2 v0.1.10-alpha
+	github.com/jeremyhahn/go-luks2 v0.2.0-alpha
 	golang.org/x/sys v0.47.0
 )
 

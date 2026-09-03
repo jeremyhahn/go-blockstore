@@ -60,17 +60,20 @@ const luksSectorSize = 512
 // benchmarks PBKDF2 against when it picks an iteration count.
 //
 // It is stated rather than defaulted, like every other format parameter, and it
-// happens to be go-luks2's own default. What it actually BUYS is smaller than
-// it looks and the difference is recorded here rather than discovered later:
-// measured against go-luks2 v0.1.7-alpha on 2026-08-29, the benchmark times
-// 1000 iterations of PBKDF2-HMAC-SHA-512 with time.Since(...).Milliseconds(),
-// that derivation takes well under a millisecond on this hardware, and the
-// elapsed time therefore rounds to ZERO — so the benchmark falls through to a
-// hard-coded 100000 and this figure is not consulted at all. Every container
-// formatted here comes out with exactly 100000 iterations, whatever is set
-// here. See luksFormat for why that is acceptable for the material this
-// provider stretches, and it is filed against go-luks2 rather than worked
-// around here.
+// happens to be go-luks2's own default. It BUYS nothing until go-luks2
+// v0.2.0-alpha, and that is recorded here rather than discovered later: measured
+// against v0.1.7-alpha on 2026-08-29, the benchmark timed 1000 iterations of
+// PBKDF2-HMAC-SHA-512 with time.Since(...).Milliseconds(), that derivation takes
+// well under a millisecond on this hardware, and the elapsed time therefore
+// rounded to ZERO — so it fell through to a hard-coded 100000 and this figure
+// was not consulted at all.
+//
+// go-luks2 #102 fixed the calibration. Measured on 2026-09-03 across the bump,
+// with the parameters Format pins below: v0.1.10-alpha wrote 100000 iterations
+// in 363ms, v0.2.0-alpha writes 3,988,449 in 2.42s — so this constant is now
+// the target it always claimed to be, and the derivation lands where the 2000ms
+// asks. See luksFormat for why the old count was nonetheless acceptable for the
+// high-entropy material this provider stretches.
 const luksPBKDFIterTime = 2000
 
 // Format writes a LUKS2 header onto the device with every cryptographic

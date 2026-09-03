@@ -416,17 +416,27 @@ func (p *Provider) withKey(ctx context.Context, volID string, op func(key []byte
 //
 // The iteration count is left to go-luks2's benchmark rather than pinned, for
 // the reason a pinned count is worse: a fixed number cannot rise on faster
-// hardware. Measured on go-luks2 v0.1.7-alpha, that benchmark does not in fact
-// adapt — it times 1000 PBKDF2-SHA-512 iterations at millisecond resolution,
-// that derivation takes under a millisecond, and it falls through to a
-// hard-coded 100000 — so every container formatted here gets 100000 iterations
-// where cryptsetup 2.7.0 chose 3,344,740 on the same hardware. That is above
-// the 1000-iteration floor NIST SP 800-132 asks for, so compliance holds, and
-// it is not load-bearing for the material this provider stretches: KeyProvider
-// returns machine-generated high-entropy key material, not a human passphrase,
-// so there is no low-entropy secret for the iteration count to be defending.
-// The behavior is recorded at luksPBKDFIterTime and filed against go-luks2
-// rather than compensated for here.
+// hardware. That reasoning did not hold until go-luks2 v0.2.0-alpha, and the
+// history is kept because it is what makes the current number credible: the
+// benchmark timed 1000 PBKDF2-SHA-512 iterations at millisecond resolution, a
+// derivation that finishes in well under a millisecond, so the elapsed time
+// rounded to zero and every container came out with a hard-coded 100000 —
+// against the 3,344,740 cryptsetup 2.7.0 chose on the same hardware. go-luks2
+// #102 fixed the calibration and this provider adopted it in #45.
+//
+// Measured after the adoption, with the parameters below: 3,988,449 iterations,
+// 2.42s of derivation, against 100000 and 363ms before it. So the count now
+// tracks the hardware, and luksPBKDFIterTime is consulted rather than ignored.
+// The cost is real and is paid on every Provision — roughly two seconds per
+// container that used to be a third of one — and it is the cost of the work
+// actually being done.
+//
+// The floor was never the concern for the material this provider stretches:
+// KeyProvider returns machine-generated high-entropy key material, not a human
+// passphrase, so there is no low-entropy secret for the iteration count to be
+// defending, and 100000 already cleared the 1000 NIST SP 800-132 asks for. What
+// changed is that a parameter this code states is now the parameter that takes
+// effect.
 //
 // The passphrase never leaves the process. It was written to a cryptsetup
 // child's standard input before 2026-08-29 — never as an argument, which any

@@ -186,14 +186,18 @@ func TestNativeFormatProducesTheHeaderTheSizingConstantAssumes(t *testing.T) {
 // left to the library, and the floor it must not fall below.
 //
 // NIST SP 800-132 asks for at least 1000 PBKDF2 iterations. Measured on
-// go-luks2 v0.1.7-alpha (2026-08-29) the answer is 100000 every time: its
-// benchmark times 1000 iterations at millisecond resolution, PBKDF2-SHA-512
-// finishes that in under a millisecond, and it falls through to a hard-coded
-// figure — so it does not adapt to hardware the way cryptsetup's did, where the
-// same parameters produced 3,344,740. That is recorded rather than pinned here:
-// the floor is what compliance needs, the count is not load-bearing for the
-// high-entropy material this provider stretches, and pinning the measured value
-// would turn a future improvement in go-luks2 into a test failure.
+// go-luks2 v0.1.7-alpha (2026-08-29) the answer was 100000 every time: its
+// benchmark timed 1000 iterations at millisecond resolution, PBKDF2-SHA-512
+// finishes that in under a millisecond, and it fell through to a hard-coded
+// figure — so it did not adapt to hardware the way cryptsetup's did, where the
+// same parameters produced 3,344,740.
+//
+// The improvement arrived: go-luks2 v0.2.0-alpha calibrates, and on 2026-09-03
+// the same parameters produced 3,988,449. This test did not have to change,
+// which is the point of it — the floor is what compliance needs, the count is
+// not load-bearing for the high-entropy material this provider stretches, and
+// pinning the measured value would have turned that improvement into a test
+// failure. It is left unpinned for the next one.
 func TestNativeFormatClearsTheIterationFloor(t *testing.T) {
 	device := newContainerFile(t, 32<<20)
 
