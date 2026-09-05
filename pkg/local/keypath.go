@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/jeremyhahn/go-blockstore/internal/mountguard"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
@@ -306,7 +307,7 @@ func (p *Provider) checkKeyFileAgainstMountedFilesystem(ctx context.Context, tar
 	// instant would otherwise leave a mount nobody checked and nobody cleans up,
 	// with a credential possibly inside it, because the reads that would find it
 	// fail first.
-	ctx, cancel := unwindContext(ctx)
+	ctx, cancel := mountguard.UnwindContext(ctx)
 	defer cancel()
 
 	if err := p.checkKeyFileOutside(target, "the path this volume is now mounted on"); err != nil {
@@ -346,7 +347,7 @@ func (p *Provider) checkKeyFileAgainstMountedFilesystem(ctx context.Context, tar
 // and an operator needs both — and needs to be told first about the one that is
 // still true.
 func (p *Provider) unwindRefusedMount(ctx context.Context, device, target string, finding error) error {
-	ctx, cancel := unwindContext(ctx)
+	ctx, cancel := mountguard.UnwindContext(ctx)
 	defer cancel()
 
 	visible, err := p.visibleMountpointsFor(ctx, device)
