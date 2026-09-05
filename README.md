@@ -445,3 +445,60 @@ unlocked and inspected in-process by go-luks2, and the loop device is attached
 with the loop ioctls rather than by forking `losetup`. Neither are `findmnt`,
 `dd`, `blkdiscard` or `mount`/`umount`: those operations are syscalls and ioctls
 made in-process.
+
+The **one** test that does need `cryptsetup` — the migration gate proving a
+container written by the pre-go-luks2 implementation still opens — lives behind
+its own tag, because the suite above advertises that it needs no such binary:
+
+```
+sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 make integration-test-cryptsetup
+```
+
+It previously sat in the local suite behind a **runtime skip**, so on any host
+without `cryptsetup` — CI included — the migration gate for every encrypted
+volume in the fleet reported success without running. Selecting the tag is an
+operator declaring the binary is present, so its absence is now a hard failure
+rather than a quiet pass. `make guards` is what found it.
+
+### Whole-tree guards
+
+```
+make guards          # also run by `make lint`, and by the CI Lint job
+```
+
+The scanners in `internal/guards` assert properties across the **entire**
+repository rather than over whatever a test happens to touch: no runtime skip
+anywhere, no unexplained `|| true`, and no document, script or workflow that
+offers `--privileged` as a fix. They read source instead of compiling it, so a
+build tag cannot hide anything from them — which matters, because a tag-gated
+file is exactly where a skip hides from a compile-based check.
+
+Two properties of the runner are load-bearing:
+
+- **A passing run prints what it examined.** `no-runtime-skip: examined 131
+  file(s), clean` is evidence; a bare "no findings" is not, because a scanner
+  that read nothing reports the same thing. An examined set of zero is a
+  failure, and so is an empty scanner list.
+- **Every scanner is proved able to fire.** `make guards` runs the package's
+  own tests alongside the sweep, and those run each scanner against a fixture
+  tree containing its violation — asserting each planted violation is found
+  individually, not merely that something was.
+
+Deliberate exceptions are declared in place with a reason —
+`# guard:fail-open <why>` on the line or the one above it — never by weakening
+a scanner.
+
+### Checking `internal/mountinfo` against a live kernel
+
+```
+make test-kernel-mountinfo
+```
+
+Three tests re-execute themselves inside an unprivileged user + mount namespace
+and check this package's answers against the kernel running now, rather than
+against tables frozen from an older one. They are behind the `kernel_mountinfo`
+tag because a host that will not create such a namespace cannot run them —
+including the container CI runs in, where all three previously **skipped** and
+the package printed `ok` in 0.002s. Selecting the tag states that the host
+provides the capability, so a refusal is now a hard failure. `make guards` is
+what found it.

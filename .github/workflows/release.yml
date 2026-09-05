@@ -424,7 +424,7 @@ jobs:
           PREV_TAG="$(git -c versionsort.suffix=- tag --list 'v*' --sort=v:refname \
                       | grep -E "$sanctioned_tag" \
                       | awk -v cur="${RELEASE_TAG}" '$0 == cur { exit } { print }' \
-                      | tail -n1 || true)"
+                      | tail -n1 || true)"   # guard:fail-open no previous tag means this is the first release, which is not an error
           {
             echo "version=${VERSION}"
             echo "prev_tag=${PREV_TAG}"

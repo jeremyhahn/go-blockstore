@@ -152,6 +152,7 @@ deps-latest:
 		echo "$(RED)✗ go list -m failed — cannot determine dependencies$(RESET)"; \
 		exit 1; \
 	fi; \
+	: "guard:fail-open grep exits 1 on no match, and a repo with no first-party deps is valid; the -z test below is what handles it"; \
 	FIRST_PARTY=$$(printf '%s\n' "$$ALL_MODS" | grep '^github.com/jeremyhahn/' | grep -v '^$(MODULE)$$' || true); \
 	if [ -z "$$FIRST_PARTY" ]; then \
 		echo "$(YELLOW)  No first-party dependencies yet — nothing to update$(RESET)"; \
@@ -189,6 +190,7 @@ test:
 	@mkdir -p $(COVERAGE_DIR)
 	$(GOTEST) -race -count=1 -timeout=$(TEST_TIMEOUT) -covermode=atomic -coverprofile=$(COVERAGE_PROFILE) ./...
 	@echo ""
+# guard:fail-open a display line only — the coverage THRESHOLD is enforced by the `coverage` target, which does not swallow
 	@$(GO) tool cover -func=$(COVERAGE_PROFILE) | tail -1 | awk '{print "  $(GREEN)Total coverage: " $$NF "$(RESET)"}' || true
 	@echo "$(GREEN)✓ Unit tests complete$(RESET)"
 
@@ -292,6 +294,7 @@ integration-test-local:
 integration-clean-local:
 	@echo "$(CYAN)$(BOLD)→ Removing state a killed local integration run left behind...$(RESET)"
 	@mappings=$$(dmsetup ls 2>/dev/null | awk '$$1 ~ /^bs-bsit[0-9]+x[0-9]+_/ {print $$1}'); \
+	: "guard:fail-open grep exits 1 when no bsit group is left, which is the normal case. RESIDUAL, stated rather than hidden: a FAILING vgs is swallowed here too, so an unreadable answer looks like a clean one. Harm is bounded because this target CLEANS debris — a false empty leaves debris rather than destroying anything — but it is the same shape as the dmsetup guard that once reported no mappings because the read failed."; \
 	vgs=$$(vgs --noheadings -o vg_name 2>/dev/null | tr -d ' ' | grep -E '^bsit[0-9]+x[0-9]+$$' || true); \
 	loops=""; \
 	for v in $$vgs; do \
@@ -340,6 +343,68 @@ test-container:
 		-e GOPROXY=off -e GOCACHE=/tmp/gocache \
 		golang:$(GO_VERSION) go test $(TAG_FLAGS) -count=1 -timeout=$(TEST_TIMEOUT) ./...
 	@echo "$(GREEN)✓ Container suite complete$(RESET)"
+
+.PHONY: integration-test-cryptsetup
+## integration-test-cryptsetup: The one suite needing the cryptsetup binary (DESTRUCTIVE, needs root + loopback + cryptsetup)
+# Separate from integration-test-local because that suite's documented tooling
+# is lvm2, e2fsprogs and util-linux and deliberately NOT cryptsetup — nothing
+# else in it shells out to one. This is the pre-go-luks2 migration gate: it
+# reproduces a container the OLD implementation wrote, which only cryptsetup can
+# produce, and then proves this package still opens it.
+#
+# It used to live in the local suite behind a RUNTIME SKIP, so on any host
+# without cryptsetup — including CI — the migration gate for every encrypted
+# volume in the fleet reported success without running. Selecting this tag is an
+# operator declaring cryptsetup is present, so its absence is now a hard failure
+# of a suite that promised to have it (conventions/testing-guidelines.md
+# §No Skip Guards; found by `make guards`).
+integration-test-cryptsetup:
+	@echo "$(CYAN)$(BOLD)→ Running the cryptsetup compatibility gate...$(RESET)"
+	@echo "$(YELLOW)  DESTRUCTIVE: creates and destroys loop devices, VGs and LUKS volumes on this host$(RESET)"
+	@echo "$(YELLOW)  REQUIRES: root, loop devices, lvm2 AND the cryptsetup binary$(RESET)"
+	$(GO) test -tags=local_integration,cryptsetup_compat -count=1 -timeout=$(TEST_TIMEOUT) -run Integration ./pkg/local/
+	@echo "$(GREEN)✓ cryptsetup compatibility gate complete$(RESET)"
+
+.PHONY: guards
+## guards: Run the whole-tree scanners (internal/guards)
+# Whole-TREE, so they read files rather than compiling them: a build tag cannot
+# blind them, which matters because a tag-gated file is exactly where a skip
+# hides. Each scanner reports what it EXAMINED as well as what it found, and an
+# empty examined set is a failure — an empty file list and a clean tree
+# otherwise produce the same verdict, which is the defect that prompted #47.
+#
+# TWO COMMANDS, ANSWERING DIFFERENT QUESTIONS. The binary asks whether the tree
+# is clean; the package tests ask whether the scanners can still FIRE at all,
+# against fixtures that contain each violation. A green sweep from scanners
+# nobody has watched fail is the defect this target exists to prevent.
+#
+# Neither carries a `-run` filter, and that is deliberate. The first version of
+# this target ran `go test -run TestGuards`, which is the same defect in a
+# different coat: a `-run` pattern matching nothing prints `ok` and exits 0.
+guards:
+	@echo "$(CYAN)$(BOLD)→ Running the whole-tree guards...$(RESET)"
+	$(GO) run ./internal/guards/cmd/guards
+	@echo "$(CYAN)  …and proving each one can still fire:$(RESET)"
+	$(GO) test -count=1 ./internal/guards/
+	@echo "$(GREEN)✓ Guards passed$(RESET)"
+
+.PHONY: test-kernel-mountinfo
+## test-kernel-mountinfo: Check internal/mountinfo against a LIVE kernel (needs unprivileged user namespaces)
+# Behind the kernel_mountinfo tag because these three tests re-exec themselves
+# in a user + mount namespace, and a host that will not create one cannot run
+# them. They used to SKIP there instead — measured 2026-09-04: inside
+# golang:$(GO_VERSION), the image `make test-container` uses, all three skipped
+# and the package printed ok in 0.002s, so the only tests checking this package
+# against a real kernel had silently stopped running in the shape CI runs in.
+#
+# Selecting the tag is a statement that this host provides the capability, so a
+# refusal is now a hard failure (conventions/testing-guidelines.md
+# §No Skip Guards; found by `make guards`).
+test-kernel-mountinfo:
+	@echo "$(CYAN)$(BOLD)→ Checking internal/mountinfo against this kernel...$(RESET)"
+	@echo "$(YELLOW)  REQUIRES: a host that permits unprivileged user + mount namespaces$(RESET)"
+	$(GO) test -tags=kernel_mountinfo -count=1 -timeout=$(TEST_TIMEOUT) -run TestAgainstARunningKernel -v ./internal/mountinfo/
+	@echo "$(GREEN)✓ Live-kernel mountinfo checks complete$(RESET)"
 
 .PHONY: preflight-matrix
 ## preflight-matrix: Prove the startup privilege guard fires (and does not) in real containers
@@ -404,7 +469,7 @@ vet:
 
 .PHONY: lint
 ## lint: gofmt, vet, golangci-lint and actionlint (devops.md §4)
-lint: fmt-check vet golangci-lint actionlint
+lint: fmt-check vet golangci-lint actionlint guards
 
 .PHONY: golangci-lint
 ## golangci-lint: Run golangci-lint (config is version "2" — needs the v2 binary)
@@ -864,6 +929,7 @@ release-alpha:
 ## clean: Remove build and test output
 clean:
 	@echo "$(CYAN)$(BOLD)→ Cleaning...$(RESET)"
+# guard:fail-open clean is best-effort; an absent cache is the normal case and nothing downstream reads this
 	@$(GOCLEAN) -testcache 2>/dev/null || true
 	@rm -rf $(COVERAGE_DIR)
 	@rm -f gosec-results.json trivy-results.sarif

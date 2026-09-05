@@ -11,6 +11,48 @@
 // 2. Commercial License
 //    Contact licensing@automatethethings.com for commercial licensing options.
 
+//go:build kernel_mountinfo
+
+// The frozen tables in visibility_test.go were copied from a kernel, but they
+// were copied ONCE. This file makes the mounts again, here, now, and checks the
+// answer against the kernel this test is running on — so a table that a future
+// kernel writes differently is caught rather than passing against a snapshot of
+// an older one.
+//
+// It needs a mount namespace, which needs privilege. Rather than requiring
+// root, the test re-executes itself inside a user namespace where it is root:
+// tmpfs is one of the filesystems a user namespace may mount, which is why the
+// mounts below are tmpfs and not something block-backed.
+//
+//	make test-kernel-mountinfo
+//
+// # Why a build tag and not the runtime skip this file used to have
+//
+// Where a user namespace is refused, this used to SKIP. That was measured on
+// 2026-09-04 and it is not a hypothetical cost: inside `golang:1.26.7` — the
+// image `make test-container` uses and the shape CI runs in — all three tests
+// below skipped and the package printed `ok` in 0.002s. On a developer host
+// they pass in a fresh namespace. So the only three tests that check this
+// package against a REAL kernel had silently stopped running exactly where it
+// mattered, and nothing said so.
+//
+// conventions/testing-guidelines.md §No Skip Guards prescribes the fix for a
+// genuinely optional capability: a declared build tag whose tier actually
+// provides the dependency. Selecting `kernel_mountinfo` is an operator stating
+// that this host will create an unprivileged user + mount namespace, so a
+// refusal is now a hard FAILURE of a suite that promised the capability, and an
+// unselected tag is a visible, greppable absence rather than a green run.
+//
+// The honest consequence, stated rather than hidden: these tests do not run in
+// CI, because the CI container cannot run them and could not before this change
+// either. What changed is that the absence is now legible.
+//
+// It never touches the caller's mounts. The child makes / recursively private
+// before mounting anything, so nothing it does propagates out, and every mount
+// it makes disappears with the namespace when it exits.
+//
+// Found by internal/guards' no-runtime-skip scanner (#47).
+
 package mountinfo
 
 import (
@@ -23,23 +65,6 @@ import (
 
 	"golang.org/x/sys/unix"
 )
-
-// The frozen tables in visibility_test.go were copied from a kernel, but they
-// were copied ONCE. This file makes the mounts again, here, now, and checks the
-// answer against the kernel this test is running on — so a table that a future
-// kernel writes differently is caught rather than passing against a snapshot of
-// an older one.
-//
-// It needs a mount namespace, which needs privilege. Rather than requiring
-// root, the test re-executes itself inside a user namespace where it is root:
-// tmpfs is one of the filesystems a user namespace may mount, which is why the
-// mounts below are tmpfs and not something block-backed. Where that is not
-// permitted — /proc/sys/kernel/unprivileged_userns_clone off, a seccomp filter,
-// a hardened container — the test SKIPS and says which step failed and why.
-//
-// It never touches the caller's mounts. The child makes / recursively private
-// before mounting anything, so nothing it does propagates out, and every mount
-// it makes disappears with the namespace when it exits.
 
 // inNamespaceEnv marks the re-executed child. Its presence is the only
 // difference between the two halves of this test.
@@ -100,11 +125,16 @@ func relaunchInMountNamespace(t *testing.T, dirs ...string) {
 		return
 	}
 
-	// A namespace this host will not create is a skip, and it says so out loud
-	// with the child's own reason attached — a skip nobody can see reads as
-	// coverage, which is what this test exists to avoid being.
+	// A namespace this host will not create is a FAILURE, because selecting the
+	// kernel_mountinfo tag is the operator's statement that it will. The reason
+	// is still separated from a wrong answer, and still reported with the
+	// child's own message, so the two failure modes stay distinguishable — what
+	// changed is that neither of them reports success.
 	if reason := unsupportedReason(string(output)); reason != "" {
-		t.Skipf("this host will not run the kernel check: %s\nchild output:\n%s", reason, indent(string(output)))
+		t.Fatalf("this host refused the namespace the kernel_mountinfo tag says it provides: %s\n"+
+			"Either run this on a host where an unprivileged user namespace can be created, or drop the tag —\n"+
+			"do not report it as a pass (conventions/testing-guidelines.md §No Skip Guards).\nchild output:\n%s",
+			reason, indent(string(output)))
 	}
 	t.Fatalf("the kernel check failed: %v\n%s", err, indent(string(output)))
 }
@@ -232,69 +262,10 @@ func deviceOfMount(t *testing.T, path string) (uint32, uint32) {
 	return unix.Major(st.Dev), unix.Minor(st.Dev)
 }
 
-// unsupportedReason picks out the child failures that mean "this host does not
-// allow it" from the ones that mean "the code is wrong", and returns the
-// child's own message so the skip names the step that was refused.
-//
-// The child marks the first kind itself with an UNSUPPORTED prefix. A child
-// that could not start at all produces no output to mark, and clone(2) refusing
-// CLONE_NEWUSER is reported by the runtime rather than by the test.
-func unsupportedReason(output string) string {
-	for _, line := range strings.Split(output, "\n") {
-		if i := strings.Index(line, "UNSUPPORTED: "); i >= 0 {
-			return strings.TrimSpace(line[i+len("UNSUPPORTED: "):])
-		}
-	}
-	switch {
-	case strings.TrimSpace(output) == "":
-		return "the child produced no output at all, which is what a kernel refusing CLONE_NEWUSER looks like"
-	case strings.Contains(output, "operation not permitted"),
-		strings.Contains(output, "permission denied"):
-		return "creating a user or mount namespace was not permitted"
-	}
-	return ""
-}
-
 // indent keeps the child's output distinguishable from the parent's in a log
 // that already has two tests' worth of lines in it.
 func indent(s string) string {
 	return "\t" + strings.ReplaceAll(strings.TrimRight(s, "\n"), "\n", "\n\t")
-}
-
-// TestUnsupportedReasonNamesTheRefusedStep checks the skip path, because the
-// skip path is the one that never runs on a host where the test works — and a
-// skip that fired silently, or a real failure misread as a skip, would both
-// read as coverage. The inputs are the child's actual output shapes.
-func TestUnsupportedReasonNamesTheRefusedStep(t *testing.T) {
-	cases := map[string]struct {
-		output string
-		want   string
-	}{
-		"a mount the namespace would not permit": {
-			output: "=== RUN   TestX\n    f_test.go:1: UNSUPPORTED: mounting tmpfs at /tmp/x: operation not permitted\n--- FAIL: TestX\n",
-			want:   "mounting tmpfs at /tmp/x: operation not permitted",
-		},
-		"a child that never started": {
-			output: "",
-			want:   "the child produced no output at all, which is what a kernel refusing CLONE_NEWUSER looks like",
-		},
-		"a clone refused before any test ran": {
-			output: "fork/exec /proc/self/exe: operation not permitted\n",
-			want:   "creating a user or mount namespace was not permitted",
-		},
-		"a genuine wrong answer is NOT a skip": {
-			output: "=== RUN   TestX\n    f_test.go:1: VisibleMountPointsFor(0:87) = [/tmp/x], want none\n--- FAIL: TestX\n",
-			want:   "",
-		},
-	}
-
-	for name, c := range cases {
-		t.Run(name, func(t *testing.T) {
-			if got := unsupportedReason(c.output); got != c.want {
-				t.Errorf("unsupportedReason = %q, want %q", got, c.want)
-			}
-		})
-	}
 }
 
 // TestAgainstARunningKernelASiblingOnTheCoveredPathIsSeparatedByItsAncestor is

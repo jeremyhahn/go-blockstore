@@ -90,6 +90,28 @@ jobs:
       - name: Vet
         run: go vet -tags="${BUILD_TAGS}" ./...
 
+      # The whole-tree scanners (#47). This job is the gate `make lint` mirrors,
+      # and `lint` depends on `guards`, so without this step the scanners would
+      # run only when somebody remembered to type it — a guard that exists but
+      # does not run.
+      #
+      # DELIBERATELY UNTAGGED, unlike every other step here. The scanners read
+      # source rather than compiling it, so BUILD_TAGS would not change what
+      # they see; passing it would suggest otherwise, and a tag-gated file is
+      # precisely where a runtime skip hides from a compile-based check.
+      #
+      # It prints the EXAMINED counts on a passing run, so the log carries the
+      # evidence that the sweep read something. A sweep that printed nothing is
+      # what opened #47, and it read as clean.
+      - name: Guards
+        run: |
+          go run ./internal/guards/cmd/guards
+          # …and prove the scanners can still fire, against fixtures that hold
+          # each violation. The line above only asks whether the tree is clean;
+          # a clean answer from a scanner nobody has watched fail is the defect
+          # itself. No -run filter on purpose: one matching nothing prints ok.
+          go test -count=1 ./internal/guards/
+
       # PREFER THE BAKED BINARY; NEVER INSTALL OVER IT (#30).
       #
       # `runs-on: ubuntu-latest` resolves to jeremyhahn/ci-runner on every Gitea

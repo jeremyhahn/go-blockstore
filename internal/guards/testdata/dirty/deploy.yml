@@ -1,0 +1,7 @@
+# A fixture proving both text scanners read CI YAML, which is where a workflow
+# would swallow a failure or suggest the flag.
+jobs:
+  fixture:
+    steps:
+      - run: docker run --privileged busybox true
+      - run: shellcheck scripts/*.sh || true
