@@ -13,7 +13,7 @@ self-hosted-runner:
   labels:
     - ubuntu-latest
     - ubuntu-22.04
+    - code-review
     - codex
     - codex-task
     - claude
-    - code-review-qwen
