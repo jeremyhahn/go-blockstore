@@ -310,6 +310,14 @@ A guard that is off appears in that list rather than being omitted from it,
 which is the difference between a list an operator can act on and one they
 cannot tell from complete.
 
+The **DRBD provider carries the same guard**, under the same
+`mount_propagation` setting and off by the same default, and reports it through
+its own `Provider.Posture()` (`go-blockstore/drbd guards:`). Replication changes
+which device is under the filesystem and changes nothing about whether the mount
+is visible where the workload looks for it — a check required in one provider
+and absent in its sibling would mean choosing a provider silently chose whether
+a class of failure is detectable.
+
 ### The mapping nobody is left to tear down
 
 An init container attaches and mounts for a pod, then exits. Teardown has no

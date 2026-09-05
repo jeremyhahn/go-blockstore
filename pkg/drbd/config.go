@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jeremyhahn/go-blockstore/internal/mountguard"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
@@ -84,6 +85,22 @@ const (
 	// provider that constructs happily on a node that cannot bring a resource
 	// up — and a choice with that consequence belongs where a reviewer sees it.
 	SettingPreflight = "preflight"
+
+	// SettingMountPropagation selects whether Mount verifies that the mount it
+	// made is visible outside this mount namespace: "unchecked" (the default)
+	// or "shared".
+	//
+	// Set it to "shared" where a workload in ANOTHER mount namespace consumes
+	// these mounts — a container handed a replicated volume by a storage
+	// component. Left unchecked there, a wrong propagation setting is the
+	// quietest failure in that model: the mount succeeds on this node, the
+	// workload finds an empty directory, and nothing anywhere reports an error.
+	//
+	// It is not the default because a mount is private on an ordinary host and
+	// that is correct there — a replicated cluster whose mounts nobody consumes
+	// from another namespace is not broken, and requiring propagation of it
+	// would refuse a working deployment on upgrade. See MountPropagationPolicy.
+	SettingMountPropagation = "mount_propagation"
 )
 
 // Defaults for the optional settings.
@@ -204,6 +221,14 @@ type Config struct {
 	// this configuration will exercise — a set that is NOT the local
 	// provider's; see requiredCapabilities.
 	Preflight PreflightMode
+
+	// MountPropagation selects whether Mount verifies that the mount it made is
+	// visible outside this mount namespace. It defaults to
+	// MountPropagationUnchecked; a deployment that hands these mounts to a
+	// workload in another namespace wants MountPropagationShared. See
+	// MountPropagationPolicy for why the default is off, and why off is still
+	// reported by Posture rather than being invisible.
+	MountPropagation MountPropagationPolicy
 }
 
 // ParseConfig validates a settings map and fills in defaults.
@@ -218,8 +243,8 @@ func ParseConfig(settings map[string]string) (Config, error) {
 		SettingPeerNode: {}, SettingPeerAddress: {}, SettingPeerNodeID: {},
 		SettingMinorBase: {}, SettingPortBase: {}, SettingSnapshotSizePercent: {},
 		SettingReplicationSecretFile: {}, SettingAllowUnauthenticatedPeers: {},
-		SettingWipeOnDelete: {},
-		SettingPreflight:    {},
+		SettingWipeOnDelete: {}, SettingPreflight: {},
+		SettingMountPropagation: {},
 	}
 	for k := range settings {
 		if _, ok := known[k]; !ok {
@@ -317,6 +342,14 @@ func ParseConfig(settings map[string]string) (Config, error) {
 				common.ErrInvalidArgument, SettingPreflight, raw, strings.Join(preflightModeSpellings(), ", "))
 		}
 		cfg.Preflight = mode
+	}
+	if raw, ok := settings[SettingMountPropagation]; ok && raw != "" {
+		policy, known := mountguard.Parse(raw)
+		if !known {
+			return Config{}, fmt.Errorf("%w: %s=%q is not one of %s",
+				common.ErrInvalidArgument, SettingMountPropagation, raw, strings.Join(mountguard.Spellings(), ", "))
+		}
+		cfg.MountPropagation = policy
 	}
 
 	if cfg.WipeOnDelete, err = optionalBool(settings, SettingWipeOnDelete); err != nil {

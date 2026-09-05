@@ -29,6 +29,7 @@ import (
 
 	"github.com/jeremyhahn/go-blockstore/internal/blkdev"
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
+	"github.com/jeremyhahn/go-blockstore/internal/mountguard"
 	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
@@ -267,6 +268,22 @@ func New(settings map[string]string, opts ...Option) (*Provider, error) {
 	}
 	if p.blockDevices == nil {
 		return nil, fmt.Errorf("%w: block devices is nil", common.ErrInvalidArgument)
+	}
+	// A provider told to require propagation, over a mount table that cannot
+	// report it, is a configuration that cannot work — and discovering it after
+	// the first mount is worse than useless: the mount has already happened, the
+	// guard cannot judge it, and the rollback cannot identify it either, so
+	// Mount would return an error over a filesystem it left mounted. It is a
+	// startup refusal for the same reason the preflight checks are, and it is
+	// only reachable through WithMountTable: the real mountinfo.System answers
+	// the question.
+	if !p.mountGuard().Policy.Valid() {
+		return nil, fmt.Errorf("%w: %s is %s, not one of %s",
+			common.ErrInvalidArgument, SettingMountPropagation, cfg.MountPropagation, strings.Join(mountguard.Spellings(), ", "))
+	}
+	if cfg.MountPropagation == MountPropagationShared && !p.mountGuard().CanReport() {
+		return nil, fmt.Errorf("%w: %s is %s, and the configured MountTable cannot report propagation (it does not implement MountPropagationReader)",
+			common.ErrInvalidArgument, SettingMountPropagation, MountPropagationShared)
 	}
 	// An injected provider wins over the file setting, so a caller unsealing
 	// from a TPM does not also have to leave the setting unset.
@@ -1179,6 +1196,19 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 	flags, data := mount.Arguments(opts.ReadOnly, opts.Flags)
 	if err := p.mounter.Mount(ctx, dev, target, fsType, flags, data); err != nil {
 		return fmt.Errorf("mounting volume %q at %q: %w", meta.Name, target, err)
+	}
+
+	// The mount exists in THIS namespace now. Whether it exists in the
+	// workload's is a different question, and the only moment it can be asked is
+	// this one: propagation is inherited from the parent at the instant mount(2)
+	// is called, so there was nothing to inspect before, and by the time a
+	// caller notices the workload's directory is empty the answer is expensive.
+	//
+	// Off unless the deployment asked for it; see MountPropagationPolicy. A
+	// refusal unwinds the mount rather than leaving one the caller was told did
+	// not happen.
+	if id, finding := p.verifyMountPropagation(ctx, dev, target); finding != nil {
+		return p.unwindUnverifiedMount(ctx, dev, target, id, finding)
 	}
 	return nil
 }

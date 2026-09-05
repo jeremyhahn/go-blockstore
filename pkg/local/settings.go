@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jeremyhahn/go-blockstore/internal/mountguard"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
@@ -161,7 +162,7 @@ func NewFromSettings(settings map[string]string) (*Provider, error) {
 	}
 
 	if raw, ok := settings[SettingMountPropagation]; ok && raw != "" {
-		policy, known := mountPropagationNames[raw]
+		policy, known := mountguard.Parse(raw)
 		if !known {
 			return nil, fmt.Errorf("%w: %s=%q is not one of %s",
 				common.ErrInvalidArgument, SettingMountPropagation, raw, strings.Join(mountPropagationSpellings(), ", "))

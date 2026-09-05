@@ -142,6 +142,22 @@
 // text/template whose inputs are typed integers and already-validated strings,
 // so a hostile VolumeSpec.Name cannot inject DRBD configuration.
 //
+// # Mount propagation, and what Posture is for
+//
+// A mount made here is invisible to a workload in another mount namespace
+// unless it propagates, and nothing reports that: mount(2) succeeds, this
+// provider reports success, and the workload finds the directory as it was.
+// mount_propagation=shared makes Mount verify the mount it just made and refuse
+// a private one, unwinding it rather than leaving a filesystem the caller was
+// told did not appear. The check is internal/mountguard, shared with pkg/local
+// for the reason internal/mount is.
+//
+// It is OFF by default, because a replicated cluster whose mounts nobody
+// consumes from another namespace is not broken and should not start failing on
+// upgrade. An off guard is an invisible one, so Provider.Posture names every
+// guard this provider has and whether it is checked — including the ones that
+// are not — for a component to print once at startup.
+//
 // # Peer authentication, and what the resource file is worth
 //
 // Generated resources authenticate the peer with cram-hmac-alg sha256 and a

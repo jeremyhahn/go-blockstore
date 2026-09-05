@@ -55,6 +55,14 @@ type fakeRunner struct {
 	tableLookups  int
 	tableHook     func()
 
+	// The propagation half of the mount table: what the kernel would report
+	// for a mount, the identity it would give that mount, and a hook that runs
+	// inside the window between the guard's verdict and the rollback.
+	propagation            map[string]propagationFixture
+	mountIDs               map[string]uint32
+	nextMountID            uint32
+	afterPropagationLookup func()
+
 	// The block-device work, recorded rather than performed, and the failures
 	// and hooks a test scripts onto it.
 	copies   []copyCall
@@ -264,22 +272,107 @@ func (f *fakeRunner) VisibleMountPointsFor(ctx context.Context, device string) (
 	return visible, nil
 }
 
-// PropagationOf answers about this device at the path. This provider does not
-// use it yet — the seam carries it because the mount table does — so the fake
-// answers the way an ordinary host mount does rather than pretending the
-// question cannot be asked.
-func (f *fakeRunner) PropagationOf(_ context.Context, device, mountPoint string) (uint32, bool, string, error) {
+// propagationFixture is one path's propagation as the kernel would report it:
+// the spelling and the verdict, kept together so a test cannot script a mount
+// that reads private and propagates anyway.
+type propagationFixture struct {
+	spelling string
+	shared   bool
+}
+
+// PropagationOf answers about THIS DEVICE at the path, and hands back the
+// kernel's identity for the mount instance.
+//
+// The fake models the identity the way the kernel does: a mount gets an id when
+// it appears, and a mount made in its place gets a different one. restack is how
+// a test says "somebody replaced what is here" — the case (device, path) cannot
+// see. An unscripted mount reads private, which is the ordinary state of a mount
+// on a host.
+func (f *fakeRunner) PropagationOf(ctx context.Context, device, mountPoint string) (uint32, bool, string, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, "", err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.mountTableErr != nil {
 		return 0, false, "", f.mountTableErr
 	}
+
+	// What is VISIBLE at the path is what umount(2) would detach and whose
+	// propagation a reader would otherwise pick up.
+	if top, covered := f.overMounted[mountPoint]; covered && top != device {
+		return 0, false, "", &mountinfo.MountPointError{MountPoint: mountPoint, Err: mountinfo.ErrNotVisibleThere}
+	}
 	for _, target := range f.mounted[device] {
-		if target == mountPoint {
-			return 1, false, "private", nil
+		if target != mountPoint {
+			continue
 		}
+		fixture := f.propagation[target]
+		if fixture.spelling == "" {
+			fixture.spelling = "private"
+		}
+		id := f.mountIDLocked(device, target)
+		if hook := f.afterPropagationLookup; hook != nil {
+			f.afterPropagationLookup = nil
+			// Released so the hook can take it, the way a concurrent actor
+			// would rather than reentering under this call's lock.
+			f.mu.Unlock()
+			hook()
+			f.mu.Lock()
+		}
+		return id, fixture.shared, fixture.spelling, nil
 	}
 	return 0, false, "", &mountinfo.MountPointError{MountPoint: mountPoint, Err: mountinfo.ErrNotMounted}
+}
+
+// mountIDLocked hands each (device, path) mount a stable identity. The caller
+// holds the lock.
+func (f *fakeRunner) mountIDLocked(device, target string) uint32 {
+	if f.mountIDs == nil {
+		f.mountIDs = map[string]uint32{}
+	}
+	key := device + "\x00" + target
+	if id, ok := f.mountIDs[key]; ok {
+		return id
+	}
+	f.nextMountID++
+	f.mountIDs[key] = f.nextMountID
+	return f.nextMountID
+}
+
+// withPropagation makes a mount propagate, the way a shared parent does.
+func (f *fakeRunner) withPropagation(target, spelling string) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.propagation == nil {
+		f.propagation = make(map[string]propagationFixture)
+	}
+	f.propagation[target] = propagationFixture{spelling: spelling, shared: strings.HasPrefix(spelling, "shared:")}
+	return f
+}
+
+// restack replaces the mount at a path with another mount OF THE SAME DEVICE,
+// the way a second mount stacked on the same path does. Everything about it
+// matches except the kernel's identity for it, which is the whole point.
+func (f *fakeRunner) restack(device, target string) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mountIDs == nil {
+		f.mountIDs = map[string]uint32{}
+	}
+	f.nextMountID++
+	f.mountIDs[device+"\x00"+target] = f.nextMountID
+	return f
+}
+
+// onPropagationLookup runs a function the NEXT time the mount table is asked
+// about a device's propagation at a path, which is how a test acts inside the
+// window between the guard's verdict and the rollback that follows it.
+func (f *fakeRunner) onPropagationLookup(hook func()) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.afterPropagationLookup = hook
+	return f
 }
 
 // overMount covers a path with another device's filesystem. What was mounted

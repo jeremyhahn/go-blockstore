@@ -28,6 +28,7 @@ import (
 
 	"github.com/jeremyhahn/go-blockstore/internal/blkdev"
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
+	"github.com/jeremyhahn/go-blockstore/internal/mountguard"
 	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
 )
 
@@ -380,13 +381,13 @@ func New(opts Options) (*Provider, error) {
 	// Mount would return an error over a filesystem it left mounted. It is a
 	// startup refusal for the same reason the privilege checks are.
 	if opts.MountPropagation == MountPropagationShared && mountTable != nil {
-		if _, ok := mountTable.(MountPropagationReader); !ok {
+		if !(mountguard.Guard{Policy: opts.MountPropagation, Table: mountTable}).CanReport() {
 			return nil, fmt.Errorf("%w: %s is %s, and the configured MountTable cannot report propagation (it does not implement MountPropagationReader)",
 				common.ErrInvalidArgument, SettingMountPropagation, MountPropagationShared)
 		}
 	}
 
-	if !opts.MountPropagation.valid() {
+	if !opts.MountPropagation.Valid() {
 		return nil, fmt.Errorf("%w: MountPropagation is %s, not one of %s",
 			common.ErrInvalidArgument, opts.MountPropagation, strings.Join(mountPropagationSpellings(), ", "))
 	}

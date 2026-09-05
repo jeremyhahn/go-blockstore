@@ -15,87 +15,23 @@ package local
 
 import (
 	"sort"
-	"strings"
 
+	"github.com/jeremyhahn/go-blockstore/internal/posture"
 	"github.com/jeremyhahn/go-blockstore/pkg/preflight"
 )
 
 // Posture is what this provider checks and what it does not, by name.
 //
-// It exists because a guard that is off is invisible. The startup privilege
-// checks announce themselves by refusing construction, so an operator learns
-// about them the moment they are wrong; the mount-propagation guard defaults to
-// off, so an operator who never enabled it sees exactly what an operator whose
-// deployment does not need it sees — nothing. That is the failure the guard was
-// added to remove, one level up: not a wrong answer, an absent one.
-//
-// So the third state is made sayable. A guard is reported as CHECKED or as NOT
-// CHECKED, always both kinds in the same list, rather than the unchecked ones
-// being omitted and inferred. An operator reading
-//
-//	mount propagation: NOT CHECKED
-//
-// beside three that are checked can act on it. An operator reading a list of
-// three cannot tell it from a list of four.
-//
-// This library writes nothing to a log — every other result it produces is a
-// returned value — so this is returned too, and the component that builds a
-// Provider is expected to print it once at startup, next to where it reports a
-// preflight failure.
-type Posture struct {
-	// Guards is every guard this provider knows about, checked or not, in a
-	// stable order.
-	Guards []GuardStatus
-}
+// It exists because a guard that is off is invisible: an operator who never
+// enabled the mount-propagation guard sees exactly what an operator whose
+// deployment does not need it sees — nothing. Reporting a guard as CHECKED or
+// as NOT CHECKED, both kinds in the same list, is what makes the third state
+// sayable. See internal/posture, whose type this is: pkg/drbd reports the same
+// shape, and a caller holding either provider should not need two renderers.
+type Posture = posture.Posture
 
 // GuardStatus is one guard's configured state.
-type GuardStatus struct {
-	// Name is the guard, in the words an operator would use.
-	Name string
-
-	// Active is whether this provider will check it.
-	Active bool
-
-	// Detail says what turns it on, or what it will do, in one clause. It is
-	// the part that makes the line actionable rather than merely informative.
-	Detail string
-}
-
-// String renders the whole posture, one guard per line, for a component to
-// print at startup.
-//
-// NOT CHECKED is upper case and CHECKED is not, deliberately: the eye finds the
-// gaps in a list of a dozen lines, which is the reading this exists to support.
-func (p Posture) String() string {
-	var b strings.Builder
-	b.WriteString("go-blockstore/local guards:")
-	for _, g := range p.Guards {
-		b.WriteString("\n  ")
-		b.WriteString(g.Name)
-		b.WriteString(": ")
-		if g.Active {
-			b.WriteString("checked")
-		} else {
-			b.WriteString("NOT CHECKED")
-		}
-		if g.Detail != "" {
-			b.WriteString(" — ")
-			b.WriteString(g.Detail)
-		}
-	}
-	return b.String()
-}
-
-// Unchecked returns the guards that are off, which is the part worth acting on.
-func (p Posture) Unchecked() []GuardStatus {
-	var off []GuardStatus
-	for _, g := range p.Guards {
-		if !g.Active {
-			off = append(off, g)
-		}
-	}
-	return off
-}
+type GuardStatus = posture.GuardStatus
 
 // guardNames maps a preflight capability onto the words this report uses for
 // it. A capability absent from the map is reported under its own name rather
@@ -112,7 +48,7 @@ var guardNames = map[preflight.Capability]string{
 // It is derived from the configuration the provider was built with, so it
 // describes this Provider rather than what the package can do in general.
 func (p *Provider) Posture() Posture {
-	posture := Posture{}
+	report := Posture{Component: "local"}
 
 	// The startup checks, named individually: "preflight ran" says nothing
 	// about WHICH capabilities it covered, and the mode makes that vary.
@@ -129,14 +65,14 @@ func (p *Provider) Posture() Posture {
 
 	for _, capability := range all {
 		_, active := checked[capability]
-		posture.Guards = append(posture.Guards, GuardStatus{
+		report.Guards = append(report.Guards, GuardStatus{
 			Name:   guardNames[capability],
 			Active: active,
 			Detail: preflightDetail(active),
 		})
 	}
 
-	posture.Guards = append(posture.Guards,
+	report.Guards = append(report.Guards,
 		GuardStatus{
 			Name:   "mount propagation",
 			Active: p.mountPropagation == MountPropagationShared,
@@ -159,7 +95,7 @@ func (p *Provider) Posture() Posture {
 				"cannot account for; nothing tears one down, because the fact that would make that safe does not exist yet (issue #41)",
 		},
 	)
-	return posture
+	return report
 }
 
 // preflightDetail says why a startup check is or is not running.
