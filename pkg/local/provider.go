@@ -1470,27 +1470,19 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 		return fmt.Errorf("%w: volume %q carries no filesystem to mount", common.ErrInvalidArgument, volID)
 	}
 
-	// Two checks, and the reason for the first is not the obvious one.
+	// The key-path guard is asked TWICE, before and after mount(2), and the two
+	// askings are not the same check repeated for safety. They differ in what
+	// they are entitled to conclude.
 	//
-	// A key path under the target is refused NOT because mounting publishes
-	// that file — it does not; mounting HIDES what is underneath, measured. It
-	// is refused because after the mount THE PATH MEANS SOMETHING ELSE, and
-	// which something depends on the volume's contents, which nobody has looked
-	// inside yet:
-	//
-	//   - the volume has no file there: the configured path now resolves to
-	//     nothing, and the provider can no longer read its own key;
-	//   - the volume HAS a file there: the configured path now resolves to the
-	//     volume's own file — so the key this provider reads is a file inside
-	//     the volume it just handed to a workload, which is the exposure this
-	//     guard exists to prevent, and it is attacker-controllable if the
-	//     volume's contents are. Measured: a path reading HOST-KEY before the
-	//     mount reads VOLUME-KEY after it.
-	//
-	// Both are wrong and they cannot be told apart from outside, so the whole
-	// class is refused rather than the pair distinguished by mounting somewhere
-	// private first and inspecting — machinery whose only purpose would be to
-	// permit the first case, which is broken anyway.
+	// A MOUNT SUBSTITUTES: afterwards a path under the target means the
+	// volume's file at that relative position, or nothing when the volume
+	// carries nothing there. Which of the two, and whether the configured key
+	// path lands under the target at all once the mount has moved what its
+	// symlinks reach, depends on contents nobody has looked inside yet. So this
+	// asking may REFUSE and may not APPROVE. It is here because the ordinary
+	// misconfiguration deserves a refusal that never touches the device, and
+	// every refusal it makes is one the observation below would make anyway —
+	// earlier, and with no mount to undo.
 	if err := p.checkKeyFileOutside(target, "the path this volume is being mounted on"); err != nil {
 		return err
 	}
@@ -1505,6 +1497,20 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 	flags, data := mount.Arguments(opts.ReadOnly, opts.Flags)
 	if err := p.mounter.Mount(ctx, device, target, fsType, flags, data); err != nil {
 		return err
+	}
+
+	// The filesystem the workload will be handed now exists at the target, so
+	// the containment question can be OBSERVED rather than predicted, and this
+	// is the asking that decides. See checkKeyFileAgainstMountedFilesystem for
+	// the case no correction to the prediction reaches.
+	//
+	// It runs BEFORE the propagation check, and the order is deliberate. Both
+	// findings unwind the mount; this one is a credential sitting somewhere a
+	// workload can read it, so it ends first rather than after a mount-table
+	// read taken on its behalf. A mount refused here is never reported on for
+	// propagation, which is right — it is going away.
+	if finding := p.checkKeyFileAgainstMountedFilesystem(ctx, target, lvs); finding != nil {
+		return p.unwindRefusedMount(ctx, device, target, finding)
 	}
 
 	// The mount exists in THIS namespace now. Whether it exists in the

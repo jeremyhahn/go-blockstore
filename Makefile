@@ -406,6 +406,32 @@ test-kernel-mountinfo:
 	$(GO) test -tags=kernel_mountinfo -count=1 -timeout=$(TEST_TIMEOUT) -run TestAgainstARunningKernel -v ./internal/mountinfo/
 	@echo "$(GREEN)✓ Live-kernel mountinfo checks complete$(RESET)"
 
+.PHONY: test-kernel-keypath
+## test-kernel-keypath: Check the key-path guard against a LIVE kernel (needs unprivileged user namespaces)
+# Behind the kernel_keypath tag for the reason test-kernel-mountinfo is behind
+# its own: the test re-execs itself in a user + mount namespace, and a host that
+# will not create one cannot run it.
+#
+# It is the measurement the whole guard rests on. pkg/local's key-path check
+# asks its question of the filesystem AFTER mount(2) rather than predicting it,
+# and the case that makes prediction impossible — a key path through a symlink
+# whose destination does not exist until the volume is mounted — can only be
+# built with a real mount. Everywhere else in the package that substitution is
+# imitated by a fake whose Mount is a recording, which is exactly the instrument
+# that cannot tell a check running before the mount from one running after it.
+#
+# This started as a runtime SKIP and CI reported it as a failure, which is how
+# the tag got chosen. Measured 2026-09-04: `go test` without -v prints nothing
+# at all for a passing package, and the CI Test job runs without -v — so the
+# skip would not have been quiet there, it would have been invisible. Selecting
+# the tag is a statement that this host provides the capability, so a refusal is
+# a hard failure (conventions/testing-guidelines.md §No Skip Guards).
+test-kernel-keypath:
+	@echo "$(CYAN)$(BOLD)→ Checking the key-path guard against this kernel...$(RESET)"
+	@echo "$(YELLOW)  REQUIRES: a host that permits unprivileged user + mount namespaces$(RESET)"
+	$(GO) test -tags=kernel_keypath -count=1 -timeout=$(TEST_TIMEOUT) -run TestAgainstARunningKernel -v ./pkg/local/
+	@echo "$(GREEN)✓ Live-kernel key-path checks complete$(RESET)"
+
 .PHONY: preflight-matrix
 ## preflight-matrix: Prove the startup privilege guard fires (and does not) in real containers
 # NOT in `make ci`, and not because it is optional. The condition the guard
