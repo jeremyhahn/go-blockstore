@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
 // MappingVerdict is what the reaper concluded about one plaintext mapping.
@@ -45,6 +47,20 @@ const (
 	// record, an unreadable one, or a mapping whose backing device is not the
 	// volume its name claims. Reported, never removed.
 	VerdictUnattributable MappingVerdict = "unattributable"
+
+	// VerdictLivenessUnknown means ownership WAS established — this node, the
+	// boot that is still running — and the configured liveness oracle could not
+	// say whether the attachment's owner is still there.
+	//
+	// It is its own verdict rather than being folded into either neighbor,
+	// because both neighbors would be a lie told by a broken instrument. Read
+	// as live, an oracle outage makes a fleet of abandoned mappings look
+	// healthy; read as orphaned, it points anything acting on these verdicts at
+	// volumes live workloads are using. Naming the third state is what lets an
+	// operator see that the check itself is what failed — the same trade
+	// preflight makes with CauseIndeterminate, and the same one Posture makes
+	// by reporting NOT CHECKED beside checked.
+	VerdictLivenessUnknown MappingVerdict = "liveness unknown"
 )
 
 // MappingFinding is one plaintext mapping and what was concluded about it.
@@ -225,11 +241,23 @@ func (p *Provider) inspectMapping(ctx context.Context, lv *lvInfo, self mappingO
 	//     the block device open raw, without ever mounting it.
 	//
 	// The missing ingredient is a LIVENESS FACT — something that says the
-	// attachment's owner is gone — and this provider has none: it holds no
-	// lease and writes no attachment record beyond this one, by design. Issue
-	// #41 is where that is decided, and it is an architecture decision rather
-	// than a loosening of this switch. Until it lands, an orphan is a line in a
-	// report and nothing else.
+	// attachment's owner is gone — and this provider cannot produce one: it
+	// holds no lease and writes no attachment record beyond this one, by
+	// design. Whether an attachment HAS an owner at all is a property of the
+	// deployment rather than of a block provider, so it is asked rather than
+	// decided here: Options.LivenessOracle is the seam, pkg/ha answers it from
+	// the lease it already holds and a CSI node plugin from the pod that
+	// consumes the staged volume (issue #41).
+	//
+	// The oracle is consulted at exactly ONE case below — this node, the boot
+	// that is still running — and that placement is the whole of its authority.
+	// It is the only case the boot ID cannot settle. It is deliberately NOT
+	// consulted on the ended-boot case, which is already proof and where an
+	// oracle could only weaken a verdict this code reaches on its own: routing
+	// that through a call that can fail would let an oracle outage erase
+	// findings that need no oracle. It is not consulted on another node's
+	// mapping either, which is not this node's to reclaim however dead its
+	// owner is.
 	//
 	// The tests below pin each conjunct and go red if one is removed. They tell
 	// you WHAT broke; this comment is the one that tells you why not to.
@@ -247,13 +275,49 @@ func (p *Provider) inspectMapping(ctx context.Context, lv *lvInfo, self mappingO
 		finding.Verdict = VerdictForeignNode
 		finding.Reason = "the volume group is reachable from more than one node and this mapping belongs to " + owner.Node
 	case owner.Boot == self.Boot:
-		finding.Verdict = VerdictLive
-		finding.Reason = "made by this node on the boot that is still running"
+		finding.Verdict, finding.Reason = p.sameBootVerdict(ctx, lv.Name)
 	default:
 		finding.Verdict = VerdictOrphaned
 		finding.Reason = "made by this node on a boot that has ended, so nothing holding it can still exist"
 	}
 	return finding, true, nil
+}
+
+// madeOnThisBoot is the half of every same-boot reason that is established
+// without asking anybody.
+const madeOnThisBoot = "made by this node on the boot that is still running"
+
+// sameBootVerdict decides about a mapping this node made on the boot that is
+// still running — the one case the boot ID cannot settle, and the one the
+// motivating failure lives in: an init container attaches, mounts, exits, and
+// the host stays up.
+//
+// With NO oracle the answer is the one this package reached before the seam
+// existed. That is a deliberate default rather than a gap left open: a
+// deployment where an attachment has no owner to outlive has nothing to inject,
+// and turning its every mapping into a warning would make the report unreadable
+// for the deployments that are behaving correctly. Posture reports the absence
+// so it is legible rather than inferred from a missing line.
+//
+// An oracle that CANNOT ANSWER is neither of the two answers. See
+// VerdictLivenessUnknown.
+func (p *Provider) sameBootVerdict(ctx context.Context, volID string) (MappingVerdict, string) {
+	if p.liveness == nil {
+		return VerdictLive, madeOnThisBoot
+	}
+
+	state, err := common.LivenessOf(ctx, p.liveness, volID)
+	switch {
+	case err != nil:
+		return VerdictLivenessUnknown, madeOnThisBoot +
+			", and the liveness oracle could not establish whether its owner is still there: " + err.Error()
+	case state == common.LivenessReleased:
+		return VerdictOrphaned, madeOnThisBoot +
+			", and the liveness oracle reports that the owner of the attachment has gone"
+	default:
+		return VerdictLive, madeOnThisBoot +
+			", and the liveness oracle reports that the attachment still has a live owner"
+	}
 }
 
 // RunReaper sweeps once for every tick, until the context is done.

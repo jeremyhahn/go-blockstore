@@ -344,15 +344,61 @@ the mapping was created — the node and the boot that unlocked it:
 |---|---|
 | live | this node, this boot — something may be using it right now |
 | another node's | shared storage; that node's workload is using it |
-| orphaned | this node, on a boot that has ended |
+| orphaned | this node, on a boot that has ended, or an owner the oracle says has gone |
+| liveness unknown | this node, this boot, and the oracle could not answer |
 | unattributable | no record, an unreadable one, or a mapping over the wrong device |
 
-**Nothing acts on these.** Removing a mapping safely needs a fact this provider
-does not have — something that says the attachment's owner is gone — and the
-boot ID is not that fact: a device-mapper mapping does not survive a reboot, so
-the orphaned verdict cannot see the case that motivates it, an owner that exits
-while the host stays up. Issue #41 is where a liveness owner is decided. Until
-then this is a report, which is the half that works.
+**Nothing acts on these.** This library reports; a component that tears a
+mapping down owns that decision.
+
+The boot ID alone cannot reach the case that motivates all of this. A
+device-mapper mapping does not survive a reboot, so "made on a boot that has
+ended" describes a state the kernel does not normally produce — while an init
+container that attaches, mounts and **exits with the host still up** leaves a
+mapping every fact this provider can observe calls live. Nothing local
+distinguishes it: the dm open count is identical for a job mid-run
+(go-luks2 #96), and a
+workload can hold the block device open raw without ever mounting it.
+
+### Who is still holding this? — the question the provider does not answer
+
+Whether an attachment has a **liveness owner** at all is a property of how the
+system is deployed, not of what a block provider does. A leased HA deployment
+has one and knows its lifetime; a CSI node plugin has the pod that consumes the
+staged volume; a host running one component over local disks has none at all.
+Encoding any of those in the provider would bake one deployment's assumption
+into a library every deployment consumes.
+
+So the provider **asks** rather than deciding. `Options.LivenessOracle` takes a
+`common.LivenessOracle`:
+
+```go
+type LivenessOracle interface {
+	AttachmentLiveness(ctx context.Context, volID string) (Liveness, error)
+}
+```
+
+`pkg/ha` can answer it from the lease it already holds; a CSI layer answers it
+from the pod. It is asked at **exactly one** point — a mapping this node made on
+the boot that is still running, the one case the boot ID cannot settle. It is
+not consulted on an ended boot, which is already proof and where an oracle
+outage would only erase a verdict reached without it, nor on another node's
+mapping, which is not this node's to reclaim however dead its owner is.
+
+Two things about it are load-bearing:
+
+- **Cannot answer is a failure, not a shrug.** An oracle that is unreachable, or
+  that returns anything but the two defined answers — its zero value included —
+  produces `liveness unknown`, never `live` and never `orphaned`. Read as live,
+  an oracle outage makes a fleet of abandoned mappings look healthy; read as
+  orphaned, it points anything acting on these verdicts at volumes live
+  workloads are using. `Liveness` is a two-valued enumeration rather than a
+  `bool` for that reason: the answer somebody may act on has to be written out
+  on purpose, and cannot arrive as a zero value.
+- **No oracle is a visible state.** It is legitimate — plenty of deployments
+  have no owner to outlive — and it leaves the report partly blind, so
+  `Posture()` says so in as many words rather than leaving an operator to infer
+  it from a line that is not there.
 
 ### The key that must not cross with it
 

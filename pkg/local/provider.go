@@ -59,6 +59,7 @@ type Provider struct {
 	mountTable         MountTable
 	mountPropagation   MountPropagationPolicy
 	bootID             func() (string, error)
+	liveness           LivenessOracle
 
 	// preflightChecked is the capabilities the startup checks covered for this
 	// configuration, kept so Posture can name them rather than reporting that
@@ -129,6 +130,18 @@ type MountTable = mountinfo.Table
 // a guard it never turns on.
 type MountPropagationReader = mountinfo.PropagationReader
 
+// LivenessOracle is the seam through which the provider asks whether an
+// attachment still has a live owner.
+//
+// It is an alias for the contract declared in pkg/common, so that a deployment
+// implementing it once — pkg/ha from the lease it already holds, a CSI node
+// plugin from the pod that consumes the staged volume — can hand the same value
+// to every provider that asks, without any of them importing the other. The
+// alias makes it nameable here, on the same reasoning as Mounter: Options.
+// LivenessOracle is settable either way, and without a name in this package a
+// caller could not declare a variable of the type it is setting.
+type LivenessOracle = common.LivenessOracle
+
 // BlockDevices is the seam through which the provider copies and zeroes block
 // devices — what it used to reach for dd and blkdiscard to do.
 type BlockDevices = blkdev.Operator
@@ -173,6 +186,34 @@ type Options struct {
 	// BlockDevices copies and zeroes block devices. It defaults to the real
 	// syscalls; tests substitute a fake.
 	BlockDevices BlockDevices
+
+	// LivenessOracle answers whether an attachment still has a live owner, for
+	// the one question this provider cannot decide on its own.
+	//
+	// It has no default and nil is a legitimate configuration: a deployment
+	// where an attachment has no owner to outlive — a host running one
+	// component over local disks — supplies none, and the reaper then reports a
+	// mapping made on the running boot as live, exactly as it did before this
+	// seam existed. Posture says so in as many words, because a guard that is
+	// off is otherwise invisible.
+	//
+	// Supply one where the attachment DOES have an owner that can exit while
+	// the host stays up. That is the case the reaper's boot-ID criterion cannot
+	// see at all — a device-mapper mapping does not survive a reboot, so a
+	// record naming an ended boot describes a state the kernel does not
+	// normally produce, while an init container that attaches, mounts and exits
+	// leaves a mapping on the boot that is still running. The oracle is what
+	// distinguishes that from a workload holding the block device open right
+	// now, and nothing this package can observe does: the dm open count is
+	// identical for a live job mid-run (go-luks2 #96), and a volume can be held
+	// raw without ever being mounted.
+	//
+	// It is reachable only through Options and has no settings key. Settings are
+	// a map of strings and an oracle is an implementation; a key that named one
+	// would have to select from a fixed list this package shipped, which is the
+	// deployment coupling the seam exists to avoid. KeyProvider is configured
+	// the same way and for the same reason.
+	LivenessOracle LivenessOracle
 
 	// Encrypted provisions new volumes as LUKS2 containers. It requires
 	// KeyProvider. Volumes already on disk are detected by probing rather than
@@ -412,6 +453,7 @@ func New(opts Options) (*Provider, error) {
 		mountPropagation:   opts.MountPropagation,
 		preflightChecked:   checked,
 		bootID:             bootID,
+		liveness:           opts.LivenessOracle,
 		blockDevices:       blockDevices,
 		luks:               luks,
 	}, nil

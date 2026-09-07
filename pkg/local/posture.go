@@ -92,7 +92,18 @@ func (p *Provider) Posture() Posture {
 			Name:   "orphaned dm-crypt mappings",
 			Active: false,
 			Detail: "REPORTED, NEVER REMOVED — InspectMappings names what this provider owns and " +
-				"cannot account for; nothing tears one down, because the fact that would make that safe does not exist yet (issue #41)",
+				"cannot account for; nothing here tears one down, and a component that acts on a finding owns that decision",
+		},
+		// Reported beside the inspection rather than inside it, because it is
+		// what decides how much of the report is worth anything. The oracle is
+		// injected and defaults to absent, which makes it the second guard in
+		// this list that an operator can leave off without ever seeing a symptom
+		// — and the symptom, when it comes, is a report full of "live" lines
+		// over mappings nothing has held for weeks.
+		GuardStatus{
+			Name:   "attachment liveness",
+			Active: p.liveness != nil,
+			Detail: livenessDetail(p.liveness != nil),
 		},
 	)
 	return report
@@ -135,4 +146,24 @@ func keyPathDetail(haveKeyPath, haveProvider bool) string {
 	default:
 		return "no key material is configured"
 	}
+}
+
+// livenessDetail says what the liveness oracle is asked, or what is not asked
+// without one.
+//
+// The absent case spells out the CONSEQUENCE and not merely the configuration,
+// because the operator who most needs this line is the one who does not know
+// the question exists: "no oracle" reads as a feature nobody turned on, while
+// "a mapping made on this boot is reported as live whether or not anything
+// still holds it" reads as the report being partly blind, which is what it is.
+func livenessDetail(configured bool) string {
+	if configured {
+		return "a mapping made on the boot that is still running is put to the injected LivenessOracle; " +
+			"an oracle that cannot answer is reported as " + string(VerdictLivenessUnknown) +
+			", never as live and never as an orphan"
+	}
+	return "NO ORACLE — a mapping made on this boot is reported as " + string(VerdictLive) +
+		" whether or not whatever attached it still exists, so an init container that attached, " +
+		"mounted and exited leaves a mapping nothing here can call abandoned; set Options.LivenessOracle " +
+		"to have the question asked (issue #41)"
 }
