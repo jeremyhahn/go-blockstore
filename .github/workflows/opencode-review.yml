@@ -457,8 +457,8 @@ jobs:
           # --- new vocabulary -----------------------------------------------------------
           agent_labels=$(printf '%s' "$LABELS" | jq -r '.[] | select(startswith("agent:"))')
           model_labels=$(printf '%s' "$LABELS" | jq -r '.[] | select(startswith("model:"))')
-          n_agent=$(printf '%s' "$agent_labels" | grep -c . || true)
-          n_model=$(printf '%s' "$model_labels" | grep -c . || true)
+          n_agent=$(printf '%s' "$agent_labels" | grep -c . || true)  # guard:fail-open grep -c exits 1 on a count of zero; an empty label list is a count of 0, and >1 is refused below
+          n_model=$(printf '%s' "$model_labels" | grep -c . || true)  # guard:fail-open same: zero model labels is a legitimate count of 0
 
           [ "$n_agent" -le 1 ] || { echo "::error::more than one agent: label: $(printf '%s' "$agent_labels" | tr '\n' ' ')"; exit 1; }
           [ "$n_model" -le 1 ] || { echo "::error::more than one model: label: $(printf '%s' "$model_labels" | tr '\n' ' ')"; exit 1; }
@@ -535,7 +535,7 @@ jobs:
           case "$agent" in
             opencode)
               model=${model:-$OPENCODE_DEFAULT_MODEL}
-              avail=$(ollama_models || true)
+              avail=$(ollama_models || true)  # guard:fail-open an unreadable model list becomes an EMPTY one, and the next line refuses to run on it
               [ -n "$avail" ] || { echo "::error::could not read the model list from $OLLAMA."; echo "::error::Refusing to run: an unvalidated model fails 20 minutes later inside the reviewer."; exit 1; }
 
               # FRIENDLY NAME -> CONCRETE TAG. The owner asks for `model:qwen3.8`, and
@@ -563,8 +563,8 @@ jobs:
                 # and `llama3.3:70b-32k`, and picking either would be a coin toss that
                 # reads like a decision -- so ambiguity is an error that names the
                 # candidates, and only a single match is accepted.
-                matches=$(printf '%s\n' "$avail" | grep "^${model}:" || true)
-                n_match=$(printf '%s' "$matches" | grep -c . || true)
+                matches=$(printf '%s\n' "$avail" | grep "^${model}:" || true)  # guard:fail-open grep exits 1 when no tag shares the prefix; n_match=0 falls through to the exact-match refusal below
+                n_match=$(printf '%s' "$matches" | grep -c . || true)  # guard:fail-open grep -c exits 1 on a count of zero, which the branch below handles as 'no unique match'
                 if [ "$n_match" -eq 1 ]; then
                   echo "Model '$model' resolves to the only tag in its family: '$matches'."
                   model="$matches"
@@ -815,7 +815,7 @@ jobs:
           # with git merge-base cost ~7 minutes of a 19-minute review and landed
           # on the same list Gitea already reports.
           files_json=$(curl -sS -H "Authorization: token $GITEA_TOKEN" \
-                       "$GITEA_API/repos/jeremyhahn/$REPO/pulls/$PR_NUM/files?limit=100" 2>/dev/null || true)
+                       "$GITEA_API/repos/jeremyhahn/$REPO/pulls/$PR_NUM/files?limit=100" 2>/dev/null || true)  # guard:fail-open a failed fetch leaves files_json empty, which counts as 0 files and is refused below
           n_files=$(printf '%s' "$files_json" | jq -r 'if type=="array" then length else 0 end' 2>/dev/null || echo 0)
           if [ "${n_files:-0}" -eq 0 ]; then
             echo "::error::PR $PR_NUM reports no changed files from $GITEA_API/repos/jeremyhahn/$REPO/pulls/$PR_NUM/files."
