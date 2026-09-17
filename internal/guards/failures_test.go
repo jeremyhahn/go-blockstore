@@ -47,6 +47,7 @@ func TestAScanThatCannotReadIsNotAScanThatPassed(t *testing.T) {
 		"no-runtime-skip":              {"unreadable.go", SkipGuards()},
 		"no-unexplained-fail-open":     {"unreadable.sh", FailOpenShell()},
 		"privileged-is-never-a-remedy": {"unreadable.md", PrivilegedAsRemedy()},
+		"key-material-custody":         {"unreadable.go", KeyMaterialCustody()},
 	}
 
 	for label, tc := range cases {
@@ -77,6 +78,9 @@ func TestAnUnparseableGoFileIsAScanFailure(t *testing.T) {
 
 	if _, err := SkipGuards().Scan(root); err == nil {
 		t.Fatal("the skip scanner reported success over a file it could not parse")
+	}
+	if _, err := KeyMaterialCustody().Scan(root); err == nil {
+		t.Fatal("the custody scanner reported success over a file it could not parse")
 	}
 }
 

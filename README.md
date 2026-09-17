@@ -522,10 +522,31 @@ make guards          # also run by `make lint`, and by the CI Lint job
 
 The scanners in `internal/guards` assert properties across the **entire**
 repository rather than over whatever a test happens to touch: no runtime skip
-anywhere, no unexplained `|| true`, and no document, script or workflow that
-offers `--privileged` as a fix. They read source instead of compiling it, so a
-build tag cannot hide anything from them — which matters, because a tag-gated
-file is exactly where a skip hides from a compile-based check.
+anywhere, no unexplained `|| true`, no document, script or workflow that
+offers `--privileged` rather than a specific capability as a fix, and no code
+that takes key material out of its custody. The first three read source
+instead of compiling it, so a build tag cannot hide anything from them — which
+matters, because a tag-gated file is exactly where a skip hides from a
+compile-based check.
+
+The fourth, `key-material-custody`, is the custody model made mechanical. A
+LUKS passphrase here is never a plain `[]byte` or `string` at rest: it lives in
+a go-enclave `MemoryEnclave` and becomes bytes in exactly one place,
+`internal/luks.(*Manager).withKey`, for the length of one `Backend` call. The
+scanner type-checks every non-test package — under both the Linux and a
+non-Linux build configuration, so the `_other.go` stubs are read too, and with
+a scan failure for any file no configuration selects — and refuses five things:
+a call to the enclave's copying exits `Open`/`OpenString`; a `WithBytes` borrow
+anywhere but the named windows, with `withKey` as an anchor that must borrow
+exactly once so the rule cannot pass vacuously; a call to the key-taking
+`Backend` methods from outside `internal/luks`; a borrowed `key []byte` used
+anywhere but as a direct call argument; and an exported signature that carries
+a `key`, `passphrase`, `secret`, `password` or `token` as a `string` or
+`[]byte`. It resolves types rather than matching names, so `os.Open` and
+`luks.Backend.Open` do not fire and go-enclave's does. The two refinements it
+needed on this tree — a struct literal passed straight to go-luks2, and a bare
+`key string` being a key/value key in `pkg/common.Coordinator` — are written
+in the scanner's doc comment, not tuned into silence.
 
 Two properties of the runner are load-bearing:
 

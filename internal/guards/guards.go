@@ -118,6 +118,7 @@ func All() []Scanner {
 		SkipGuards(),
 		FailOpenShell(),
 		PrivilegedAsRemedy(),
+		KeyMaterialCustody(),
 	}
 }
 
