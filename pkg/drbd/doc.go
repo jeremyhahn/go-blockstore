@@ -204,13 +204,33 @@
 //
 // # Confidentiality in transit
 //
-// Replication is NOT encrypted. An unauthenticated peer is now refused, but the
-// block data itself crosses the storage VLAN as plaintext, and a shared secret
-// authenticates the peer without concealing anything from something that can
-// observe the link.
+// REPLICATION IS PLAINTEXT UNLESS THE PROVIDER IS CONFIGURED TO ENCRYPT.
+// Authenticating the peer and concealing the data are separate controls and
+// neither implies the other: an unauthenticated peer is refused, and a shared
+// secret still conceals nothing from something that can observe the link.
 //
-// This is stated rather than solved here. The standard answer is dm-crypt ABOVE
-// the replicated device, so the wire carries ciphertext and a failover unlocks
-// on the new Primary — the same layering pkg/local applies to a logical volume.
-// It is not yet implemented in this provider; see the report on issue #3.
+// Set encrypted=true with luks_key_file — or inject a KeyProvider — and the
+// provider puts a LUKS2 container ABOVE the replicated device. DRBD then
+// replicates the bytes of a device that is already ciphertext, so the wire
+// carries ciphertext and so does each node's backing volume. It is the same
+// layering pkg/local applies to a logical volume, and the machinery is
+// literally the same code: internal/luks holds the pinned cryptographic
+// parameters, the passphrase borrow window and the mapping ownership check for
+// both providers.
+//
+// WHERE THE CONTAINER IS OPENED IS THE ONE THING THAT DIFFERS, and it is not a
+// free choice. DRBD denies every open of a Secondary's device, read-only opens
+// included, so there is exactly one moment at which a container over
+// /dev/drbdN can be formatted or unlocked: Promote. Demote closes it again,
+// before the role change, because an open dm-crypt mapping holds the device and
+// DRBD will not demote a device somebody has open. A failover therefore unlocks
+// on the new Primary, which is the property this layering exists for.
+//
+// The container's header is allocated on top of the request, as DRBD's
+// metadata is: an encrypted volume's DRBD device is SizeBytes plus the 16 MiB
+// header, the backing volume is that plus the metadata, and Status reports the
+// device less the header — the same side of the request pkg/local puts its
+// header on. An encrypted volume cannot be resized by this revision: Resize
+// refuses it with ErrResizeEncrypted rather than grow the device under a
+// filesystem it cannot reach. See Config.Encrypted.
 package drbd

@@ -22,6 +22,8 @@ import (
 	"testing"
 
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
+
+	"github.com/jeremyhahn/go-blockstore/internal/luks"
 )
 
 func TestListLVsParsesTheReport(t *testing.T) {
@@ -402,7 +404,7 @@ func TestProbeFSTypeOnlyAcceptsTheNotFoundStatus(t *testing.T) {
 func TestLUKSIsOpenOnlyAcceptsAnAbsentMapping(t *testing.T) {
 	failures := map[string]error{
 		"device-mapper unreachable": errors.New("open /dev/mapper/control: permission denied"),
-		"backing device unnamed":    fmt.Errorf("%w: /sys/dev/block/253:3/slaves lists 0", errNoBackingDevice),
+		"backing device unnamed":    fmt.Errorf("%w: /sys/dev/block/253:3/slaves lists 0", luks.ErrNoBackingDevice),
 	}
 	for name, sentinel := range failures {
 		t.Run(name, func(t *testing.T) {

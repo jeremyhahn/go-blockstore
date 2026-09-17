@@ -40,9 +40,10 @@ func capabilitySet(capabilities []preflight.Capability) string {
 // perform, and no others.
 func TestRequiredCapabilitiesFollowsTheConfiguration(t *testing.T) {
 	cases := map[string]struct {
-		seams injectedSeams
-		mode  PreflightMode
-		want  string
+		seams     injectedSeams
+		encrypted bool
+		mode      PreflightMode
+		want      string
 	}{
 		"a production provider needs all four": {
 			want: "device-mapper,net-admin,drbd-control,mount",
@@ -59,20 +60,32 @@ func TestRequiredCapabilitiesFollowsTheConfiguration(t *testing.T) {
 			seams: injectedSeams{runner: true, mounter: true, mountTable: true, blockDevices: true},
 			want:  "",
 		},
-		"PreflightAll ignores the injected seams": {
-			seams: injectedSeams{runner: true, mounter: true, mountTable: true, blockDevices: true},
+		// PreflightAll checks everything this provider CAN do, so the keyring
+		// is in the set whether or not this deployment encrypts — the same
+		// answer pkg/local's PreflightAll gives.
+		"PreflightAll ignores the injected seams and the configuration": {
+			seams: injectedSeams{runner: true, mounter: true, mountTable: true, blockDevices: true, luks: true},
 			mode:  PreflightAll,
-			want:  "device-mapper,net-admin,drbd-control,mount",
+			want:  "device-mapper,net-admin,drbd-control,mount,kernel-keyring",
 		},
 		"PreflightOff derives nothing": {
 			mode: PreflightOff,
 			want: "",
 		},
+		"encryption adds the keyring requirement": {
+			encrypted: true,
+			want:      "device-mapper,net-admin,drbd-control,mount,kernel-keyring",
+		},
+		"an injected LUKS backend removes it again": {
+			seams:     injectedSeams{luks: true},
+			encrypted: true,
+			want:      "device-mapper,net-admin,drbd-control,mount",
+		},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got := capabilitySet(requiredCapabilities(tc.seams, tc.mode))
+			got := capabilitySet(requiredCapabilities(tc.seams, tc.encrypted, tc.mode))
 			if got != tc.want {
 				t.Errorf("requiredCapabilities = %q, want %q", got, tc.want)
 			}
@@ -87,7 +100,7 @@ func TestRequiredCapabilitiesFollowsTheConfiguration(t *testing.T) {
 // pkg/local's capability set would pass its own tests and be wrong twice: it
 // would omit the capability DRBD actually needs, and demand one it never uses.
 func TestTheCapabilitySetIsNotTheLocalProvidersIsTheWholePoint(t *testing.T) {
-	got := requiredCapabilities(injectedSeams{}, PreflightConfigured)
+	got := requiredCapabilities(injectedSeams{}, false, PreflightConfigured)
 
 	has := func(c preflight.Capability) bool {
 		for _, g := range got {
@@ -108,12 +121,17 @@ func TestTheCapabilitySetIsNotTheLocalProvidersIsTheWholePoint(t *testing.T) {
 		t.Error("drbd-control is absent; a node without the module loaded would get no refusal until the first Provision")
 	}
 
-	// NOT required here, though pkg/local needs it for encrypted volumes. This
-	// package performs no LUKS operation at all: its secret is a DRBD peer
-	// authentication key, which never enters the kernel keyring. Demanding it
-	// would make a correctly configured node refuse to start.
+	// NOT required by an UNENCRYPTED deployment, which is what this case is,
+	// though pkg/local needs it whenever it handles encrypted volumes. The DRBD
+	// peer-authentication secret never enters the kernel keyring, so demanding
+	// it here would make a correctly configured node refuse to start.
+	//
+	// The condition is the whole of the difference now: LUKS-above-DRBD does
+	// derive keys and does create dm-crypt mappings, and the encrypted case
+	// above asserts the capability appears there. What must not come back is
+	// the unconditional demand.
 	if has(preflight.CapabilityKernelKeyring) {
-		t.Error("kernel-keyring is required; this provider performs no LUKS operation, so a correct node would be refused")
+		t.Error("kernel-keyring is required of an unencrypted provider, which performs no LUKS operation, so a correct node would be refused")
 	}
 
 	// Genuinely shared: volumes are LVM logical volumes and the provider mounts.
@@ -126,7 +144,7 @@ func TestTheCapabilitySetIsNotTheLocalProvidersIsTheWholePoint(t *testing.T) {
 // that legitimately passes without probing.
 func TestRunPreflightChecksNothingWhenThereIsNothingToCheck(t *testing.T) {
 	all := injectedSeams{runner: true, mounter: true, mountTable: true, blockDevices: true}
-	if err := runPreflight(all, PreflightConfigured); err != nil {
+	if err := runPreflight(all, false, PreflightConfigured); err != nil {
 		t.Fatalf("runPreflight over a fully injected provider: %v", err)
 	}
 }
@@ -139,13 +157,13 @@ func TestRunPreflightChecksNothingWhenThereIsNothingToCheck(t *testing.T) {
 // requires a PASS, so a guard that refused everything would fail it; on a node
 // without, the refusal.
 func TestRunPreflightAgreesWithTheChecker(t *testing.T) {
-	capabilities := requiredCapabilities(injectedSeams{}, PreflightConfigured)
+	capabilities := requiredCapabilities(injectedSeams{}, false, PreflightConfigured)
 	if len(capabilities) == 0 {
 		t.Fatal("the default configuration derived no capabilities, so this test would prove nothing")
 	}
 
 	oracle := preflight.Check(context.Background(), capabilities...)
-	got := runPreflight(injectedSeams{}, PreflightConfigured)
+	got := runPreflight(injectedSeams{}, false, PreflightConfigured)
 
 	if (oracle == nil) != (got == nil) {
 		t.Fatalf("the checker says %v and runPreflight says %v; they must agree", oracle, got)
@@ -163,7 +181,7 @@ func TestNewRunsTheStartupPrivilegeChecks(t *testing.T) {
 	delete(settings, SettingPreflight) // the default mode is the subject here
 
 	oracle := preflight.Check(context.Background(),
-		requiredCapabilities(injectedSeams{}, PreflightConfigured)...)
+		requiredCapabilities(injectedSeams{}, false, PreflightConfigured)...)
 
 	p, err := New(settings, WithSecretProvider(testSecretProvider))
 

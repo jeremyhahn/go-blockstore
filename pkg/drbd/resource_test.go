@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeremyhahn/go-blockstore/internal/luks"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
@@ -571,8 +572,8 @@ func TestBackingBytesReservesMetadata(t *testing.T) {
 			if meta < wantBitmap {
 				t.Errorf("metadataBytes(%d) = %d, below the %d bytes of bitmap the device needs", size, meta, wantBitmap)
 			}
-			if got := backingBytes(size); got != size+meta {
-				t.Errorf("backingBytes(%d) = %d, want %d", size, got, size+meta)
+			if got := backingBytes(size, false); got != size+meta {
+				t.Errorf("backingBytes(%d, false) = %d, want %d", size, got, size+meta)
 			}
 			// The reservation must stay small relative to the volume: a rule
 			// that ballooned would waste the volume group.
@@ -597,24 +598,112 @@ func TestMetadataGrowsWithTheDevice(t *testing.T) {
 // paths lean on: backingBytes wraps NEGATIVE near the top of the int64 range,
 // and the checked form has to report that rather than pass the wrapped value on.
 func TestBackingBytesCheckedDetectsOverflow(t *testing.T) {
-	if _, ok := backingBytesChecked(math.MaxInt64); ok {
-		t.Errorf("backingBytesChecked(math.MaxInt64) = ok, want the overflow detected")
+	for _, encrypted := range []bool{false, true} {
+		t.Run(strconv.FormatBool(encrypted), func(t *testing.T) {
+			if _, ok := backingBytesChecked(math.MaxInt64, encrypted); ok {
+				t.Errorf("backingBytesChecked(math.MaxInt64, false) = ok, want the overflow detected")
+			}
+			if _, ok := backingBytesChecked(-1, encrypted); ok {
+				t.Errorf("backingBytesChecked(-1, false) = ok, want a negative size rejected")
+			}
+			// With no extent rounding, the largest representable usable size is
+			// the one whose backing exactly fills the int64 range — anything
+			// above it wraps.
+			max := maxDataBytes(0, encrypted)
+			backing, ok := backingBytesChecked(max, encrypted)
+			if !ok {
+				t.Fatalf("backingBytesChecked(maxDataBytes(0, false)=%d) = not ok, want representable", max)
+			}
+			if backing != math.MaxInt64 {
+				t.Errorf("backing at the extent-free maximum = %d, want math.MaxInt64 = %d", backing, int64(math.MaxInt64))
+			}
+			if _, ok := backingBytesChecked(max+1, encrypted); ok {
+				t.Errorf("backingBytesChecked(maxDataBytes(0, false)+1) = ok, want the overflow detected")
+			}
+		})
 	}
-	if _, ok := backingBytesChecked(-1); ok {
-		t.Errorf("backingBytesChecked(-1) = ok, want a negative size rejected")
+
+	// The header addition is a step of its own that can wrap before the
+	// metadata step ever runs: a usable size within HeaderBytes of the ceiling
+	// has no representable data area at all on an encrypted provider, and the
+	// unchecked arithmetic would hand a NEGATIVE data area to metadataBytes.
+	if _, ok := backingBytesChecked(math.MaxInt64-luks.HeaderBytes+1, true); ok {
+		t.Errorf("backingBytesChecked(MaxInt64-HeaderBytes+1, encrypted) = ok, want the header addition's overflow detected")
 	}
-	// With no extent rounding, the largest representable usable size is the one
-	// whose backing exactly fills the int64 range — anything above it wraps.
-	max := maxDataBytes(0)
-	backing, ok := backingBytesChecked(max)
-	if !ok {
-		t.Fatalf("backingBytesChecked(maxDataBytes(0)=%d) = not ok, want representable", max)
+}
+
+// TestBackingBytesAllocatesTheLUKSHeaderOnTop pins the other half of the
+// sizing contract, the half #13 first got wrong. common.VolumeSpec.SizeBytes is
+// USABLE capacity, so on an encrypted provider the LUKS2 header is allocated
+// on top of the request exactly as DRBD's metadata is — the data area DRBD
+// exports is usable plus header, and the metadata reservation is computed
+// from THAT, since the bitmap covers the header's blocks too. pkg/local has
+// always done this; the two backends now agree.
+//
+// The expectations are literals worked out by hand from DRBD's formula, not a
+// restatement of the function under test, so the table fails if the header is
+// dropped (backing comes out 16 MiB short), doubled (16 MiB long), or added
+// after the metadata step (the 120 MiB row crosses a 128 MiB bitmap unit only
+// when the header is inside the data area, and comes out 4 KiB short
+// otherwise).
+func TestBackingBytesAllocatesTheLUKSHeaderOnTop(t *testing.T) {
+	const header = luks.HeaderBytes
+	if header != 16<<20 {
+		t.Fatalf("luks.HeaderBytes = %d; the literals below were worked out for 16 MiB", header)
 	}
-	if backing != math.MaxInt64 {
-		t.Errorf("backing at the extent-free maximum = %d, want math.MaxInt64 = %d", backing, int64(math.MaxInt64))
+
+	cases := []struct {
+		usable        int64
+		wantPlain     int64
+		wantEncrypted int64
+	}{
+		{1 << 20, 1089536, 17866752},            // 1 MiB
+		{(4 << 20) - 1, 4235263, 21012479},      // one byte under an extent
+		{4 << 20, 4235264, 21012480},            // exactly one 4 MiB extent
+		{120 << 20, 125870080, 142651392},       // header pushes the bitmap over a unit
+		{128 << 20, 134262784, 151040000},       // exactly one bitmap unit
+		{1 << 30, 1073815552, 1090592768},       // 1 GiB
+		{1 << 40, 1099545223168, 1099562000384}, // 1 TiB
 	}
-	if _, ok := backingBytesChecked(max + 1); ok {
-		t.Errorf("backingBytesChecked(maxDataBytes(0)+1) = ok, want the overflow detected")
+	for _, tc := range cases {
+		t.Run(strconv.FormatInt(tc.usable, 10), func(t *testing.T) {
+			if got := backingBytes(tc.usable, false); got != tc.wantPlain {
+				t.Errorf("backingBytes(%d, plain) = %d, want %d", tc.usable, got, tc.wantPlain)
+			}
+			if got := backingBytes(tc.usable, true); got != tc.wantEncrypted {
+				t.Errorf("backingBytes(%d, encrypted) = %d, want %d", tc.usable, got, tc.wantEncrypted)
+			}
+			// The data area DRBD exports is what the header is added to, and
+			// what Status subtracts it from.
+			if got := dataBytes(tc.usable, true); got != tc.usable+header {
+				t.Errorf("dataBytes(%d, encrypted) = %d, want %d", tc.usable, got, tc.usable+header)
+			}
+			if got := dataBytes(tc.usable, false); got != tc.usable {
+				t.Errorf("dataBytes(%d, plain) = %d, want %d", tc.usable, got, tc.usable)
+			}
+			// The checked form agrees with the unchecked one wherever both are
+			// representable; they are one rule, not two.
+			for _, encrypted := range []bool{false, true} {
+				checked, ok := backingBytesChecked(tc.usable, encrypted)
+				if !ok || checked != backingBytes(tc.usable, encrypted) {
+					t.Errorf("backingBytesChecked(%d, %v) = %d, %v; want %d, true", tc.usable, encrypted, checked, ok, backingBytes(tc.usable, encrypted))
+				}
+			}
+		})
+	}
+
+	// Near the ceiling: an encrypted volume's backing is the plain backing of
+	// a request one header larger, so the largest usable capacity an encrypted
+	// provider can back is exactly one header below the plain one — for every
+	// extent, since the rounding on top sees the same backing figure.
+	for _, extent := range []int64{0, 1, 512, 4 << 20} {
+		plain, encrypted := maxDataBytes(extent, false), maxDataBytes(extent, true)
+		if encrypted != plain-header {
+			t.Errorf("maxDataBytes(%d, encrypted) = %d, want maxDataBytes(%d, plain) - HeaderBytes = %d", extent, encrypted, extent, plain-header)
+		}
+		if got, ok := backingBytesChecked(encrypted, true); !ok || got != backingBytes(plain, false) {
+			t.Errorf("backing at the encrypted maximum (extent %d) = %d, %v; want the plain maximum's backing %d", extent, got, ok, backingBytes(plain, false))
+		}
 	}
 }
 
@@ -623,32 +712,34 @@ func TestBackingBytesCheckedDetectsOverflow(t *testing.T) {
 // providers must ATTEMPT it), and one past it does not (so they must refuse it).
 // The extent-aware bound only tightens as the extent grows, never loosens.
 func TestMaxDataBytesIsTheOverflowBoundary(t *testing.T) {
-	for _, extent := range []int64{0, 1, 512, 4 << 20} {
-		t.Run(strconv.FormatInt(extent, 10), func(t *testing.T) {
-			max := maxDataBytes(extent)
+	for _, encrypted := range []bool{false, true} {
+		for _, extent := range []int64{0, 1, 512, 4 << 20} {
+			t.Run(strconv.FormatBool(encrypted)+"/"+strconv.FormatInt(extent, 10), func(t *testing.T) {
+				max := maxDataBytes(extent, encrypted)
 
-			// The maximum is representable: its backing computes without wrapping,
-			// and rounding that up to an extent stays positive and no smaller than
-			// the backing it rounded.
-			backing, ok := backingBytesChecked(max)
-			if !ok {
-				t.Fatalf("backingBytesChecked(maxDataBytes(%d)=%d) = not ok, want representable", extent, max)
-			}
-			if rounded := roundUpTo(backing, extent); rounded < 0 || rounded < backing {
-				t.Errorf("roundUpTo(%d, %d) = %d, want a positive value no smaller than the backing", backing, extent, rounded)
-			}
+				// The maximum is representable: its backing computes without
+				// wrapping, and rounding that up to an extent stays positive and
+				// no smaller than the backing it rounded.
+				backing, ok := backingBytesChecked(max, encrypted)
+				if !ok {
+					t.Fatalf("backingBytesChecked(maxDataBytes(%d, false)=%d) = not ok, want representable", extent, max)
+				}
+				if rounded := roundUpTo(backing, extent); rounded < 0 || rounded < backing {
+					t.Errorf("roundUpTo(%d, %d) = %d, want a positive value no smaller than the backing", backing, extent, rounded)
+				}
 
-			// One past it is not: either the backing addition wraps, or the extent
-			// rounding layered on top of it would.
-			if b, ok := backingBytesChecked(max + 1); ok && b <= maxRoundableBytes(extent) {
-				t.Errorf("maxDataBytes(%d) = %d, but %d is still representable (backing %d, roundable ceiling %d): the bound is too low",
-					extent, max, max+1, b, maxRoundableBytes(extent))
-			}
-		})
-	}
+				// One past it is not: either the backing addition wraps, or the
+				// extent rounding layered on top of it would.
+				if b, ok := backingBytesChecked(max+1, encrypted); ok && b <= maxRoundableBytes(extent) {
+					t.Errorf("maxDataBytes(%d, false) = %d, but %d is still representable (backing %d, roundable ceiling %d): the bound is too low",
+						extent, max, max+1, b, maxRoundableBytes(extent))
+				}
+			})
+		}
 
-	if withExtent, without := maxDataBytes(4<<20), maxDataBytes(0); withExtent > without {
-		t.Errorf("maxDataBytes(4MiB) = %d exceeds maxDataBytes(0) = %d; extent rounding must only tighten the bound", withExtent, without)
+		if withExtent, without := maxDataBytes(4<<20, encrypted), maxDataBytes(0, encrypted); withExtent > without {
+			t.Errorf("maxDataBytes(4MiB, false) = %d exceeds maxDataBytes(0, false) = %d; extent rounding must only tighten the bound", withExtent, without)
+		}
 	}
 }
 

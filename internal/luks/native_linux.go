@@ -13,7 +13,7 @@
 
 //go:build linux
 
-package local
+package luks
 
 import (
 	"context"
@@ -29,34 +29,34 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// nativeLUKS is the luksBackend this provider runs on a real host: every
+// Native is the Backend the providers run on a real host: every
 // operation is performed in this process by go-luks2 rather than by forking
 // cryptsetup.
 //
 // It is Linux-only, and the build tag is not a formality. go-luks2 reaches the
 // kernel through device-mapper ioctls (github.com/anatol/devmapper.go), which
 // exist nowhere else, and it carries no build constraints of its own — importing
-// it from a file with no tag would stop package local compiling for darwin and
-// windows, which it does today. See luksbackend_other.go for what the other
+// it from a file with no tag would stop the packages importing it compiling for darwin and
+// windows, which it does today. See native_other.go for what the other
 // platforms get.
 //
 // It holds no state. Everything it needs is on the device or in the kernel, in
 // keeping with the rest of the provider.
-type nativeLUKS struct{}
+type Native struct{}
 
 // Ensure the backend satisfies the seam at compile time.
-var _ luksBackend = nativeLUKS{}
+var _ Backend = Native{}
 
-// luksSectorSize is the encryption sector size every container this provider
+// sectorSize is the encryption sector size every container this package
 // creates uses.
 //
 // It is pinned for the same reason the cipher and the KDF are: it is one of the
 // inputs to the on-disk layout, and a library default that moved would move the
 // layout with it. 512 is also what the data-offset measurement recorded in
-// luksHeaderBytes was taken at.
-const luksSectorSize = 512
+// HeaderBytes was taken at.
+const sectorSize = 512
 
-// luksPBKDFIterTime is the wall-clock target, in milliseconds, that go-luks2
+// pbkdfIterTime is the wall-clock target, in milliseconds, that go-luks2
 // benchmarks PBKDF2 against when it picks an iteration count.
 //
 // It is stated rather than defaulted, like every other format parameter, and it
@@ -72,37 +72,37 @@ const luksSectorSize = 512
 // with the parameters Format pins below: v0.1.10-alpha wrote 100000 iterations
 // in 363ms, v0.2.0-alpha writes 3,988,449 in 2.42s — so this constant is now
 // the target it always claimed to be, and the derivation lands where the 2000ms
-// asks. See luksFormat for why the old count was nonetheless acceptable for the
-// high-entropy material this provider stretches.
-const luksPBKDFIterTime = 2000
+// asks. See Manager.Format for why the old count was nonetheless acceptable for the
+// high-entropy material it stretches.
+const pbkdfIterTime = 2000
 
 // Format writes a LUKS2 header onto the device with every cryptographic
-// parameter pinned. See luksFormat for what each one is and why.
-func (nativeLUKS) Format(ctx context.Context, device string, key []byte) error {
+// parameter pinned. See Manager.Format for what each one is and why.
+func (Native) Format(ctx context.Context, device string, key []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return luks2.Format(luks2.FormatOptions{
 		Device:        device,
 		Passphrase:    key,
-		Cipher:        luksCipher,
-		CipherMode:    luksCipherMode,
-		KeySize:       luksKeySizeBits,
-		HashAlgo:      luksHash,
-		SectorSize:    luksSectorSize,
-		KDFType:       luksPBKDF,
-		PBKDFIterTime: luksPBKDFIterTime,
+		Cipher:        cipher,
+		CipherMode:    cipherMode,
+		KeySize:       keySizeBits,
+		HashAlgo:      hashAlgo,
+		SectorSize:    sectorSize,
+		KDFType:       pbkdf,
+		PBKDFIterTime: pbkdfIterTime,
 	})
 }
 
 // Open unlocks the container and creates its plaintext mapping.
 //
-// The mapping's length is not passed in and is not this provider's to choose:
+// The mapping's length is not passed in and is not this package's to choose:
 // the data segment a Format here writes is "dynamic", so go-luks2 sizes the
 // mapping from the backing device at the moment it opens it. That is what makes
 // growing a container a matter of growing the logical volume and re-opening —
-// see Resize.
-func (nativeLUKS) Open(ctx context.Context, device, name string, key []byte) error {
+// see each provider's resize path.
+func (Native) Open(ctx context.Context, device, name string, key []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -110,7 +110,7 @@ func (nativeLUKS) Open(ctx context.Context, device, name string, key []byte) err
 }
 
 // Close removes the plaintext mapping.
-func (nativeLUKS) Close(ctx context.Context, name string) error {
+func (Native) Close(ctx context.Context, name string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -122,7 +122,7 @@ func (nativeLUKS) Close(ctx context.Context, name string) error {
 // digest, and no device-mapper mapping is created. So a restore can establish
 // that the volume it is about to produce will be openable before it creates
 // anything, rather than after it has copied the image.
-func (nativeLUKS) TestKey(ctx context.Context, device string, key []byte) error {
+func (Native) TestKey(ctx context.Context, device string, key []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -133,8 +133,8 @@ func (nativeLUKS) TestKey(ctx context.Context, device string, key []byte) error 
 // occupies, and so the difference between the logical volume's size and the
 // usable capacity of the mapping over it.
 //
-// It is read from the header rather than assumed to be luksHeaderBytes because
-// not every container this provider handles was formatted by this provider. A
+// It is read from the header rather than assumed to be HeaderBytes because
+// not every container handled here was formatted here. A
 // volume restored from an encrypted snapshot carries its SOURCE's header
 // verbatim, and that source may have been made by an older version of this
 // package or by an operator's own cryptsetup with different parameters.
@@ -149,7 +149,7 @@ func (nativeLUKS) TestKey(ctx context.Context, device string, key []byte) error 
 // rather than guessed at. More than one means a reencryption is in progress,
 // and picking a segment out of that state would produce a capacity that is true
 // of neither the old layout nor the new one.
-func (nativeLUKS) DataOffset(ctx context.Context, device string) (int64, error) {
+func (Native) DataOffset(ctx context.Context, device string) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -187,37 +187,37 @@ func (nativeLUKS) DataOffset(ctx context.Context, device string) (int64, error) 
 // is no "what is this mapping over" call to make. The kernel publishes the
 // stack in /sys/dev/block/<major>:<minor>/slaves, one symlink per device
 // underneath, and reading it needs no privilege and no passphrase.
-func (n nativeLUKS) Mapping(ctx context.Context, name string) (mappingInfo, bool, error) {
+func (n Native) Mapping(ctx context.Context, name string) (MappingInfo, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return mappingInfo{}, false, err
+		return MappingInfo{}, false, err
 	}
 	if !luks2.IsUnlocked(name) {
-		return mappingInfo{}, false, nil
+		return MappingInfo{}, false, nil
 	}
 
 	path, err := luks2.GetMappedDevicePath(name)
 	if err != nil {
-		return mappingInfo{}, false, err
+		return MappingInfo{}, false, err
 	}
 	rdev, err := blockDeviceNumber(path)
 	if err != nil {
-		return mappingInfo{}, false, err
+		return MappingInfo{}, false, err
 	}
 
 	backing, err := backingDevice(sysfsRoot, rdev)
 	if err != nil {
-		return mappingInfo{}, false, err
+		return MappingInfo{}, false, err
 	}
 	backingRdev, err := blockDeviceNumber(backing)
 	if err != nil {
-		return mappingInfo{}, false, err
+		return MappingInfo{}, false, err
 	}
 
-	return mappingInfo{Backing: backing, BackingID: formatDeviceID(backingRdev)}, true, nil
+	return MappingInfo{Backing: backing, BackingID: formatDeviceID(backingRdev)}, true, nil
 }
 
 // Identity returns a device's major:minor.
-func (nativeLUKS) Identity(ctx context.Context, path string) (string, error) {
+func (Native) Identity(ctx context.Context, path string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -269,8 +269,8 @@ const sysfsRoot = "/sys"
 // as the most legible path that leads to it.
 //
 // Exactly one is required. A dm-crypt target has one backing device, so none or
-// several is not the mapping this provider is looking for, and the whole point
-// of the lookup is to refuse what cannot be established — see errNoBackingDevice.
+// several is not the mapping being looked for, and the whole point
+// of the lookup is to refuse what cannot be established — see ErrNoBackingDevice.
 //
 // The path is dm-canonical where it can be: a slave that is itself
 // device-mapper publishes its name under <root>/class/block/<kname>/dm/name, and
@@ -289,7 +289,7 @@ func backingDevice(root string, rdev uint64) (string, error) {
 		names = append(names, entry.Name())
 	}
 	if len(names) != 1 {
-		return "", fmt.Errorf("%w: %s lists %d", errNoBackingDevice, dir, len(names))
+		return "", fmt.Errorf("%w: %s lists %d", ErrNoBackingDevice, dir, len(names))
 	}
 
 	kname := names[0]

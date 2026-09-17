@@ -63,6 +63,7 @@ type injectedSeams struct {
 	mounter      bool
 	mountTable   bool
 	blockDevices bool
+	luks         bool
 }
 
 // requiredCapabilities derives what this configuration will actually ask the
@@ -82,16 +83,20 @@ type injectedSeams struct {
 //     the first resource up.
 //   - CapabilityDRBDControl is required here and has no analog there. It is
 //     not a privilege: the module has to be loaded on the node.
-//   - CapabilityKernelKeyring is NOT required here, though pkg/local needs it
-//     whenever it handles encrypted volumes. This package performs no LUKS
-//     operations at all — grep the package: it has no key-derivation, no
-//     dm-crypt mapping and no keyring use. Its secret is a DRBD shared secret
-//     for peer authentication, which never enters the kernel keyring. Asking for
-//     a capability this provider does not exercise would make a correctly
-//     configured node refuse to start.
+//   - CapabilityKernelKeyring is required here ONLY WHEN THE PROVIDER IS
+//     CONFIGURED TO ENCRYPT, which was not a state this package had when the
+//     set was first measured. That measurement said the capability was never
+//     needed because "this package performs no LUKS operations at all — grep
+//     the package", and the grep now finds them: LUKS-above-DRBD gives every
+//     replicated device a dm-crypt mapping, opened on Promote. The condition is
+//     what keeps the old conclusion true where it still holds — an unencrypted
+//     deployment asks for nothing new, and asking for a capability a provider
+//     does not exercise would make a correctly configured node refuse to start.
+//     The DRBD shared secret is unchanged by this: it authenticates the peer and
+//     never enters the kernel keyring.
 //   - CapabilityDeviceMapper and CapabilityMount ARE shared: volumes are LVM
 //     logical volumes underneath, and the provider mounts filesystems.
-func requiredCapabilities(seams injectedSeams, mode PreflightMode) []preflight.Capability {
+func requiredCapabilities(seams injectedSeams, encrypted bool, mode PreflightMode) []preflight.Capability {
 	if mode == PreflightOff {
 		return nil
 	}
@@ -115,6 +120,13 @@ func requiredCapabilities(seams injectedSeams, mode PreflightMode) []preflight.C
 		capabilities = append(capabilities, preflight.CapabilityMount)
 	}
 
+	// The kernel keyring is reached only when this provider handles encrypted
+	// volumes, and only through the real LUKS backend — a test driving an
+	// injected one derives no keys and creates no mappings.
+	if all || (!seams.luks && encrypted) {
+		capabilities = append(capabilities, preflight.CapabilityKernelKeyring)
+	}
+
 	return capabilities
 }
 
@@ -124,8 +136,8 @@ func requiredCapabilities(seams injectedSeams, mode PreflightMode) []preflight.C
 // who got the settings wrong hears about the settings rather than about the
 // node's capabilities — and before any volume work, so a misconfigured
 // deployment is a refusal to start rather than a failure at the first Provision.
-func runPreflight(seams injectedSeams, mode PreflightMode) error {
-	capabilities := requiredCapabilities(seams, mode)
+func runPreflight(seams injectedSeams, encrypted bool, mode PreflightMode) error {
+	capabilities := requiredCapabilities(seams, encrypted, mode)
 	if len(capabilities) == 0 {
 		return nil
 	}

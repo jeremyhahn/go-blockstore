@@ -68,7 +68,7 @@ func secondaryStatus(name string, minor int) string {
 
 // scriptProvision scripts the three commands a Provision runs.
 func (f *fakeRunner) scriptProvision(name string, size int64) {
-	f.scriptProvisionAt(name, backingBytes(size))
+	f.scriptProvisionAt(name, backingBytes(size, false))
 }
 
 // scriptProvisionAt is the same for a backing volume created at an explicit
@@ -84,13 +84,15 @@ func (f *fakeRunner) scriptProvisionAt(name string, backingSize int64) {
 // created it — what a snapshot of one reports as its origin_size, and therefore
 // the size a restore of it creates its destination at.
 func originBacking() int64 {
-	return roundUpTo(backingBytes(testSize), testExtentSize)
+	return roundUpTo(backingBytes(testSize, false), testExtentSize)
 }
 
 // provision runs a successful Provision, scripting it first.
 func provision(t *testing.T, p *Provider, r *fakeRunner, spec *common.VolumeSpec) common.Volume {
 	t.Helper()
-	r.scriptProvision(spec.Name, spec.SizeBytes)
+	// The backing size is the provider's to decide — an encrypted one adds the
+	// LUKS header on top — so the script follows its configuration.
+	r.scriptProvisionAt(spec.Name, backingBytes(spec.SizeBytes, p.cfg.Encrypted))
 	vol, err := p.Provision(context.Background(), *spec)
 	if err != nil {
 		t.Fatalf("Provision(%q): %v", spec.Name, err)
@@ -122,7 +124,7 @@ func TestProvision(t *testing.T) {
 		t.Errorf("Volume.Spec.SizeBytes = %d, want %d", vol.Spec.SizeBytes, testSize)
 	}
 
-	r.assertRan(t, fmt.Sprintf("lvcreate --yes --name vol1 --size %db vg0", backingBytes(testSize)))
+	r.assertRan(t, fmt.Sprintf("lvcreate --yes --name vol1 --size %db vg0", backingBytes(testSize, false)))
 	r.assertRan(t, "drbdadm -- --force create-md vol1")
 	r.assertRan(t, "drbdadm up vol1")
 
@@ -178,11 +180,11 @@ func TestProvisionValidation(t *testing.T) {
 		{"negative size", common.VolumeSpec{Name: testVolume, SizeBytes: -1}, common.ErrInvalidArgument},
 		// A size whose backing (data plus DRBD metadata) does not fit in an
 		// int64 is malformed input: unguarded it would reach lvcreate as a
-		// wrapped-negative byte count. maxDataBytes(0) is the largest that fits
+		// wrapped-negative byte count. maxDataBytes(0, false) is the largest that fits
 		// when lvcreate does the extent rounding, so one past it is the first
 		// that does not.
 		{"size at math.MaxInt64", common.VolumeSpec{Name: testVolume, SizeBytes: math.MaxInt64, Replicas: 2}, common.ErrInvalidArgument},
-		{"size one past the representable backing", common.VolumeSpec{Name: testVolume, SizeBytes: maxDataBytes(0) + 1, Replicas: 2}, common.ErrInvalidArgument},
+		{"size one past the representable backing", common.VolumeSpec{Name: testVolume, SizeBytes: maxDataBytes(0, false) + 1, Replicas: 2}, common.ErrInvalidArgument},
 		{"unsupported filesystem", common.VolumeSpec{Name: testVolume, SizeBytes: testSize, FSType: "btrfs"}, common.ErrInvalidArgument},
 		// A count this provider cannot honor is well-formed and served by the
 		// local provider, so it is ErrUnsupported — "choose another backend" —
@@ -215,12 +217,12 @@ func TestProvisionAcceptsTwoReplicas(t *testing.T) {
 // TestProvisionAcceptsTheLargestRepresentableSize is the boundary the refusals
 // in TestProvisionValidation must not overshoot: the largest usable capacity
 // whose backing still fits in an int64 has to be ATTEMPTED, not refused. Its
-// backing is created at backingBytes(maxDataBytes(0)), which is exactly
+// backing is created at backingBytes(maxDataBytes(0, false)), which is exactly
 // math.MaxInt64.
 func TestProvisionAcceptsTheLargestRepresentableSize(t *testing.T) {
 	p, r := newTestProvider(t)
-	limit := maxDataBytes(0)
-	r.scriptProvisionAt(testVolume, backingBytes(limit))
+	limit := maxDataBytes(0, false)
+	r.scriptProvisionAt(testVolume, backingBytes(limit, false))
 
 	vol, err := p.Provision(context.Background(), common.VolumeSpec{Name: testVolume, SizeBytes: limit, Replicas: 2})
 	if err != nil {
@@ -229,7 +231,7 @@ func TestProvisionAcceptsTheLargestRepresentableSize(t *testing.T) {
 	if vol.Spec.SizeBytes != limit {
 		t.Errorf("Volume.Spec.SizeBytes = %d, want the representable maximum %d", vol.Spec.SizeBytes, limit)
 	}
-	r.assertRan(t, fmt.Sprintf("lvcreate --yes --name vol1 --size %db vg0", backingBytes(limit)))
+	r.assertRan(t, fmt.Sprintf("lvcreate --yes --name vol1 --size %db vg0", backingBytes(limit, false)))
 }
 
 func TestProvisionRollback(t *testing.T) {
@@ -242,7 +244,7 @@ func TestProvisionRollback(t *testing.T) {
 		{
 			name: "lvcreate fails",
 			breakIt: func(r *fakeRunner) {
-				r.on(binLVCreate, "--yes", "--name", testVolume, "--size", strconv.FormatInt(backingBytes(testSize), 10)+"b", testVG).
+				r.on(binLVCreate, "--yes", "--name", testVolume, "--size", strconv.FormatInt(backingBytes(testSize, false), 10)+"b", testVG).
 					fails(5, "Volume group \"vg0\" has insufficient free space")
 			},
 			wantNotRan: []string{"lvremove", "drbdadm"},
@@ -461,7 +463,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 	// size must still be accepted.
 	r.scriptLVS(lvsJSON(lvEntry{
 		Name: snapLV, VG: testVG, Size: "214748364", Origin: "vol1",
-		OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10), Time: "2026-08-26 10:00:00 -0500", Attr: "swi-a-s---",
+		OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10), Time: "2026-08-26 10:00:00 -0500", Attr: "swi-a-s---",
 	}))
 
 	r.scriptProvisionAt("vol2", originBacking())
@@ -515,7 +517,7 @@ func TestProvisionFromSnapshotErrors(t *testing.T) {
 			name: "snapshot of an unmanaged volume", managed: false, snapID: "vg0/vol1.snap.nightly",
 			lvs: lvsJSON(lvEntry{
 				Name: "vol1.snap.nightly", VG: testVG, Origin: "vol1",
-				OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+				OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 			}),
 			size: testSize, want: common.ErrSnapshotNotFound,
 		},
@@ -531,7 +533,7 @@ func TestProvisionFromSnapshotErrors(t *testing.T) {
 			name: "snapshot of another volume", managed: true, snapID: "vg0/vol1.snap.nightly",
 			lvs: lvsJSON(lvEntry{
 				Name: "vol1.snap.nightly", VG: testVG, Origin: "vol2",
-				OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+				OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 			}),
 			size: testSize, want: common.ErrSnapshotNotFound,
 		},
@@ -546,7 +548,7 @@ func TestProvisionFromSnapshotErrors(t *testing.T) {
 			name: "shrinking during restore is refused", managed: true, snapID: "vg0/vol1.snap.nightly",
 			lvs: lvsJSON(lvEntry{
 				Name: "vol1.snap.nightly", VG: testVG, Origin: "vol1",
-				OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+				OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 			}),
 			size: testSize / 2, want: common.ErrUnsupported,
 		},
@@ -1184,9 +1186,9 @@ func TestResize(t *testing.T) {
 	newSize := testSize * 2
 	r.scriptLVS(lvsJSON(lvEntry{
 		Name: "vol1", VG: testVG,
-		Size: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+		Size: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 	}))
-	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize), 10)+"b", "vg0/vol1").returns("")
+	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize, false), 10)+"b", "vg0/vol1").returns("")
 	r.on(binDRBDAdm, "resize", testVolume).returns("")
 	r.scriptMount("/dev/drbd0", "")
 	// Unmounted ext4 on a Primary: checked, then grown offline.
@@ -1197,7 +1199,7 @@ func TestResize(t *testing.T) {
 	if err := p.Resize(context.Background(), testVolume, newSize); err != nil {
 		t.Fatalf("Resize: %v", err)
 	}
-	r.assertRan(t, fmt.Sprintf("lvextend --size %db vg0/vol1", backingBytes(newSize)))
+	r.assertRan(t, fmt.Sprintf("lvextend --size %db vg0/vol1", backingBytes(newSize, false)))
 	r.assertRan(t, "e2fsck -f -p /dev/drbd0")
 	r.assertRan(t, "resize2fs /dev/drbd0")
 	r.assertRan(t, "drbdadm resize vol1")
@@ -1244,7 +1246,7 @@ func TestResizeRepeatFinishesTheFilesystem(t *testing.T) {
 	// leaves when its filesystem grow failed.
 	r.scriptLVS(lvsJSON(lvEntry{
 		Name: testVolume, VG: testVG,
-		Size: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+		Size: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 	}))
 	r.on(binDRBDAdm, "resize", testVolume).returns("")
 	r.scriptMount("/dev/drbd0", testMountPoint)
@@ -1279,11 +1281,11 @@ func TestResizeRefusesASizeWhoseBackingOverflows(t *testing.T) {
 	r.scriptStatus(primaryStatus(testVolume, 0))
 	r.scriptLVS(lvsJSON(lvEntry{
 		Name: testVolume, VG: testVG,
-		Size:       strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+		Size:       strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 		ExtentSize: strconv.FormatInt(testExtentSize, 10),
 	}))
 
-	limit := maxDataBytes(testExtentSize)
+	limit := maxDataBytes(testExtentSize, false)
 	for _, tc := range []struct {
 		name string
 		size int64
@@ -1323,15 +1325,15 @@ func TestResizeAttemptsTheLargestRepresentableSize(t *testing.T) {
 	provision(t, p, r, defaultSpec())
 	r.reset()
 
-	limit := maxDataBytes(testExtentSize)
+	limit := maxDataBytes(testExtentSize, false)
 
 	r.scriptStatus(primaryStatus(testVolume, 0))
 	r.scriptLVS(lvsJSON(lvEntry{
 		Name: testVolume, VG: testVG,
-		Size:       strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+		Size:       strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 		ExtentSize: strconv.FormatInt(testExtentSize, 10),
 	}))
-	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(limit), 10)+"b", "vg0/vol1").returns("")
+	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(limit, false), 10)+"b", "vg0/vol1").returns("")
 	r.on(binDRBDAdm, "resize", testVolume).returns("")
 	r.scriptMount("/dev/drbd0", "")
 	r.on(binE2fsck, "-f", "-p", "/dev/drbd0").returns("")
@@ -1341,7 +1343,7 @@ func TestResizeAttemptsTheLargestRepresentableSize(t *testing.T) {
 		t.Fatalf("Resize to the representable maximum = %v, want it attempted", err)
 	}
 	// It reached the device rather than being turned away at the guard.
-	r.assertRan(t, fmt.Sprintf("lvextend --size %db vg0/vol1", backingBytes(limit)))
+	r.assertRan(t, fmt.Sprintf("lvextend --size %db vg0/vol1", backingBytes(limit, false)))
 	r.assertRan(t, "drbdadm resize vol1")
 
 	meta, err := p.loadMeta(testVolume)
@@ -2072,11 +2074,11 @@ func TestDeleteWhenResourceIsDown(t *testing.T) {
 func TestStatus(t *testing.T) {
 	// The DRBD device presents the usable capacity, which under the
 	// usable-capacity contract is AT LEAST what the caller asked for: the backing
-	// volume is created at backingBytes(testSize), rounded up to a whole extent,
+	// volume is created at backingBytes(testSize, false), rounded up to a whole extent,
 	// and only DRBD's internal metadata is carved off the end of that. This is
 	// the "size" the status fixtures report, in KiB, and it must match the
 	// literal in the fixtures. It works out to
-	//   roundUpTo(backingBytes(testSize), testExtentSize) - metadataBytes(...),
+	//   roundUpTo(backingBytes(testSize, false), testExtentSize) - metadataBytes(...),
 	// which for a 1 GiB volume on 4 MiB extents is 1052600 KiB — comfortably
 	// above testSize, where the pre-#11a fixtures pinned a value 4 KiB SHORT of
 	// it, a device no volume this provider sizes could ever present.
@@ -2593,7 +2595,7 @@ func TestRestoreSizeBoundary(t *testing.T) {
 		// bound is looser, without the extent rounding) and is caught in the
 		// restore's own sizing, before dst wraps negative and reads the restore
 		// as a shrink. Malformed input, not an unsupported shrink.
-		{"a size whose rounded backing overflows", originBacking(), maxDataBytes(testExtentSize) + 1, common.ErrInvalidArgument},
+		{"a size whose rounded backing overflows", originBacking(), maxDataBytes(testExtentSize, false) + 1, common.ErrInvalidArgument},
 	}
 
 	for _, tc := range tests {
@@ -2781,7 +2783,7 @@ func TestProvisionDoesNotPublishUntilComplete(t *testing.T) {
 	attachDone := make(chan struct{})
 	// The hook fires with the reservation on disk and nothing else done yet.
 	r.on(binLVCreate, "--yes", "--name", testVolume, "--size",
-		strconv.FormatInt(backingBytes(testSize), 10)+"b", testVG).
+		strconv.FormatInt(backingBytes(testSize, false), 10)+"b", testVG).
 		returns("").
 		then(func() {
 			_, midStatus = p.Status(context.Background(), testVolume)
@@ -2961,7 +2963,7 @@ func TestResizeConvergesAfterAPartialFailure(t *testing.T) {
 	// The backing volume is already at the target; only the record is behind.
 	r.scriptLVS(lvsJSON(lvEntry{
 		Name: "vol1", VG: testVG,
-		Size: strconv.FormatInt(roundUpTo(backingBytes(newSize), testExtentSize), 10),
+		Size: strconv.FormatInt(roundUpTo(backingBytes(newSize, false), testExtentSize), 10),
 	}))
 	r.on(binDRBDAdm, "resize", testVolume).returns("")
 	r.scriptMount("/dev/drbd0", "")
@@ -3099,9 +3101,9 @@ func TestResizeGrowsTheFilesystem(t *testing.T) {
 			newSize := testSize * 2
 			r.scriptLVS(lvsJSON(lvEntry{
 				Name: "vol1", VG: testVG,
-				Size: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+				Size: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 			}))
-			r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize), 10)+"b", "vg0/vol1").returns("")
+			r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize, false), 10)+"b", "vg0/vol1").returns("")
 			r.on(binDRBDAdm, "resize", testVolume).returns("")
 			if tc.fsType != "" {
 				r.scriptMount("/dev/drbd0", tc.mounted)
@@ -3150,9 +3152,9 @@ func TestResizeFailsWhenTheFilesystemGrowFails(t *testing.T) {
 	newSize := testSize * 2
 	r.scriptLVS(lvsJSON(lvEntry{
 		Name: "vol1", VG: testVG,
-		Size: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+		Size: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 	}))
-	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize), 10)+"b", "vg0/vol1").returns("")
+	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize, false), 10)+"b", "vg0/vol1").returns("")
 	r.on(binDRBDAdm, "resize", testVolume).returns("")
 	r.scriptMount("/dev/drbd0", testMountPoint)
 	r.on(binResize2fs, "/dev/drbd0").fails(1, "resize2fs: Device or resource busy")
@@ -3275,7 +3277,7 @@ func TestSnapshotAndDeleteAreSerialized(t *testing.T) {
 	r.scriptStatus(secondaryStatus(testVolume, 0))
 	r.scriptLVS(lvsJSON(lvEntry{
 		Name: testVolume, VG: testVG,
-		Size: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+		Size: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 	}))
 	r.on(binDRBDAdm, "down", testVolume).returns("")
 	r.on(binLVRemove, "--force", "vg0/vol1").returns("")
@@ -3484,9 +3486,9 @@ func TestOfflineExtGrowStopsOnAnUnfixableCheck(t *testing.T) {
 			newSize := testSize * 2
 			r.scriptLVS(lvsJSON(lvEntry{
 				Name: testVolume, VG: testVG,
-				Size: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+				Size: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 			}))
-			r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize), 10)+"b", "vg0/vol1").returns("")
+			r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize, false), 10)+"b", "vg0/vol1").returns("")
 			r.on(binDRBDAdm, "resize", testVolume).returns("")
 			r.scriptMount("/dev/drbd0", "")
 			r.scriptStatus(primaryStatus(testVolume, 0))
@@ -3637,7 +3639,7 @@ func TestRestoreInheritsTheSourceFilesystem(t *testing.T) {
 	const snapLV = "vol1.snap.nightly"
 	r.scriptLVS(lvsJSON(lvEntry{
 		Name: snapLV, VG: testVG, Origin: testVolume,
-		OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+		OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 	}))
 	r.scriptProvisionAt("vol2", originBacking())
 	if _, err := p.Provision(context.Background(), common.VolumeSpec{
@@ -4289,7 +4291,7 @@ func TestRestoreIntoALargerVolume(t *testing.T) {
 	// up immediately before. That matters: Resize refuses to extend a detached
 	// resource, and this path satisfies that guard rather than bypassing it.
 	r.scriptStatus(statusJSON("vol2", 1, "Secondary", "Connected", "Established", "Inconsistent"))
-	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(requested), 10)+"b", "vg0/vol2").returns("")
+	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(requested, false), 10)+"b", "vg0/vol2").returns("")
 	r.on(binDRBDAdm, "resize", "vol2").returns("")
 	r.scriptMount("/dev/drbd1", "")
 
@@ -4303,7 +4305,7 @@ func TestRestoreIntoALargerVolume(t *testing.T) {
 
 	r.assertRan(t, fmt.Sprintf("lvcreate --yes --name vol2 --size %db vg0", originBacking()))
 	assertCopied(t, r, "/dev/vg0/"+snapLV, "/dev/vg0/vol2")
-	r.assertRan(t, fmt.Sprintf("lvextend --size %db vg0/vol2", backingBytes(requested)))
+	r.assertRan(t, fmt.Sprintf("lvextend --size %db vg0/vol2", backingBytes(requested, false)))
 	r.assertRan(t, "drbdadm resize vol2")
 
 	// And in that order: extending a detached resource is exactly what the

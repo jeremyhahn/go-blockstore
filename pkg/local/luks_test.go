@@ -25,6 +25,8 @@ import (
 
 	"github.com/jeremyhahn/go-enclave"
 
+	"github.com/jeremyhahn/go-blockstore/internal/luks"
+
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
@@ -293,7 +295,7 @@ func TestFileKeyProviderRejectsUnusableFiles(t *testing.T) {
 	// An oversized file is refused rather than mlock'd: locked memory is
 	// rationed, and a path pointing at something enormous is a misconfiguration.
 	big := filepath.Join(dir, "big.key")
-	if err := os.WriteFile(big, make([]byte, maxKeyFileBytes+1), 0o600); err != nil {
+	if err := os.WriteFile(big, make([]byte, luks.MaxKeyFileBytes+1), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	if _, err := FileKeyProvider(big)(context.Background(), "data"); err == nil {
@@ -305,7 +307,7 @@ func TestFileKeyProviderRejectsUnusableFiles(t *testing.T) {
 // hits. The provider does not fall back to unprotected memory when the kernel
 // will not lock pages, so the error has to say what to change.
 func TestLockedMemoryErrorIsLegible(t *testing.T) {
-	err := lockedMemoryError(&enclave.LockedMemoryError{Cause: errors.New("cannot allocate memory")})
+	err := luks.LockedMemoryError(errScope, &enclave.LockedMemoryError{Cause: errors.New("cannot allocate memory")})
 
 	if !errors.Is(err, enclave.ErrLockedMemoryUnavailable) {
 		t.Fatalf("lockedMemoryError dropped the sentinel: %v", err)
@@ -319,8 +321,8 @@ func TestLockedMemoryErrorIsLegible(t *testing.T) {
 	// An unrelated error passes through untouched rather than being dressed up
 	// as a memlock problem.
 	other := errors.New("some other failure")
-	if got := lockedMemoryError(other); !errors.Is(got, other) {
-		t.Errorf("lockedMemoryError(%v) = %v, want it passed through", other, got)
+	if got := luks.LockedMemoryError(errScope, other); !errors.Is(got, other) {
+		t.Errorf("luks.LockedMemoryError(errScope, %v) = %v, want it passed through", other, got)
 	}
 }
 
@@ -376,7 +378,7 @@ func TestLUKSIsOpenAcceptsOurOwnMapping(t *testing.T) {
 // directory a test owns. This checks that luksIsOpen propagates rather than
 // swallowing, which is the half that belongs here.
 func TestLUKSIsOpenFailsClosedOnUnreadableIdentity(t *testing.T) {
-	sentinel := fmt.Errorf("%w: /sys/dev/block/253:3/slaves lists 2", errNoBackingDevice)
+	sentinel := fmt.Errorf("%w: /sys/dev/block/253:3/slaves lists 2", luks.ErrNoBackingDevice)
 	runner := newFakeRunner().on(luksBinary, func(args []string, _ []byte) ([]byte, error) {
 		if len(args) > 0 && args[0] == "mapping" {
 			return nil, sentinel
@@ -389,8 +391,8 @@ func TestLUKSIsOpenFailsClosedOnUnreadableIdentity(t *testing.T) {
 	if err == nil {
 		t.Fatalf("luksIsOpen returned %v and no error for a mapping with no single backing device", open)
 	}
-	if !errors.Is(err, errNoBackingDevice) {
-		t.Errorf("luksIsOpen = %v, want it to carry errNoBackingDevice", err)
+	if !errors.Is(err, luks.ErrNoBackingDevice) {
+		t.Errorf("luksIsOpen = %v, want it to carry luks.ErrNoBackingDevice", err)
 	}
 }
 

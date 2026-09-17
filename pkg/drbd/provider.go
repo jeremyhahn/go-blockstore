@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/jeremyhahn/go-blockstore/internal/blkdev"
+	"github.com/jeremyhahn/go-blockstore/internal/luks"
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
 	"github.com/jeremyhahn/go-blockstore/internal/mountguard"
 	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
@@ -164,9 +165,16 @@ type Provider struct {
 	// exactly the operations this provider will actually perform. A seam that
 	// was replaced is not checked: that is a derivation from the configuration,
 	// not a guess — a provider given its own Mounter does not call mount(2).
-	injected injectedSeams
-	secrets  SecretProvider
-	mu       sync.Mutex
+	injected    injectedSeams
+	secrets     SecretProvider
+	keyProvider KeyProvider
+	luks        luks.Backend
+
+	// crypt is the shared LUKS machinery bound to this provider's mapping
+	// namespace. See luks.go for what this package keeps of its own.
+	crypt *luks.Manager
+
+	mu sync.Mutex
 }
 
 // Compile-time proof that the provider satisfies the replicated contract, not
@@ -253,6 +261,7 @@ func New(settings map[string]string, opts ...Option) (*Provider, error) {
 		mounter:      mount.System(),
 		mountTable:   mountinfo.System{},
 		blockDevices: blkdev.System{},
+		luks:         luks.Native{},
 	}
 	for _, o := range opts {
 		o(p)
@@ -268,6 +277,9 @@ func New(settings map[string]string, opts ...Option) (*Provider, error) {
 	}
 	if p.blockDevices == nil {
 		return nil, fmt.Errorf("%w: block devices is nil", common.ErrInvalidArgument)
+	}
+	if p.luks == nil {
+		return nil, fmt.Errorf("%w: luks backend is nil", common.ErrInvalidArgument)
 	}
 	// A provider told to require propagation, over a mount table that cannot
 	// report it, is a configuration that cannot work — and discovering it after
@@ -285,6 +297,27 @@ func New(settings map[string]string, opts ...Option) (*Provider, error) {
 		return nil, fmt.Errorf("%w: %s is %s, and the configured MountTable cannot report propagation (it does not implement MountPropagationReader)",
 			common.ErrInvalidArgument, SettingMountPropagation, MountPropagationShared)
 	}
+	// An injected provider wins over the file setting, for the reason it does
+	// with the replication secret: a caller unsealing from a TPM should not also
+	// have to leave the setting unset.
+	if p.keyProvider == nil && cfg.LUKSKeyFile != "" {
+		p.keyProvider = FileKeyProvider(cfg.LUKSKeyFile)
+	}
+	// Refused at construction rather than at the first Promote. A node
+	// configured to encrypt with no way to obtain the passphrase is a
+	// deployment mistake, and finding out at the first failover is finding out
+	// at the worst possible moment.
+	if cfg.Encrypted && p.keyProvider == nil {
+		return nil, fmt.Errorf("%w: %s is set but there is no way to obtain the passphrase: set %s or inject a KeyProvider",
+			common.ErrInvalidArgument, SettingEncrypted, SettingLUKSKeyFile)
+	}
+	// And the other way round, because a key that is configured and never used
+	// is a deployment that believes it is encrypting and is not.
+	if !cfg.Encrypted && p.keyProvider != nil {
+		return nil, fmt.Errorf("%w: a LUKS passphrase is configured but %s is not set, so nothing would be encrypted",
+			common.ErrInvalidArgument, SettingEncrypted)
+	}
+	p.crypt = luks.NewManager(p.luks, p.keyProvider, p.mappingNamespace(), errScope)
 	// An injected provider wins over the file setting, so a caller unsealing
 	// from a TPM does not also have to leave the setting unset.
 	if p.secrets == nil && cfg.ReplicationSecretFile != "" {
@@ -316,7 +349,7 @@ func New(settings map[string]string, opts ...Option) (*Provider, error) {
 	// discovering it at the first volume operation turns a deployment mistake
 	// into an outage. The capability set is derived, and it is NOT the local
 	// provider's; see requiredCapabilities.
-	if err := runPreflight(p.injected, cfg.Preflight); err != nil {
+	if err := runPreflight(p.injected, cfg.Encrypted, cfg.Preflight); err != nil {
 		return nil, err
 	}
 	return p, nil
@@ -458,9 +491,10 @@ func (p *Provider) resourceDown(ctx context.Context, res string) error {
 // on initial sync.
 //
 // spec.SizeBytes is USABLE capacity, per common.VolumeSpec.SizeBytes: the
-// backing logical volume is created at backingBytes(spec.SizeBytes), so DRBD's
-// internal metadata comes out of space added for it rather than out of what the
-// caller asked for. The record keeps the usable figure.
+// backing logical volume is created at backingBytes(spec.SizeBytes, encrypted),
+// so DRBD's internal metadata — and, on an encrypted provider, the LUKS2
+// header — comes out of space added for it rather than out of what the caller
+// asked for. The record keeps the usable figure.
 //
 // spec.Replicas may be left unset: zero means unspecified and resolves to this
 // provider's natural count of two.
@@ -499,16 +533,17 @@ func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (commo
 	if spec.SizeBytes <= 0 {
 		return common.Volume{}, fmt.Errorf("%w: size must be positive, got %d", common.ErrInvalidArgument, spec.SizeBytes)
 	}
-	// The backing volume is created at backingBytes(spec.SizeBytes), and that
-	// addition has to be representable. A signed overflow in Go wraps rather than
-	// trapping, so without this a size near math.MaxInt64 would reach lvcreate as
-	// a NEGATIVE byte count. It is malformed input rather than an unsupported
-	// operation: no backend could back it, and the caller has to change the
-	// number rather than choose another provider. Extent rounding is lvcreate's
-	// here, so the bound is the metadata addition alone; the restore and resize
-	// paths, which round in Go, bound that too.
-	if limit := maxDataBytes(0); spec.SizeBytes > limit {
-		return common.Volume{}, fmt.Errorf("%w: size %d exceeds the largest usable capacity this provider can back, %d (a larger request overflows the backing size once DRBD's internal metadata is added)",
+	// The backing volume is created at backingBytes(spec.SizeBytes, encrypted),
+	// and those additions have to be representable. A signed overflow in Go
+	// wraps rather than trapping, so without this a size near math.MaxInt64
+	// would reach lvcreate as a NEGATIVE byte count. It is malformed input
+	// rather than an unsupported operation: no backend could back it, and the
+	// caller has to change the number rather than choose another provider.
+	// Extent rounding is lvcreate's here, so the bound is the header and
+	// metadata additions alone; the restore and resize paths, which round in
+	// Go, bound that too.
+	if limit := maxDataBytes(0, p.cfg.Encrypted); spec.SizeBytes > limit {
+		return common.Volume{}, fmt.Errorf("%w: size %d exceeds the largest usable capacity this provider can back, %d (a larger request overflows the backing size once DRBD's internal metadata, and the LUKS2 header on an encrypted provider, is added)",
 			common.ErrInvalidArgument, spec.SizeBytes, limit)
 	}
 	if err := validateFSType(spec.FSType); err != nil {
@@ -723,7 +758,7 @@ func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (commo
 	// A restore creates the backing volume at the SOURCE's size and grows to the
 	// requested one after bring-up; see restorePlan for why the copy cannot go
 	// straight into a longer device.
-	createSize := backingBytes(meta.SizeBytes)
+	createSize := backingBytes(meta.SizeBytes, p.cfg.Encrypted)
 	if plan != nil {
 		createSize = plan.backingSize
 	}
@@ -959,19 +994,35 @@ func (p *Provider) restoreSource(ctx context.Context, spec *common.VolumeSpec) (
 	// src > dst comparison below would read a wrapped-negative destination as a
 	// shrink the caller never asked for. Malformed input rather than an
 	// unsupported restore: no volume group could hold it.
-	if limit := maxDataBytes(entry.extentSizeBytes()); spec.SizeBytes > limit {
-		return nil, fmt.Errorf("%w: size %d exceeds the largest usable capacity representable on this volume group, %d (extents are %d bytes and DRBD's internal metadata is added on top)",
+	if limit := maxDataBytes(entry.extentSizeBytes(), p.cfg.Encrypted); spec.SizeBytes > limit {
+		return nil, fmt.Errorf("%w: size %d exceeds the largest usable capacity representable on this volume group, %d (extents are %d bytes and DRBD's internal metadata, and the LUKS2 header on an encrypted provider, is added on top)",
 			common.ErrInvalidArgument, spec.SizeBytes, limit, entry.extentSizeBytes())
 	}
 	// Both are logical volumes, whose sizes LVM rounds up to the volume group's
 	// extent, so the comparison is against the size lvcreate would give the
 	// destination rather than the unrounded request — comparing a rounded
 	// origin against an unrounded request reads a restore at exactly the
-	// original size as a shrink.
-	dst := roundUpTo(backingBytes(spec.SizeBytes), entry.extentSizeBytes())
+	// original size as a shrink. The conversion is this provider's, header
+	// included when it encrypts: a snapshot of an encrypted volume has the
+	// encrypted backing size as its origin, so a same-size restore of it lands
+	// on exactly that figure and is neither a grow nor a shrink.
+	dst := roundUpTo(backingBytes(spec.SizeBytes, p.cfg.Encrypted), entry.extentSizeBytes())
 	if src > dst {
 		return nil, fmt.Errorf("%w: restoring snapshot %q needs a %d-byte backing volume, but %d usable (%d backing) was requested: this provider does not shrink during restore",
 			common.ErrUnsupported, spec.SourceSnapshotID, src, spec.SizeBytes, dst)
+	}
+
+	// A restore that would have to GROW is refused on an encrypted provider,
+	// here, before a logical volume exists. The grow it would run is
+	// resizeLocked's, which refuses for the same reason — the copied container
+	// carries the source's filesystem, and recording the larger size over it
+	// is the same wrong answer a Resize would give — and letting Provision
+	// reach that refusal would mean creating, copying into and bringing up a
+	// volume only to roll all of it back. A restore at the source's own size
+	// involves no grow and is not affected. See ErrResizeEncrypted.
+	if dst > src && p.cfg.Encrypted {
+		return nil, fmt.Errorf("restoring snapshot %q into %d usable bytes would have to grow it from the source's %d-byte backing volume: %w",
+			spec.SourceSnapshotID, spec.SizeBytes, src, ErrResizeEncrypted)
 	}
 
 	return &restorePlan{
@@ -1099,6 +1150,16 @@ func (p *Provider) Detach(ctx context.Context, volID string, node common.NodeID)
 		}
 		return fmt.Errorf("volume %q: drbdsetup reports role %q: %w", meta.Name, rawRole, ErrRoleUnknown)
 	}
+
+	// Converging rather than expected: a Secondary reached through Demote has
+	// no mapping left, because Demote closes it and DRBD would not have
+	// demoted otherwise. What this covers is the mapping nobody closed — a run
+	// that ended between the two, an operator who opened one by hand — and it
+	// has to go before the resource does, since an open mapping holds the
+	// device and fails the drbdadm down.
+	if err := p.closeContainer(ctx, &meta); err != nil {
+		return err
+	}
 	return p.resourceDown(ctx, meta.Name)
 }
 
@@ -1165,6 +1226,15 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 		return primaryErr
 	}
 
+	// And that the container is open, which Primary implies in the ordinary
+	// case and does not guarantee. Checked before the format for the reason the
+	// target is: ensureFilesystem writes to the plaintext device, and a device
+	// node that is not there is not a mkfs to attempt and hope for a legible
+	// error from. A no-op for an unencrypted volume.
+	if unlockErr := p.requireContainerOpen(ctx, &meta); unlockErr != nil {
+		return unlockErr
+	}
+
 	// Before the format, not merely before the mount. Mount creates a
 	// filesystem on an empty device, and that is the destructive step: a
 	// request that is going to fail on its target must fail BEFORE it, or a
@@ -1182,7 +1252,7 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 		return fmt.Errorf("%w: mount target %q: %w", common.ErrInvalidArgument, target, targetErr)
 	}
 
-	dev := devicePath(meta.Minor)
+	dev := p.fsDevice(&meta)
 	// The type that comes back is the one on the device, which may not be the
 	// one that went in: a volume formatted by an attempt that failed before
 	// recording carries a filesystem neither the record nor the caller knows
@@ -1275,7 +1345,7 @@ func (p *Provider) ensureFilesystem(ctx context.Context, meta *resourceMeta, fsT
 	// interleave with each other. Mount now holds it across its whole body —
 	// the lookup included, so that meta names a volume that still exists — and
 	// this is its only caller, so taking it again would deadlock.
-	dev := devicePath(meta.Minor)
+	dev := p.fsDevice(meta)
 	found, empty, err := p.probeDevice(ctx, dev)
 	if err != nil {
 		return "", err
@@ -1381,7 +1451,7 @@ func (p *Provider) Unmount(ctx context.Context, volID, target string) error {
 		return err
 	}
 
-	mounted, err := p.mountedAt(ctx, devicePath(meta.Minor), target)
+	mounted, err := p.mountedAt(ctx, p.fsDevice(&meta), target)
 	if err != nil {
 		return err
 	}
@@ -1476,8 +1546,15 @@ func (p *Provider) isMounted(ctx context.Context, dev string) (bool, error) {
 // the same request once the volume is mounted, or promoted, finishes the job.
 // See growFilesystem.
 //
+// AN ENCRYPTED VOLUME IS REFUSED OUTRIGHT, with ErrResizeEncrypted, before
+// anything is extended. The converge-on-retry above depends on the filesystem
+// half being finishable by a later call, and over an open LUKS container it is
+// not: the plaintext device keeps the size it was opened at, so no repeat can
+// grow the filesystem and a device grown anyway would be reported at a size
+// its filesystem never reached. Issue #62 lifts this.
+//
 // newSize is USABLE capacity, in the same units Provision and Status use, so
-// the backing logical volume grows to backingBytes(newSize) — by more than the
+// the backing logical volume grows to backingBytes(newSize, encrypted) — by more than the
 // difference between the two sizes, since the metadata reservation grows with
 // the device. The shrink check compares usable against usable; the "is the
 // device already big enough" check compares backing against backing.
@@ -1515,6 +1592,18 @@ func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newS
 	}
 	if newSize < meta.SizeBytes {
 		return fmt.Errorf("%w: volume %q is %d bytes and this provider does not shrink", common.ErrUnsupported, meta.Name, meta.SizeBytes)
+	}
+	// An encrypted volume is refused HERE, before the role query that is the
+	// first command below, so that a refused resize leaves nothing behind:
+	// not an extended backing volume, not a resized resource, and above all
+	// not a record claiming a size the filesystem never reached. The three
+	// steps below are idempotent precisely so that a partial run can be
+	// finished by a repeat; on an encrypted volume the filesystem step cannot
+	// be finished by any repeat, so a partial run here would never converge
+	// and the up-front refusal is the only shape that fails closed. Why the
+	// filesystem cannot be grown, and what lifts this, is on ErrResizeEncrypted.
+	if p.cfg.Encrypted {
+		return fmt.Errorf("volume %q: %w", meta.Name, ErrResizeEncrypted)
 	}
 	// A request equal to the recorded size is NOT a no-op. Growing the device
 	// and growing the filesystem on it are two halves of one operation, and the
@@ -1564,7 +1653,7 @@ func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newS
 	if !ok {
 		return fmt.Errorf("volume %q: backing logical volume %q is missing", meta.Name, p.lvRef(meta.LV))
 	}
-	// The target below is backingBytes(newSize) rounded up to a whole extent, and
+	// The target below is backingBytes(newSize, encrypted) rounded up to a whole extent, and
 	// that has to be representable BEFORE it is computed. Past the bound it wraps
 	// NEGATIVE: entry.sizeBytes() < target is then false, so lvextend and the
 	// drbdadm resize after it are SKIPPED, the filesystem is never grown, and yet
@@ -1572,12 +1661,12 @@ func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newS
 	// success over a device that never moved, after which every legitimate Resize
 	// is refused as a shrink against the recorded size. A size with no
 	// representable backing is malformed input, not a supported grow.
-	if limit := maxDataBytes(entry.extentSizeBytes()); newSize > limit {
-		return fmt.Errorf("%w: newSize %d exceeds the largest usable capacity representable on this volume, %d (this volume group's extents are %d bytes and DRBD's internal metadata is added on top)",
+	if limit := maxDataBytes(entry.extentSizeBytes(), p.cfg.Encrypted); newSize > limit {
+		return fmt.Errorf("%w: newSize %d exceeds the largest usable capacity representable on this volume, %d (this volume group's extents are %d bytes and DRBD's internal metadata, and the LUKS2 header on an encrypted provider, is added on top)",
 			common.ErrInvalidArgument, newSize, limit, entry.extentSizeBytes())
 	}
-	if target := roundUpTo(backingBytes(newSize), entry.extentSizeBytes()); entry.sizeBytes() < target {
-		if err := p.lvExtend(ctx, meta.LV, backingBytes(newSize)); err != nil {
+	if target := roundUpTo(backingBytes(newSize, p.cfg.Encrypted), entry.extentSizeBytes()); entry.sizeBytes() < target {
+		if err := p.lvExtend(ctx, meta.LV, backingBytes(newSize, p.cfg.Encrypted)); err != nil {
 			return err
 		}
 	}
@@ -1626,7 +1715,25 @@ func (p *Provider) growFilesystem(ctx context.Context, meta *resourceMeta) error
 		return nil
 	}
 
-	dev := devicePath(meta.Minor)
+	// An encrypted volume's filesystem CANNOT be grown here, and this is not
+	// the place that decides what to do about it. The dm-crypt mapping is sized
+	// from the replicated device at the moment Promote opens it and go-luks2
+	// exposes no table reload, so after a drbdadm resize the plaintext device
+	// is still its old size; a resize2fs against it would grow the filesystem
+	// to the OLD size and the caller would then record the new one. The only
+	// answer that does not misreport is to refuse the whole resize before the
+	// device is touched, which resizeLocked and restoreSource do with
+	// ErrResizeEncrypted. So this method is never reached for an encrypted
+	// volume, and if it ever is, the device above has already grown under a
+	// stale mapping and quietly returning nil would be exactly the silent
+	// wrong answer the refusal exists to prevent. Fail loudly instead; the
+	// caller's record is not advanced on an error.
+	if p.cfg.Encrypted {
+		return fmt.Errorf("volume %q: growFilesystem reached over an encrypted volume, whose plaintext device is still the size it was opened at: %w",
+			meta.Name, ErrResizeEncrypted)
+	}
+
+	dev := p.fsDevice(meta)
 	target, mounted, err := p.mountTarget(ctx, dev)
 	if err != nil {
 		return err
@@ -1898,6 +2005,13 @@ func (p *Provider) Delete(ctx context.Context, volID string) error {
 	}
 
 	if up {
+		// Before the teardown, for the reason it is before Demote's role
+		// change: an open mapping holds the device open and drbdadm down fails
+		// on it. Only while the resource is UP, because that is when the device
+		// a mapping could be over exists at all.
+		if err := p.closeContainer(ctx, &meta); err != nil {
+			return err
+		}
 		if err := p.resourceDown(ctx, meta.Name); err != nil {
 			return err
 		}
@@ -2009,9 +2123,14 @@ func (p *Provider) wipe(ctx context.Context, lv string, wasActive bool) error {
 // The size is the DRBD device's, as drbdsetup reports it, not the backing
 // volume's: the backing volume also holds DRBD's internal metadata, and LVM
 // rounds its allocation up to the volume group's extent size, so neither number
-// is the capacity a caller can write to. A resource that is not up has no
-// device to measure and falls back to the size the volume was provisioned or
-// resized to.
+// is the capacity a caller can write to. On an encrypted provider the device
+// is not that capacity either — it holds the LUKS2 container, header included
+// — so the header is taken back off through usableBytes, in every state the
+// device can be measured in; the container need not be open for the figure to
+// be right, because the header's size is a constant of this package and not
+// something read from the mapping. A resource that is not up has no device to
+// measure and falls back to the size the volume was provisioned or resized to,
+// which the record keeps in usable bytes already.
 //
 // AttachedNodes lists the local node when the resource is up, and the peer when
 // the connection to it is established — a connected peer necessarily has the
@@ -2069,7 +2188,11 @@ func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatu
 
 	if dev, ok := rs.device(); ok {
 		if dev.Size > 0 {
-			status.SizeBytes = dev.Size * statusSizeUnit
+			usable, sizeErr := usableBytes(dev.Size*statusSizeUnit, p.cfg.Encrypted)
+			if sizeErr != nil {
+				return common.VolumeStatus{}, fmt.Errorf("volume %q: %w", meta.Name, sizeErr)
+			}
+			status.SizeBytes = usable
 		}
 		// A device that has failed or gone away outranks anything else the
 		// status might say: the volume exists but cannot serve reads.
@@ -2079,7 +2202,7 @@ func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatu
 		}
 	}
 
-	mounted, err := p.isMounted(ctx, devicePath(meta.Minor))
+	mounted, err := p.isMounted(ctx, p.fsDevice(&meta))
 	if err != nil {
 		return common.VolumeStatus{}, err
 	}
@@ -2126,8 +2249,49 @@ func (p *Provider) Promote(ctx context.Context, volID string) error {
 	if err != nil {
 		return err
 	}
+
+	// Read BEFORE the promotion, because the rollback below turns on it and
+	// afterwards there is no way to tell the two cases apart. It mirrors
+	// pkg/local's Attach, which rolls its activation back only when the volume
+	// was not already active: a promotion this call did not perform is not this
+	// call's to undo, and undoing it would take the volume away from whoever
+	// promoted it first.
+	wasPrimary := false
+	if p.cfg.Encrypted {
+		role, up, roleErr := p.localRole(ctx, meta.Name)
+		if roleErr != nil {
+			return roleErr
+		}
+		wasPrimary = up && role == common.ReplRolePrimary
+	}
+
 	if err := p.drbdadm(ctx, "primary", meta.Name); err != nil {
 		return fmt.Errorf("promoting volume %q: %w", meta.Name, err)
+	}
+
+	// AFTER the role change, because DRBD refuses every open of a Secondary's
+	// device — there is no earlier moment at which the container can be
+	// unlocked. A no-op for an unencrypted volume.
+	if err := p.openContainer(ctx, &meta); err != nil {
+		if wasPrimary {
+			return err
+		}
+		// The promotion was this call's, and it did not achieve what the caller
+		// asked for: a Primary with no plaintext device is a volume nothing can
+		// mount, holding the pair's only writable copy away from the peer. It
+		// goes back.
+		//
+		// On a context of ITS OWN. The most likely reason to be here is that
+		// ctx was canceled or timed out partway through the unlock, and reusing
+		// it makes the demotion fail instantly — the production runner execs
+		// through exec.CommandContext — leaving behind exactly the state this
+		// undoes, while the code reads as though it had been restored.
+		cleanupCtx, cancel := cleanupContext(ctx)
+		defer cancel()
+		if demoteErr := p.drbdadm(cleanupCtx, "secondary", meta.Name); demoteErr != nil {
+			return errors.Join(err, fmt.Errorf("demoting volume %q after a failed unlock: %w", meta.Name, demoteErr))
+		}
+		return err
 	}
 	return nil
 }
@@ -2158,7 +2322,27 @@ func (p *Provider) Demote(ctx context.Context, volID string) error {
 	if err != nil {
 		return err
 	}
+
+	// BEFORE the role change, and the order is the operation. An open dm-crypt
+	// mapping holds /dev/drbdN open, and DRBD refuses to demote a device
+	// somebody has open — so a demotion attempted first fails on a busy device
+	// and reports it as though a workload still held the volume. A no-op for an
+	// unencrypted volume.
+	//
+	// A failure here is the caller's answer: the volume stays Primary and stays
+	// unlocked, which is the state it was in, rather than half of a demotion.
+	if err := p.closeContainer(ctx, &meta); err != nil {
+		return err
+	}
+
 	if err := p.drbdadm(ctx, "secondary", meta.Name); err != nil {
+		// The mapping is NOT re-opened. Demote is reached with the volume
+		// already unmounted — the mapping is what a mount sits on — so what a
+		// failed demotion leaves is a Primary with a closed container and
+		// nothing using it, and the next Promote opens one. Re-opening here
+		// would be a second operation that can fail on its own, in a path that
+		// is already reporting a failure, to restore a plaintext device with no
+		// user.
 		return fmt.Errorf("demoting volume %q: %w", meta.Name, err)
 	}
 	return nil

@@ -28,6 +28,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/jeremyhahn/go-blockstore/internal/luks"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
@@ -234,13 +235,14 @@ type resourceMeta struct {
 	// SizeBytes is the USABLE capacity the volume was provisioned or resized to
 	// — common.VolumeSpec.SizeBytes as the caller gave it, in the units that
 	// field defines. It is NOT the size of the backing logical volume, which is
-	// larger by DRBD's internal metadata (backingBytes) and larger again by
-	// LVM's rounding up to the volume group's extent size.
+	// larger by the LUKS2 header on an encrypted provider (dataBytes), larger
+	// by DRBD's internal metadata (backingBytes) and larger again by LVM's
+	// rounding up to the volume group's extent size.
 	//
 	// Every comparison against this field is therefore in usable bytes and
 	// every comparison against an lv_size is in backing bytes; the two are
 	// converted through backingBytes and never mixed. Status reports the DRBD
-	// device's real size, which is also a usable figure.
+	// device's real size brought back to usable through usableBytes.
 	SizeBytes int64 `json:"size_bytes"`
 
 	// FSType is the filesystem recorded for the volume, or empty for a raw
@@ -549,7 +551,7 @@ const (
 )
 
 // metadataBytes is the space DRBD 9 reserves for internal metadata on a backing
-// device holding dataBytes of usable data.
+// device holding dataBytes of data.
 //
 // It is this backend's half of the contract on common.VolumeSpec.SizeBytes:
 // that field is the capacity the CALLER CAN USE, and a provider with per-volume
@@ -560,8 +562,12 @@ const (
 // therefore adds this on top, and the caller gets the capacity in the spec.
 //
 // pkg/local implements the same contract against a LUKS2 header; see
-// luksHeaderBytes there. The two backends differ in what the overhead IS and
-// agree on which side of the request it falls.
+// luksHeaderBytes there. This package now does too: on an encrypted provider
+// the header is added on top of the request FIRST, giving the data area DRBD
+// exports (dataBytes), and this reservation is computed from that data area —
+// the bitmap covers the header's blocks like any others. The two backends
+// differ in what the overhead IS and agree on which side of the request it
+// falls.
 //
 // The size follows DRBD's own formula, in sectors:
 //
@@ -580,12 +586,52 @@ func metadataBytes(dataBytes int64) int64 {
 	return sectors * sectorBytes
 }
 
-// backingBytes is the backing volume size that yields dataBytes of usable DRBD
-// capacity — the conversion from the units common.VolumeSpec.SizeBytes is in to
-// the units an lv_size is in. Every size comparison in this package goes
+// dataBytes is the DRBD data area — the size of the device DRBD exports — that
+// yields usableBytes of capacity the caller can write to.
+//
+// On a plain provider the two are the same number. On an encrypted one the
+// LUKS2 container sits INSIDE the DRBD device, so the device has to hold the
+// container's header as well as the caller's data, and the header is allocated
+// on top of the request like every other overhead in this package. Status
+// reverses this when it reads the device's size back; see usableBytes.
+//
+// It is unchecked, like backingBytes, for the hot path once a size is known
+// representable; backingBytesChecked guards the addition.
+func dataBytes(usableBytes int64, encrypted bool) int64 {
+	if !encrypted {
+		return usableBytes
+	}
+	return usableBytes + luks.HeaderBytes
+}
+
+// usableBytes is dataBytes inverted: the capacity a caller can write to on a
+// DRBD device of the given size. It is what Status reports for a device it has
+// measured, and what a size read back from DRBD has to go through before it
+// is compared against anything in a VolumeSpec's units.
+//
+// A device on an encrypted provider that is not even a header long cannot be
+// one this provider sized, and the caller sees an error rather than a zero or
+// negative capacity — an invented number is the failure this package refuses
+// to report.
+func usableBytes(deviceBytes int64, encrypted bool) (int64, error) {
+	if !encrypted {
+		return deviceBytes, nil
+	}
+	if deviceBytes <= luks.HeaderBytes {
+		return 0, fmt.Errorf("DRBD device is %d bytes, no larger than the %d-byte LUKS2 header an encrypted volume carries, so it holds no usable capacity", deviceBytes, int64(luks.HeaderBytes))
+	}
+	return deviceBytes - luks.HeaderBytes, nil
+}
+
+// backingBytes is the backing volume size that yields usableBytes of capacity
+// the caller can write to — the conversion from the units
+// common.VolumeSpec.SizeBytes is in to the units an lv_size is in: the data
+// area (usable plus, on an encrypted provider, the LUKS2 header) plus DRBD's
+// metadata for that data area. Every size comparison in this package goes
 // through it rather than mixing the two.
-func backingBytes(dataBytes int64) int64 {
-	return dataBytes + metadataBytes(dataBytes)
+func backingBytes(usableBytes int64, encrypted bool) int64 {
+	data := dataBytes(usableBytes, encrypted)
+	return data + metadataBytes(data)
 }
 
 // backingBytesChecked is backingBytes with its intermediate arithmetic guarded
@@ -597,23 +643,30 @@ func backingBytes(dataBytes int64) int64 {
 // It is the predicate the size bounds below binary-search and the check the
 // validators call before committing to a caller-controlled size. The unchecked
 // backingBytes stays for the hot path, once a size is known representable.
-func backingBytesChecked(dataBytes int64) (int64, bool) {
-	if dataBytes < 0 {
+func backingBytesChecked(usableBytes int64, encrypted bool) (int64, bool) {
+	if usableBytes < 0 {
 		return 0, false
 	}
+	// The header addition is the first step that can wrap on an encrypted
+	// provider, before the metadata step below ever sees the data area; an
+	// unguarded wrap here would hand metadataBytes a NEGATIVE data area.
+	if encrypted && usableBytes > math.MaxInt64-luks.HeaderBytes {
+		return 0, false
+	}
+	data := dataBytes(usableBytes, encrypted)
 	// metadataBytes rounds the data area up to a whole sector first, and that
-	// addition is the earliest step that can wrap. Once it is safe, everything
+	// addition is the next step that can wrap. Once it is safe, everything
 	// downstream of it is: the bitmap math divides down before it multiplies
-	// back up, so metadataBytes itself cannot overflow for any dataBytes this
+	// back up, so metadataBytes itself cannot overflow for any data area this
 	// far below the ceiling.
-	if dataBytes > math.MaxInt64-(sectorBytes-1) {
+	if data > math.MaxInt64-(sectorBytes-1) {
 		return 0, false
 	}
-	meta := metadataBytes(dataBytes)
-	if dataBytes > math.MaxInt64-meta {
+	meta := metadataBytes(data)
+	if data > math.MaxInt64-meta {
 		return 0, false
 	}
-	return dataBytes + meta, true
+	return data + meta, true
 }
 
 // maxRoundableBytes is the largest byte count roundUpTo can take for a given
@@ -640,12 +693,14 @@ func maxRoundableBytes(extent int64) int64 {
 // backend could serve.
 //
 // Pass extent <= 0 where the caller does no rounding of its own — lvcreate
-// rounds internally, so only the metadata addition is bounded there.
+// rounds internally, so only the metadata addition is bounded there. On an
+// encrypted provider the bound is one LUKS2 header lower, since the header is
+// part of the data area the metadata and the rounding are computed over.
 //
 // backingBytes and roundUpTo are both monotonic non-decreasing, so the
 // representable capacities form a prefix [0, max] and a binary search finds its
 // top exactly, without inverting metadataBytes's nested ceilings by hand.
-func maxDataBytes(extent int64) int64 {
+func maxDataBytes(extent int64, encrypted bool) int64 {
 	limit := maxRoundableBytes(extent)
 	lo, hi := int64(0), int64(math.MaxInt64)
 	for lo < hi {
@@ -655,7 +710,7 @@ func maxDataBytes(extent int64) int64 {
 		// whole int64 axis (lo 0, hi math.MaxInt64), which is exactly the extent
 		// <= 0 case.
 		mid := hi - (hi-lo)/2
-		if b, ok := backingBytesChecked(mid); ok && b <= limit {
+		if b, ok := backingBytesChecked(mid, encrypted); ok && b <= limit {
 			lo = mid
 		} else {
 			hi = mid - 1

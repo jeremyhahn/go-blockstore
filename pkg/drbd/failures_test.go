@@ -43,13 +43,13 @@ func TestSystemCommandFailuresSurface(t *testing.T) {
 		r.scriptStatus(primaryStatus(testVolume, 0))
 		r.scriptLVS(lvsJSON(lvEntry{
 			Name: testVolume, VG: testVG,
-			Size: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+			Size: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 		}))
 		r.on(binDRBDAdm, "up", testVolume).returns("")
 		r.on(binDRBDAdm, "down", testVolume).returns("")
 		r.on(binDRBDAdm, "secondary", testVolume).returns("")
 		r.on(binDRBDAdm, "resize", testVolume).returns("")
-		r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(testSize*2), 10)+"b", "vg0/vol1").returns("")
+		r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(testSize*2, false), 10)+"b", "vg0/vol1").returns("")
 		r.on(binLVRemove, "--force", "vg0/vol1").returns("")
 		r.on(binLVRemove, "--force", "vg0/vol1.snap.nightly").returns("")
 		r.on(binLVCreate, "--yes", "--snapshot", "--name", "vol1.snap.nightly",
@@ -140,7 +140,7 @@ func TestSystemCommandFailuresSurface(t *testing.T) {
 		},
 		{
 			"Resize: lvextend", func(r *fakeRunner) {
-				r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(testSize*2), 10)+"b", "vg0/vol1").
+				r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(testSize*2, false), 10)+"b", "vg0/vol1").
 					fails(5, "insufficient free space")
 			},
 			func(p *Provider) error { return p.Resize(context.Background(), testVolume, testSize*2) },
@@ -407,7 +407,7 @@ func TestRestoreCopyFailureRollsBack(t *testing.T) {
 	const snapLV = "vol1.snap.nightly"
 	r.scriptLVS(lvsJSON(lvEntry{
 		Name: snapLV, VG: testVG, Origin: testVolume,
-		OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+		OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 	}))
 	r.scriptProvisionAt("vol2", originBacking())
 	r.failCopy(&blkdev.CopyError{
@@ -449,9 +449,9 @@ func TestFilesystemGrowFailureOnXFS(t *testing.T) {
 	newSize := testSize * 2
 	r.scriptLVS(lvsJSON(lvEntry{
 		Name: testVolume, VG: testVG,
-		Size: strconv.FormatInt(roundUpTo(backingBytes(testSize), testExtentSize), 10),
+		Size: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10),
 	}))
-	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize), 10)+"b", "vg0/vol1").returns("")
+	r.on(binLVExtend, "--size", strconv.FormatInt(backingBytes(newSize, false), 10)+"b", "vg0/vol1").returns("")
 	r.on(binDRBDAdm, "resize", testVolume).returns("")
 	r.scriptMount("/dev/drbd0", testMountPoint)
 	r.on(binXFSGrowfs, testMountPoint).fails(1, "xfs_growfs: XFS_IOC_FSGROWFSDATA failed")

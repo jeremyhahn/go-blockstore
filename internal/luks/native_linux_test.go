@@ -13,7 +13,7 @@
 
 //go:build linux
 
-package local
+package luks
 
 import (
 	"bytes"
@@ -70,7 +70,7 @@ func newContainerFile(t *testing.T, size int64) string {
 		t.Fatalf("closing the backing file: %v", closeErr)
 	}
 
-	if err := (nativeLUKS{}).Format(context.Background(), path, luksTestPassphraseBytes); err != nil {
+	if err := (Native{}).Format(context.Background(), path, luksTestPassphraseBytes); err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	return path
@@ -97,23 +97,23 @@ func TestNativeFormatPinsFIPSParameters(t *testing.T) {
 	if !ok {
 		t.Fatal("the header has no keyslot 0")
 	}
-	if keyslot.KDF.Type != luksPBKDF {
+	if keyslot.KDF.Type != pbkdf {
 		t.Errorf("KDF = %q, want %q; argon2 is not FIPS-approved and is the library default",
-			keyslot.KDF.Type, luksPBKDF)
+			keyslot.KDF.Type, pbkdf)
 	}
-	if keyslot.KDF.Hash != luksHash {
-		t.Errorf("KDF hash = %q, want %q", keyslot.KDF.Hash, luksHash)
+	if keyslot.KDF.Hash != hashAlgo {
+		t.Errorf("KDF hash = %q, want %q", keyslot.KDF.Hash, hashAlgo)
 	}
-	if keyslot.AF.Hash != luksHash {
-		t.Errorf("anti-forensic hash = %q, want %q; one hash across the header", keyslot.AF.Hash, luksHash)
+	if keyslot.AF.Hash != hashAlgo {
+		t.Errorf("anti-forensic hash = %q, want %q; one hash across the header", keyslot.AF.Hash, hashAlgo)
 	}
 	// The header carries the master key size in BYTES; the option is in bits,
 	// and XTS splits it in two — so 64 bytes here is AES-256-XTS.
-	if want := luksKeySizeBits / 8; keyslot.KeySize != want {
+	if want := keySizeBits / 8; keyslot.KeySize != want {
 		t.Errorf("key size = %d bytes, want %d (AES-256-XTS)", keyslot.KeySize, want)
 	}
 
-	wantCipher := luksCipher + "-" + luksCipherMode
+	wantCipher := cipher + "-" + cipherMode
 	if keyslot.Area.Encryption != wantCipher {
 		t.Errorf("keyslot area encryption = %q, want %q", keyslot.Area.Encryption, wantCipher)
 	}
@@ -124,8 +124,8 @@ func TestNativeFormatPinsFIPSParameters(t *testing.T) {
 	if segment.Encryption != wantCipher {
 		t.Errorf("segment encryption = %q, want %q", segment.Encryption, wantCipher)
 	}
-	if segment.SectorSize != luksSectorSize {
-		t.Errorf("sector size = %d, want %d", segment.SectorSize, luksSectorSize)
+	if segment.SectorSize != sectorSize {
+		t.Errorf("sector size = %d, want %d", segment.SectorSize, sectorSize)
 	}
 
 	// argon2 must appear nowhere: it is the library's default and is not
@@ -147,7 +147,7 @@ func TestNativeFormatPinsFIPSParameters(t *testing.T) {
 // whole #11 sizing contract rests on, checked against the formatter that
 // actually writes the header rather than against the one it was measured on.
 //
-// luksHeaderBytes was measured on cryptsetup 2.7.0 in 2026-08-27 and is used to
+// HeaderBytes was measured on cryptsetup 2.7.0 in 2026-08-27 and is used to
 // size every encrypted volume this provider creates: the logical volume is made
 // that much larger than the requested usable capacity. If go-luks2 laid the
 // header out differently, every encrypted volume would come out the wrong size
@@ -168,15 +168,15 @@ func TestNativeFormatProducesTheHeaderTheSizingConstantAssumes(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			device := newContainerFile(t, size)
 
-			offset, err := (nativeLUKS{}).DataOffset(context.Background(), device)
+			offset, err := (Native{}).DataOffset(context.Background(), device)
 			if err != nil {
 				t.Fatalf("DataOffset: %v", err)
 			}
-			if offset != luksHeaderBytes {
-				t.Errorf("this container's header cost %d bytes; luksHeaderBytes says %d. "+
+			if offset != HeaderBytes {
+				t.Errorf("this container's header cost %d bytes; HeaderBytes says %d. "+
 					"The constant sizes every encrypted volume this provider creates — re-measure it "+
 					"against go-luks2's layout rather than adjusting the volumes",
-					offset, luksHeaderBytes)
+					offset, HeaderBytes)
 			}
 		})
 	}
@@ -234,7 +234,7 @@ func TestNativeFormatRefusesAShortPassphrase(t *testing.T) {
 		t.Fatalf("closing the backing file: %v", closeErr)
 	}
 
-	if err := (nativeLUKS{}).Format(context.Background(), path, []byte("short")); err == nil {
+	if err := (Native{}).Format(context.Background(), path, []byte("short")); err == nil {
 		t.Fatal("Format accepted a passphrase below go-luks2's 8-byte floor")
 	}
 }
@@ -244,7 +244,7 @@ func TestNativeFormatRefusesAShortPassphrase(t *testing.T) {
 // anything is created, and checking it exposes no plaintext device.
 func TestNativeTestKeyVerifiesWithoutUnlocking(t *testing.T) {
 	device := newContainerFile(t, 32<<20)
-	backend := nativeLUKS{}
+	backend := Native{}
 
 	if err := backend.TestKey(context.Background(), device, luksTestPassphraseBytes); err != nil {
 		t.Fatalf("TestKey refused the passphrase the container was formatted with: %v", err)
@@ -260,7 +260,7 @@ func TestNativeTestKeyVerifiesWithoutUnlocking(t *testing.T) {
 // every encrypted volume's usable capacity by a whole header.
 func TestNativeDataOffsetRefusesWhatIsNotAContainer(t *testing.T) {
 	dir := t.TempDir()
-	backend := nativeLUKS{}
+	backend := Native{}
 
 	plain := filepath.Join(dir, "plain.img")
 	if err := os.WriteFile(plain, make([]byte, 1<<20), 0o600); err != nil {
@@ -313,7 +313,7 @@ func TestNativeDataOffsetRefusesAnUnusableSegmentTable(t *testing.T) {
 				t.Fatalf("WriteHeader: %v", err)
 			}
 
-			if offset, err := (nativeLUKS{}).DataOffset(context.Background(), device); err == nil {
+			if offset, err := (Native{}).DataOffset(context.Background(), device); err == nil {
 				t.Fatalf("DataOffset = %d, want a refusal", offset)
 			}
 		})
@@ -322,7 +322,7 @@ func TestNativeDataOffsetRefusesAnUnusableSegmentTable(t *testing.T) {
 
 // TestNativeDataOffsetReadsAForeignHeader is the other half of the same read:
 // a container whose data does NOT start where this package would have put it is
-// reported at its own offset, not at luksHeaderBytes. A volume restored from an
+// reported at its own offset, not at HeaderBytes. A volume restored from an
 // outside snapshot carries exactly such a header, and assuming the constant
 // there would misstate its capacity by the difference.
 func TestNativeDataOffsetReadsAForeignHeader(t *testing.T) {
@@ -339,14 +339,14 @@ func TestNativeDataOffsetReadsAForeignHeader(t *testing.T) {
 		t.Fatalf("WriteHeader: %v", writeErr)
 	}
 
-	offset, err := (nativeLUKS{}).DataOffset(context.Background(), device)
+	offset, err := (Native{}).DataOffset(context.Background(), device)
 	if err != nil {
 		t.Fatalf("DataOffset: %v", err)
 	}
 	if offset != foreign {
 		t.Errorf("DataOffset = %d, want the header's own %d", offset, foreign)
 	}
-	if offset == luksHeaderBytes {
+	if offset == HeaderBytes {
 		t.Error("DataOffset returned the constant instead of reading the header")
 	}
 }
@@ -355,7 +355,7 @@ func TestNativeDataOffsetReadsAForeignHeader(t *testing.T) {
 // is allowed to act on, and the only one. A name nothing has ever opened is not
 // an error.
 func TestNativeMappingReportsAnAbsentNameAsAbsent(t *testing.T) {
-	info, exists, err := (nativeLUKS{}).Mapping(context.Background(), "bs-vg0_no-such-volume-"+strconv.Itoa(os.Getpid()))
+	info, exists, err := (Native{}).Mapping(context.Background(), "bs-vg0_no-such-volume-"+strconv.Itoa(os.Getpid()))
 	if err != nil {
 		t.Fatalf("Mapping: %v", err)
 	}
@@ -371,7 +371,7 @@ func TestNativeMappingReportsAnAbsentNameAsAbsent(t *testing.T) {
 // TestIntegrationEncryptedVolumeRoundTrip — but a silent success here would mean
 // Attach reporting a plaintext device that was never created.
 func TestNativeMappingOperationsFailRatherThanSucceedQuietly(t *testing.T) {
-	backend := nativeLUKS{}
+	backend := Native{}
 	ctx := context.Background()
 	absentDevice := filepath.Join(t.TempDir(), "absent.img")
 	absentMapping := "bs-vg0_no-such-volume-" + strconv.Itoa(os.Getpid())
@@ -392,13 +392,13 @@ func TestNativeMappingOperationsFailRatherThanSucceedQuietly(t *testing.T) {
 
 // TestNativeOperationsHonorACancelledContext checks the one thing a context can
 // mean here. go-luks2 takes none, so cancellation is observed at the call
-// boundary: an operation that has not started does not start. See luksBackend
+// boundary: an operation that has not started does not start. See Backend
 // for why an operation that HAS started is run to completion.
 func TestNativeOperationsHonorACancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	backend := nativeLUKS{}
+	backend := Native{}
 	device := filepath.Join(t.TempDir(), "container.img")
 
 	ops := map[string]func() error{
@@ -493,8 +493,8 @@ func TestBackingDeviceRequiresExactlyOneSlave(t *testing.T) {
 			if err == nil {
 				t.Fatalf("backingDevice = %q, want a refusal", backing)
 			}
-			if !errors.Is(err, errNoBackingDevice) {
-				t.Errorf("backingDevice = %v, want errNoBackingDevice", err)
+			if !errors.Is(err, ErrNoBackingDevice) {
+				t.Errorf("backingDevice = %v, want ErrNoBackingDevice", err)
 			}
 		})
 	}
@@ -511,7 +511,7 @@ func TestBackingDeviceRequiresExactlyOneSlave(t *testing.T) {
 // the identity has to survive a symlink; anything that is not a device has no
 // identity to report and must fail rather than answer 0:0.
 func TestIdentityFollowsSymlinksAndRefusesNonDevices(t *testing.T) {
-	backend := nativeLUKS{}
+	backend := Native{}
 	ctx := context.Background()
 
 	direct, err := backend.Identity(ctx, "/dev/null")
@@ -581,7 +581,7 @@ var hashOutputBytes = map[string]int{
 // `DeriveKey(..., 32)`), so it writes a 32-byte digest under a sha512 label and
 // verifies by deriving 32 bytes and comparing.
 //
-// This package pins luksHash = "sha512". The consequence, measured 2026-08-29
+// This package pins hashAlgo = "sha512". The consequence, measured 2026-08-29
 // on this host against cryptsetup 2.7.0 rather than reasoned about:
 //
 //   - A container formatted by cryptsetup with this package's exact parameters
@@ -597,7 +597,7 @@ var hashOutputBytes = map[string]int{
 //     cryptsetup interop — see TestNativeFormatWritesACryptsetupReadableHeader,
 //     which covers the separate defects that do.
 //
-// Upstream: go-luks2 #73. Do not work around it here by moving luksHash to
+// Upstream: go-luks2 #73. Do not work around it here by moving hashAlgo to
 // sha256: that would silently downgrade a deliberate FIPS 180-4 choice and
 // still would not open a single existing sha512 volume.
 func TestNativeFormatWritesASpecLengthDigest(t *testing.T) {
@@ -743,7 +743,7 @@ func TestNativeFormatWritesACryptsetupReadableHeader(t *testing.T) {
 func TestNativeRoundTripIsNotEvidenceOfConformance(t *testing.T) {
 	device := newContainerFile(t, 32<<20)
 
-	if err := (nativeLUKS{}).TestKey(context.Background(), device, luksTestPassphraseBytes); err != nil {
+	if err := (Native{}).TestKey(context.Background(), device, luksTestPassphraseBytes); err != nil {
 		t.Fatalf("go-luks2 cannot open a container go-luks2 formatted: %v", err)
 	}
 

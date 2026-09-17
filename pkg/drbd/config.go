@@ -77,6 +77,28 @@ const (
 	// not reach.
 	SettingWipeOnDelete = "wipe_on_delete"
 
+	// SettingEncrypted ("true"/"false") puts a LUKS2 container over each
+	// replicated device, so what crosses the wire and what rests on both nodes'
+	// backing volumes is ciphertext. It requires SettingLUKSKeyFile or an
+	// injected KeyProvider. It defaults to false.
+	//
+	// It is spelled the same as pkg/local's setting and means the same thing at
+	// the same layer of the API. What differs is where the container lives —
+	// ABOVE the replication here, not over a logical volume — and therefore
+	// when it is opened: see Promote.
+	SettingEncrypted = "encrypted"
+
+	// SettingLUKSKeyFile is the path to a file holding the LUKS passphrase. It
+	// is read on every operation that needs one, so a rotated file takes effect
+	// without restarting the process; the file's bytes are the passphrase,
+	// trailing newline included.
+	//
+	// It must be an absolute path in cleaned form, and it must NOT be the file
+	// named by SettingReplicationSecretFile: that secret authenticates the peer
+	// and is shared with it, and giving it the additional job of protecting the
+	// data is not a configuration this provider will accept.
+	SettingLUKSKeyFile = "luks_key_file"
+
 	// SettingPreflight selects which startup privilege checks New performs:
 	// "configured" (the default), "all", or "off".
 	//
@@ -186,14 +208,14 @@ type Config struct {
 	// what DRBD wrote to the backing device is plain data on both nodes, so the
 	// exposure exists once per copy.
 	//
-	// ENCRYPTION IS THE BETTER MITIGATION, and this provider does not offer it
-	// yet. What survives in a freed extent is then ciphertext whose key went
-	// away with the LUKS header, at none of the cost: a wipe writes the whole
-	// volume, which is minutes per terabyte on rotating disks, while encryption
-	// costs nothing at delete time. pkg/local has it today as Options.Encrypted;
-	// the LUKS-above-DRBD work that brings it here is tracked separately. Until
-	// then this option is the mitigation available on this provider, and the
-	// choice is between paying for it and accepting the remanence.
+	// ENCRYPTION IS THE BETTER MITIGATION, and it is now available here: see
+	// Encrypted below. What survives in a freed extent is then ciphertext whose
+	// key went away with the LUKS header, at none of the cost — a wipe writes
+	// the whole volume, which is minutes per terabyte on rotating disks, while
+	// encryption costs nothing at delete time. This option remains the answer
+	// for a volume that is NOT encrypted, and for one that was provisioned
+	// before encryption was turned on, since the container is only ever
+	// formatted onto a device carrying nothing at all.
 	//
 	// How much the exposure bites depends on the storage. With LVM's
 	// devices/issue_discards set to 1 over a backing device that supports
@@ -215,6 +237,41 @@ type Config struct {
 	// It defaults to false, matching LVM's own behavior rather than imposing a
 	// full-volume zero-fill on every deletion in every deployment.
 	WipeOnDelete bool
+
+	// Encrypted puts a LUKS2 container over each replicated device.
+	//
+	// The container sits ABOVE the replication, which is what makes it transit
+	// confidentiality and not merely encryption at rest: DRBD replicates the
+	// bytes of the device it is given, so the peer receives ciphertext and both
+	// nodes' backing volumes hold ciphertext. Peer AUTHENTICATION — the
+	// cram-hmac shared secret — is a separate control and neither implies the
+	// other; an authenticated peer is not a confidential link.
+	//
+	// The container's header is allocated ON TOP of the request, the way
+	// DRBD's metadata already is: common.VolumeSpec.SizeBytes is usable
+	// capacity, so an encrypted volume's DRBD device is sized at
+	// SizeBytes + internal/luks.HeaderBytes (16 MiB), its backing volume at
+	// that plus DRBD's metadata for it, and Status reports the device less
+	// the header. The filesystem inside the container has the whole of what
+	// the caller asked for, and pkg/local and this package agree on which side
+	// of the request the header falls. See dataBytes and backingBytes.
+	//
+	// AN ENCRYPTED VOLUME CANNOT BE RESIZED IN THIS REVISION. Resize refuses
+	// it with ErrResizeEncrypted before anything is extended, and so does a
+	// restore that would have to grow its destination. The dm-crypt mapping is
+	// sized from the replicated device when Promote opens it and go-luks2
+	// exposes no table reload, so the filesystem inside the container cannot
+	// be grown to a new size while the container is open — and growing the
+	// device while recording a size the filesystem never reached is a wrong
+	// answer this package will not give. Issue #62 — sizing the container from
+	// a header on top, and a grow that knows about the mapping — lifts the
+	// refusal; it builds on this revision rather than being part of it.
+	Encrypted bool
+
+	// LUKSKeyFile is the path to a file holding the LUKS passphrase. Empty
+	// means no file-backed provider; a caller may inject one through
+	// WithKeyProvider instead.
+	LUKSKeyFile string
 
 	// Preflight selects which startup privilege checks New performs. It
 	// defaults to PreflightConfigured, which checks exactly the capabilities
@@ -245,6 +302,7 @@ func ParseConfig(settings map[string]string) (Config, error) {
 		SettingReplicationSecretFile: {}, SettingAllowUnauthenticatedPeers: {},
 		SettingWipeOnDelete: {}, SettingPreflight: {},
 		SettingMountPropagation: {},
+		SettingEncrypted:        {}, SettingLUKSKeyFile: {},
 	}
 	for k := range settings {
 		if _, ok := known[k]; !ok {
@@ -354,6 +412,25 @@ func ParseConfig(settings map[string]string) (Config, error) {
 
 	if cfg.WipeOnDelete, err = optionalBool(settings, SettingWipeOnDelete); err != nil {
 		return Config{}, err
+	}
+	if cfg.Encrypted, err = optionalBool(settings, SettingEncrypted); err != nil {
+		return Config{}, err
+	}
+	if v := settings[SettingLUKSKeyFile]; v != "" {
+		if !filepath.IsAbs(v) || filepath.Clean(v) != v {
+			return Config{}, fmt.Errorf("%w: %s %q must be an absolute path in cleaned form", common.ErrInvalidArgument, SettingLUKSKeyFile, v)
+		}
+		cfg.LUKSKeyFile = v
+	}
+	// One file cannot be both secrets. The replication secret is SHARED WITH
+	// THE PEER so DRBD can authenticate it; the LUKS passphrase decrypts the
+	// volume. Pointing both settings at one path does not configure two
+	// controls, it gives the peer-authentication secret the additional job of
+	// protecting the data — and a rotation of either one then silently changes
+	// the other.
+	if cfg.LUKSKeyFile != "" && cfg.LUKSKeyFile == cfg.ReplicationSecretFile {
+		return Config{}, fmt.Errorf("%w: %s and %s name the same file %q: the peer-authentication secret must not also be the volume passphrase",
+			common.ErrInvalidArgument, SettingLUKSKeyFile, SettingReplicationSecretFile, cfg.LUKSKeyFile)
 	}
 	// Setting both says two contradictory things about the same resource. The
 	// secret would win, since it is what gets written, so the override would be

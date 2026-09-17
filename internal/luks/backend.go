@@ -11,14 +11,14 @@
 // 2. Commercial License
 //    Contact licensing@automatethethings.com for commercial licensing options.
 
-package local
+package luks
 
 import (
 	"context"
 	"errors"
 )
 
-// luksBackend is the seam between this provider and the LUKS2 implementation
+// Backend is the seam between the storage providers and the LUKS2 implementation
 // underneath it.
 //
 // It exists for the same reason CommandRunner does — the unit tests drive the
@@ -32,7 +32,7 @@ import (
 //
 // EVERY key parameter is a []byte borrowed from locked memory for the duration
 // of one call and nothing longer. An implementation must not retain it, copy it
-// or let it outlive the call — see runWithKey, which owns that window, and
+// or let it outlive the call — see Manager.withKey, which owns that window, and
 // KeyProvider, which explains what the borrow is protecting.
 //
 // THERE IS NO RESIZE HERE, and its absence is load-bearing. Growing a dm-crypt
@@ -56,7 +56,7 @@ import (
 // one halfway leaves a container in a state neither the caller nor the next
 // operation can reason about; the operations are also bounded by a key
 // derivation rather than by a network, so there is no unbounded wait to escape.
-type luksBackend interface {
+type Backend interface {
 	// Format writes a LUKS2 header onto device with this package's pinned
 	// parameters. It destroys whatever was there.
 	Format(ctx context.Context, device string, key []byte) error
@@ -78,21 +78,21 @@ type luksBackend interface {
 
 	// Mapping describes an open plaintext mapping, reporting false when there is
 	// no mapping under that name.
-	Mapping(ctx context.Context, name string) (mappingInfo, bool, error)
+	Mapping(ctx context.Context, name string) (MappingInfo, bool, error)
 
 	// Identity returns a device's major:minor, which is the same for every path
 	// that leads to it.
 	//
 	// It rides on this interface rather than standing alone because the one
 	// question it answers is a LUKS one — whether the mapping under this
-	// provider's deterministic name is over this provider's volume — and because
+	// deterministic mapping name is over this volume — and because
 	// it reads the /dev and /sys trees, which a test that owns neither has to be
 	// able to answer for.
 	Identity(ctx context.Context, path string) (string, error)
 }
 
-// mappingInfo describes an open device-mapper mapping.
-type mappingInfo struct {
+// MappingInfo describes an open device-mapper mapping.
+type MappingInfo struct {
 	// Backing is the most legible path to the device the mapping decrypts,
 	// for an error a human has to act on: the dm-canonical
 	// /dev/mapper/<vg>-<lv> where the backing device is itself device-mapper,
@@ -104,7 +104,7 @@ type mappingInfo struct {
 	BackingID string
 }
 
-// errNoBackingDevice reports a mapping whose backing device could not be
+// ErrNoBackingDevice reports a mapping whose backing device could not be
 // established.
 //
 // It fails closed on purpose, and the shape of the failure is the reason: the
@@ -114,4 +114,4 @@ type mappingInfo struct {
 // over one volume. The whole point of looking is to refuse a mapping whose
 // identity cannot be established, so an unreadable answer is a refusal rather
 // than a pass.
-var errNoBackingDevice = errors.New("the mapping reports no single backing device")
+var ErrNoBackingDevice = errors.New("the mapping reports no single backing device")

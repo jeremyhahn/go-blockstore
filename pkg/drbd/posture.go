@@ -39,13 +39,23 @@ type GuardStatus = posture.GuardStatus
 // silence this type exists to remove.
 //
 // The set is this provider's, not pkg/local's — net-admin and drbd-control are
-// required here and have no analog there, and the kernel keyring is required
-// there and never touched here. See requiredCapabilities, which measured it.
+// required here and have no analog there. See requiredCapabilities, which
+// measured it.
+//
+// The kernel keyring is listed CONDITIONALLY, and the condition is the whole
+// reason it is here. It used to be the one capability this package never
+// touched; LUKS-above-DRBD (#13) made it required whenever the provider is
+// configured to encrypt, and not otherwise. Leaving it out of this map would
+// mean New performs a startup check that the report does not mention — the
+// same invisible-guard defect one level up, with the sign flipped: not an off
+// guard nobody can see, but an ON one. Listing it lets an operator tell an
+// encrypting provider from a plain one by reading the posture.
 var guardNames = map[preflight.Capability]string{
-	preflight.CapabilityDeviceMapper: "device-mapper access",
-	preflight.CapabilityMount:        "mount(2) privilege",
-	preflight.CapabilityNetAdmin:     "net-admin privilege",
-	preflight.CapabilityDRBDControl:  "DRBD control interface",
+	preflight.CapabilityDeviceMapper:  "device-mapper access",
+	preflight.CapabilityMount:         "mount(2) privilege",
+	preflight.CapabilityNetAdmin:      "net-admin privilege",
+	preflight.CapabilityDRBDControl:   "DRBD control interface",
+	preflight.CapabilityKernelKeyring: "kernel keyring",
 }
 
 // Posture reports what this provider checks and what it does not.
@@ -66,7 +76,12 @@ func (p *Provider) Posture() Posture {
 	report := Posture{Component: "drbd"}
 
 	checked := make(map[preflight.Capability]struct{})
-	for _, capability := range requiredCapabilities(p.injected, p.cfg.Preflight) {
+	// The SAME arguments New passes to runPreflight, encryption included. That
+	// is what backs this method's promise that the report cannot claim a check
+	// New did not make — and it is a promise that only holds if the argument
+	// lists stay identical, which is why they are spelled out here rather than
+	// defaulted.
+	for _, capability := range requiredCapabilities(p.injected, p.cfg.Encrypted, p.cfg.Preflight) {
 		checked[capability] = struct{}{}
 	}
 

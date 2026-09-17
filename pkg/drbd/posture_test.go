@@ -88,6 +88,7 @@ func TestPostureNamesEveryGuardWhicheverWayItIsSet(t *testing.T) {
 		"mount(2) privilege",
 		"net-admin privilege",
 		"DRBD control interface",
+		"kernel keyring",
 		"mount propagation",
 		"peer authentication",
 		"delete-time wipe",
@@ -195,5 +196,61 @@ func TestPostureReportsThePeerAuthenticationTheProviderActuallyHas(t *testing.T)
 	}
 	if !strings.Contains(guard.Detail, SettingAllowUnauthenticatedPeers) {
 		t.Errorf("detail = %q, want it to name the setting that produced this state", guard.Detail)
+	}
+}
+
+// TestPostureReportsTheKeyringCheckOnlyWhenItIsActuallyDerived is this report's
+// own rule applied to the capability #13 added.
+//
+// The kernel keyring is the one capability whose requirement depends on the
+// CONFIGURATION rather than only on which seams were injected: New checks it
+// when the provider is set to encrypt AND is using the real LUKS backend. Both
+// inputs are asserted here, because the first version of this test asserted
+// neither properly and two separate things were learned from it:
+//
+//   - Asserting that the guard is NAMED proves nothing. The name comes from
+//     guardNames and is printed whether the guard is on or off, so a mutation
+//     hardcoding `false` into Posture's derivation survived it. Measured.
+//   - Preflight is OFF across the unit suite, so with no checks derived at all
+//     every capability guard reads inactive whatever the configuration says.
+//     That is what made the mutation invisible. The mode is therefore set on
+//     the BUILT provider rather than through New, which exercises Posture's
+//     derivation without running the host-dependent startup checks.
+//
+// The injected-backend case is not padding. Every fixture in this suite injects
+// a fake LUKS backend, and a fake derives no key and creates no mapping — so a
+// test that assumed "encrypted implies keyring" would have been asserting
+// something New does not do, and would have failed against correct code. It did.
+func TestPostureReportsTheKeyringCheckOnlyWhenItIsActuallyDerived(t *testing.T) {
+	const guard = "kernel keyring"
+
+	active := func(t *testing.T, p *Provider, encrypted, luksInjected bool) bool {
+		t.Helper()
+		p.cfg.Preflight = PreflightConfigured
+		p.cfg.Encrypted = encrypted
+		p.injected.luks = luksInjected
+		return guardNamed(t, p.Posture(), guard).Active
+	}
+
+	// Encrypting, on the real backend: New derives the check, so the report
+	// must say so. This is the case the `false` mutation breaks.
+	enc, _, _ := newEncryptedProvider(t)
+	if !active(t, enc, true, false) {
+		t.Error("an encrypting provider on the real backend does not report the kernel-keyring check, hiding a check New does make")
+	}
+
+	// Encrypting, but driven by an injected backend: nothing derives a key and
+	// no mapping is created, so New does NOT check the keyring and the report
+	// must not claim it did.
+	enc2, _, _ := newEncryptedProvider(t)
+	if active(t, enc2, true, true) {
+		t.Error("a provider driven by an injected LUKS backend reports the kernel-keyring check, which New never makes")
+	}
+
+	// Not encrypting: the case that must not regress to the unconditional
+	// demand, which would make a correctly configured node refuse to start.
+	plain, _, _ := newTestProviderWith(t, nil)
+	if active(t, plain, false, false) {
+		t.Error("an unencrypted provider reports the kernel-keyring check; New never makes it")
 	}
 }

@@ -13,7 +13,7 @@
 
 //go:build !linux
 
-package local
+package luks
 
 import (
 	"context"
@@ -22,7 +22,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// nativeLUKS is what package local gets for its LUKS operations on a platform
+// Native is what the providers get for their LUKS operations on a platform
 // that has no device-mapper.
 //
 // The package compiles everywhere on purpose — it is the always-built backend,
@@ -37,10 +37,10 @@ import (
 // LVM is Linux-only too, so a provider gets no further than its first lvs; this
 // exists so the package builds, and so that anything which does reach it fails
 // with a sentence rather than a nil dereference.
-type nativeLUKS struct{}
+type Native struct{}
 
 // Ensure the backend satisfies the seam at compile time.
-var _ luksBackend = nativeLUKS{}
+var _ Backend = Native{}
 
 // unsupported is the one answer this backend has.
 func unsupported(op string) error {
@@ -48,24 +48,24 @@ func unsupported(op string) error {
 		common.ErrUnsupported, op)
 }
 
-func (nativeLUKS) Format(context.Context, string, []byte) error { return unsupported("format") }
+func (Native) Format(context.Context, string, []byte) error { return unsupported("format") }
 
-func (nativeLUKS) Open(context.Context, string, string, []byte) error { return unsupported("open") }
+func (Native) Open(context.Context, string, string, []byte) error { return unsupported("open") }
 
-func (nativeLUKS) Close(context.Context, string) error { return unsupported("close") }
+func (Native) Close(context.Context, string) error { return unsupported("close") }
 
-func (nativeLUKS) TestKey(context.Context, string, []byte) error {
+func (Native) TestKey(context.Context, string, []byte) error {
 	return unsupported("passphrase check")
 }
 
-func (nativeLUKS) DataOffset(context.Context, string) (int64, error) {
+func (Native) DataOffset(context.Context, string) (int64, error) {
 	return 0, unsupported("header read")
 }
 
-func (nativeLUKS) Mapping(context.Context, string) (mappingInfo, bool, error) {
-	return mappingInfo{}, false, unsupported("mapping lookup")
+func (Native) Mapping(context.Context, string) (MappingInfo, bool, error) {
+	return MappingInfo{}, false, unsupported("mapping lookup")
 }
 
-func (nativeLUKS) Identity(context.Context, string) (string, error) {
+func (Native) Identity(context.Context, string) (string, error) {
 	return "", unsupported("device identity")
 }

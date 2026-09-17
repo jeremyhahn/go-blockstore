@@ -27,6 +27,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/preflight"
 
 	"github.com/jeremyhahn/go-blockstore/internal/blkdev"
+	"github.com/jeremyhahn/go-blockstore/internal/luks"
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
 	"github.com/jeremyhahn/go-blockstore/internal/mountguard"
 	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
@@ -67,6 +68,10 @@ type Provider struct {
 	preflightChecked []preflight.Capability
 	blockDevices     BlockDevices
 	luks             luksBackend
+
+	// crypt is the shared LUKS machinery bound to this provider's mapping
+	// namespace. See pkg/local/luks.go for what this package keeps of its own.
+	crypt *luks.Manager
 }
 
 // ErrMountedBeneathAnother reports a volume still mounted at a path where
@@ -392,9 +397,9 @@ func New(opts Options) (*Provider, error) {
 		mounter = mount.System()
 	}
 
-	luks := opts.luks
-	if luks == nil {
-		luks = nativeLUKS{}
+	backend := opts.luks
+	if backend == nil {
+		backend = luks.Native{}
 	}
 
 	node := opts.NodeID
@@ -455,7 +460,9 @@ func New(opts Options) (*Provider, error) {
 		bootID:             bootID,
 		liveness:           opts.LivenessOracle,
 		blockDevices:       blockDevices,
-		luks:               luks,
+		luks:               backend,
+		crypt: luks.NewManager(backend, opts.KeyProvider,
+			luks.MappingPrefix+opts.VolumeGroup+"_", errScope),
 	}, nil
 }
 
