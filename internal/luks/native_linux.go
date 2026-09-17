@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -179,14 +180,23 @@ func (Native) DataOffset(ctx context.Context, device string) (int64, error) {
 	return 0, errors.New("the LUKS header reports no data segment")
 }
 
-// Mapping reports whether a plaintext mapping exists under name, and what it is
-// stacked on.
+// Mapping reports whether a plaintext mapping exists under name, what it is
+// stacked on, and how large each of the two is.
 //
 // The backing device comes from sysfs rather than from device-mapper, because
 // the dm ioctls go-luks2 uses expose the table only to whoever loaded it: there
 // is no "what is this mapping over" call to make. The kernel publishes the
 // stack in /sys/dev/block/<major>:<minor>/slaves, one symlink per device
 // underneath, and reading it needs no privilege and no passphrase.
+//
+// The sizes come from the same tree, for the same reason and one more: the
+// BLKGETSIZE64 ioctl needs the device opened, and DRBD refuses every open of a
+// Secondary's device, so a measurement that opened would fail on exactly the
+// node where the question "has this device outgrown its mapping" is asked
+// after a resize. sysfs answers for any block device the kernel has, opened or
+// not, and it answers with the kernel's own current capacity — the number
+// set_capacity() published, which is the number a fresh Unlock would size the
+// mapping from.
 func (n Native) Mapping(ctx context.Context, name string) (MappingInfo, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return MappingInfo{}, false, err
@@ -213,7 +223,21 @@ func (n Native) Mapping(ctx context.Context, name string) (MappingInfo, bool, er
 		return MappingInfo{}, false, err
 	}
 
-	return MappingInfo{Backing: backing, BackingID: formatDeviceID(backingRdev)}, true, nil
+	size, err := deviceSize(sysfsRoot, rdev)
+	if err != nil {
+		return MappingInfo{}, false, fmt.Errorf("measuring the mapping %s: %w", name, err)
+	}
+	backingSize, err := deviceSize(sysfsRoot, backingRdev)
+	if err != nil {
+		return MappingInfo{}, false, fmt.Errorf("measuring %s under the mapping %s: %w", backing, name, err)
+	}
+
+	return MappingInfo{
+		Backing:          backing,
+		BackingID:        formatDeviceID(backingRdev),
+		SizeBytes:        size,
+		BackingSizeBytes: backingSize,
+	}, true, nil
 }
 
 // Identity returns a device's major:minor.
@@ -264,6 +288,39 @@ func formatDeviceID(rdev uint64) string {
 // a real /sys list two slaves for one dm-crypt target on demand, and those are
 // exactly the shapes that must not be read as success.
 const sysfsRoot = "/sys"
+
+// sysfsSectorBytes is the unit of /sys/dev/block/<major>:<minor>/size. It is
+// the block layer's 512-byte sector whatever the device's own logical sector
+// size — a 4Kn disk still reports its capacity in these — so the scaling is a
+// constant and not a second lookup.
+const sysfsSectorBytes = 512
+
+// deviceSize returns a block device's current capacity in bytes, read from
+// sysfs.
+//
+// Every unreadable shape is a refusal rather than a zero. This number decides
+// whether a plaintext mapping still covers the device it decrypts, and the two
+// wrong defaults are both silent: a 0 read as a size makes every mapping look
+// stale, and an error read as "unknown, assume fine" makes none of them. A
+// missing file is a device the kernel does not have — the same fail-closed
+// answer backingDevice gives for a missing slaves directory.
+func deviceSize(root string, rdev uint64) (int64, error) {
+	path := filepath.Join(root, "dev", "block", fmt.Sprintf("%d:%d", unix.Major(rdev), unix.Minor(rdev)), "size")
+	// #nosec G304 -- the path is built from a device number and a sysfs root
+	// this package owns; nothing a caller supplies reaches it.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("reading %s: %w", path, err)
+	}
+	sectors, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s reports %q: not a sector count", path, strings.TrimSpace(string(raw)))
+	}
+	if sectors <= 0 || sectors > math.MaxInt64/sysfsSectorBytes {
+		return 0, fmt.Errorf("%s reports %d sectors, which is not a size this package can act on", path, sectors)
+	}
+	return sectors * sysfsSectorBytes, nil
+}
 
 // backingDevice returns the single device a device-mapper device is stacked on,
 // as the most legible path that leads to it.

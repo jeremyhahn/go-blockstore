@@ -36,26 +36,41 @@ const errScope = "go-blockstore/drbd"
 // fsTypeLUKS is what blkid reports for a LUKS container.
 const fsTypeLUKS = luks.FSType
 
-// ErrResizeEncrypted is returned by Resize, and by a restore that would have to
-// grow its destination, on a provider configured to encrypt.
+// ErrMappingStale is returned by an operation that would have to grow a
+// filesystem into a plaintext mapping that no longer covers the device it
+// decrypts.
 //
 // The dm-crypt mapping over /dev/drbdN is sized from the replicated device AT
-// THE MOMENT Promote opens it, and go-luks2 exposes no table reload. So after a
-// drbdadm resize the plaintext device is still the size it was when it was
-// unlocked, and the filesystem inside it cannot be grown to the new size while
-// the container is open. Growing the device anyway and recording the new size
-// would report a resize as complete over a filesystem that had not moved — the
-// silent wrong answer this package refuses to give — so the whole operation is
-// refused instead, before anything is extended.
+// THE MOMENT Promote opens it — go-luks2 computes a "dynamic" segment's length
+// once, at Unlock, from the device's size then — and nothing reachable through
+// internal/luks.Backend reloads it; that seam has no resize, and the comment
+// on it says why that absence is deliberate. So after a drbdadm resize has
+// grown the device under an open mapping, the plaintext device is still the
+// size it was unlocked at, and a resize2fs "to fit" it grows the filesystem
+// to the OLD size and exits 0. Recording the new size over that is the silent
+// wrong answer this package refuses to give; this error is the loud one.
 //
-// It wraps common.ErrUnsupported, and that is the right portable reading: the
-// request is well-formed, this backend cannot serve it as configured, and no
-// retry or demote/promote cycle changes the answer. pkg/local's counterpart,
-// ErrResizeWhileAttached, deliberately does NOT wrap ErrUnsupported because
-// there one Detach lifts the refusal; here nothing the caller does lifts it.
-// What lifts it is issue #62 — sizing the container from a header on top and a
-// grow that knows about the mapping — which builds on this revision.
-var ErrResizeEncrypted = fmt.Errorf("%w: an encrypted volume cannot be resized by this revision — the dm-crypt mapping is sized when Promote opens it and go-luks2 exposes no reload, so the filesystem cannot be grown to the new size while the container is open (tracked by issue #62)", common.ErrUnsupported)
+// The remedy is the one this provider already owns, and the error names it:
+// Demote closes the mapping and Promote opens one over the device as it is
+// now, sized to it, after which the same Resize grows the filesystem through
+// it. The device half of the refused Resize — lvextend, drbdadm resize — is
+// not undone, because it is idempotent, is not what is wrong, and is what the
+// repeat converges on.
+//
+// It deliberately does NOT wrap common.ErrUnsupported, for the reason
+// pkg/local's ErrResizeWhileAttached does not: ErrUnsupported tells a caller
+// that no retry and no state change will serve the request, and here one role
+// cycle serves it exactly. It is the same shape as common.ErrNotPrimary — the
+// request is fine, the volume is in the wrong state at the moment.
+//
+// This provider does NOT close and re-open the mapping itself, although the
+// two calls exist on the seam. The mapping is Promote's, held for the caller,
+// and tearing it down inside a Resize is the destructive operation wearing a
+// resize's name that internal/luks.Backend declines to offer: the teardown is
+// unconditional, the rebuild can fail, and a Resize that failed halfway would
+// have taken the caller's plaintext device rather than left its filesystem
+// unresized. pkg/local made the same call for the same reason.
+var ErrMappingStale = errors.New("the volume's plaintext mapping is smaller than the device it decrypts")
 
 // KeyProvider supplies the passphrase that unlocks a volume's LUKS container,
 // as a locked enclave rather than as bytes. See internal/luks.KeyProvider for
@@ -184,6 +199,36 @@ func (p *Provider) requireContainerOpen(ctx context.Context, meta *resourceMeta)
 		return fmt.Errorf("volume %q: promote it on this node to unlock it: %w", meta.Name, ErrNotUnlocked)
 	}
 	return nil
+}
+
+// requireFreshMapping refuses to proceed over a plaintext mapping that has
+// fallen behind its device, and refuses just as firmly over one whose size
+// cannot be established.
+//
+// It is called from growFilesystem and nowhere else: every path that grows a
+// filesystem — Resize, the grow a restore finishes with, a Mount paying a
+// deferred grow — funnels through there, which is what makes this the one
+// check that cannot be routed around. A raw volume has no filesystem and is
+// checked all the same, because its consumer uses the plaintext device
+// directly and a stale one is short by exactly the resize.
+//
+// Fail-closed, per the rule pkg/preflight states for the same shape: a mapping
+// whose length, or whose device's length, or whose container's data offset
+// cannot be read is reported as a failure rather than assumed to fit.
+func (p *Provider) requireFreshMapping(ctx context.Context, meta *resourceMeta) error {
+	dev := devicePath(meta.Minor)
+	size, err := p.crypt.MeasureMapping(ctx, meta.Name, dev)
+	if err != nil {
+		return err
+	}
+	if !size.Stale() {
+		return nil
+	}
+	return fmt.Errorf("volume %q: its plaintext mapping %s is %d bytes but the container on %s now holds %d — "+
+		"the mapping was sized when Promote opened it and cannot be grown in place. "+
+		"Unmount it, Demote, and Promote to reopen it over the device as it is now, then repeat the Resize "+
+		"(from a mounted volume it grows online): %w",
+		meta.Name, p.fsDevice(meta), size.MappingBytes, dev, size.DataBytes, ErrMappingStale)
 }
 
 // openContainer unlocks the volume's LUKS container over the replicated device,

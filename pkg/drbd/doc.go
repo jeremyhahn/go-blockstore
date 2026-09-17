@@ -230,7 +230,11 @@
 // metadata is: an encrypted volume's DRBD device is SizeBytes plus the 16 MiB
 // header, the backing volume is that plus the metadata, and Status reports the
 // device less the header — the same side of the request pkg/local puts its
-// header on. An encrypted volume cannot be resized by this revision: Resize
-// refuses it with ErrResizeEncrypted rather than grow the device under a
-// filesystem it cannot reach. See Config.Encrypted.
+// header on. Resizing one is size-at-open: the mapping takes the device's size
+// when Promote opens it and nothing reloads it, so Resize grows the device,
+// grows the filesystem through a mapping that still covers it, defers the
+// filesystem to the next Mount when the container is closed, and refuses with
+// ErrMappingStale — naming the demote/promote cycle that reopens the mapping —
+// rather than grow a filesystem into a mapping the device has outgrown. See
+// Config.Encrypted and Provider.Resize.
 package drbd

@@ -481,7 +481,7 @@ func TestFilesystemGrowRejectsAnUnknownType(t *testing.T) {
 	meta.FSType = "btrfs"
 
 	r.scriptMount("/dev/drbd0", testMountPoint)
-	err = p.growFilesystem(context.Background(), &meta)
+	_, err = p.growFilesystem(context.Background(), &meta)
 	if !errors.Is(err, common.ErrUnsupported) {
 		t.Fatalf("growFilesystem of an unknown type = %v, want ErrUnsupported", err)
 	}

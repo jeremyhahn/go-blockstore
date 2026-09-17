@@ -256,16 +256,18 @@ type Config struct {
 	// the caller asked for, and pkg/local and this package agree on which side
 	// of the request the header falls. See dataBytes and backingBytes.
 	//
-	// AN ENCRYPTED VOLUME CANNOT BE RESIZED IN THIS REVISION. Resize refuses
-	// it with ErrResizeEncrypted before anything is extended, and so does a
-	// restore that would have to grow its destination. The dm-crypt mapping is
-	// sized from the replicated device when Promote opens it and go-luks2
-	// exposes no table reload, so the filesystem inside the container cannot
-	// be grown to a new size while the container is open — and growing the
-	// device while recording a size the filesystem never reached is a wrong
-	// answer this package will not give. Issue #62 — sizing the container from
-	// a header on top, and a grow that knows about the mapping — lifts the
-	// refusal; it builds on this revision rather than being part of it.
+	// RESIZING AN ENCRYPTED VOLUME IS SIZE-AT-OPEN. The dm-crypt mapping is
+	// sized from the replicated device when Promote opens it, and go-luks2
+	// exposes no table reload, so a resize grows the device and the mapping
+	// follows only when it is next opened. Resize therefore completes while
+	// the container is closed (a Secondary), recording the grow the
+	// filesystem is owed for the next Mount to perform online; grows the
+	// filesystem through an open mapping that still covers the device; and
+	// REFUSES, with ErrMappingStale, to grow one into a mapping the device
+	// has outgrown — naming the demote/promote cycle that reopens it — rather
+	// than fit the filesystem to the old size and record the new one. A
+	// restore that has to grow its destination takes the same path. See
+	// Provider.Resize and ErrMappingStale.
 	Encrypted bool
 
 	// LUKSKeyFile is the path to a file holding the LUKS passphrase. Empty

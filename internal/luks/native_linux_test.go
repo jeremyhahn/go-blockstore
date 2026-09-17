@@ -506,6 +506,67 @@ func TestBackingDeviceRequiresExactlyOneSlave(t *testing.T) {
 	})
 }
 
+// TestDeviceSizeReadsSysfsSectorsAndRefusesWhatItCannotParse covers the
+// number a stale-mapping check is decided on. sysfs publishes a block device's
+// size in 512-byte sectors regardless of its logical sector size — that unit
+// is the kernel's, fixed in the block layer, not a property of the device — so
+// the reading is scaled once here and nowhere else. Every unreadable shape is
+// a refusal: the whole point of measuring is to refuse a mapping whose size
+// cannot be established, and a 0 read as "zero bytes" would make every
+// mapping look stale, while one read as "unknown, assume fine" would make none
+// of them.
+func TestDeviceSizeReadsSysfsSectorsAndRefusesWhatItCannotParse(t *testing.T) {
+	const major, minor = 253, 7
+	rdev := uint64(major<<8 | minor)
+
+	withSize := func(t *testing.T, content string) string {
+		t.Helper()
+		root := t.TempDir()
+		dir := filepath.Join(root, "dev", "block", strconv.Itoa(major)+":"+strconv.Itoa(minor))
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "size"), []byte(content), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		return root
+	}
+
+	t.Run("sectors are scaled to bytes", func(t *testing.T) {
+		// 2129920 sectors is what a 1 GiB + 16 MiB device reports, and the
+		// literal on the right is that in bytes: the test fails if the unit
+		// is ever taken as bytes or as 4 KiB blocks.
+		got, err := deviceSize(withSize(t, "2129920\n"), rdev)
+		if err != nil {
+			t.Fatalf("deviceSize: %v", err)
+		}
+		if want := int64(1090519040); got != want {
+			t.Errorf("deviceSize = %d, want %d", got, want)
+		}
+	})
+
+	refusals := map[string]string{
+		"empty":         "",
+		"not a number":  "lots\n",
+		"negative":      "-8\n",
+		"zero sectors":  "0\n",
+		"overflows int": "99999999999999999999\n",
+	}
+	for name, content := range refusals {
+		t.Run(name, func(t *testing.T) {
+			if got, err := deviceSize(withSize(t, content), rdev); err == nil {
+				t.Fatalf("deviceSize = %d for %q, want a refusal", got, content)
+			}
+		})
+	}
+
+	t.Run("no size file at all", func(t *testing.T) {
+		if got, err := deviceSize(t.TempDir(), rdev); err == nil {
+			t.Fatalf("deviceSize = %d for a device sysfs does not describe, want a refusal", got)
+		}
+	})
+}
+
 // TestIdentityFollowsSymlinksAndRefusesNonDevices covers the comparison
 // luksIsOpen decides ownership on. The same device answers to several paths, so
 // the identity has to survive a symlink; anything that is not a device has no

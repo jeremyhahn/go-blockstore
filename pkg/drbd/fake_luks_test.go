@@ -52,10 +52,33 @@ type fakeLUKS struct {
 	// fail is keyed by operation — "format", "open", "close", "mapping",
 	// "identity" — so a test can script exactly one of them into failing.
 	fail map[string]error
+
+	// deviceSize is the CURRENT size of each device path, as sysfs would
+	// report it; a test grows a device by rescripting it. mappingSize is the
+	// length each open mapping was given, captured from deviceSize at the
+	// moment Open ran and never updated afterwards — which is precisely the
+	// kernel's behavior go-luks2 inherits, and the thing the stale-mapping
+	// tests are about: the device moves, the mapping does not.
+	deviceSize  map[string]int64
+	mappingSize map[string]int64
 }
 
 func newFakeLUKS(r *fakeRunner) *fakeLUKS {
-	return &fakeLUKS{r: r, open: map[string]string{}, fail: map[string]error{}}
+	return &fakeLUKS{
+		r:           r,
+		open:        map[string]string{},
+		fail:        map[string]error{},
+		deviceSize:  map[string]int64{},
+		mappingSize: map[string]int64{},
+	}
+}
+
+// sized scripts the current size of a device. Rescripting it after a mapping
+// was opened over it is how a test grows the replicated device under a live
+// mapping.
+func (f *fakeLUKS) sized(device string, bytes int64) *fakeLUKS {
+	f.deviceSize[device] = bytes
+	return f
 }
 
 // fails scripts an operation to return err.
@@ -65,9 +88,11 @@ func (f *fakeLUKS) fails(op string, err error) *fakeLUKS {
 }
 
 // unlocked pre-opens a mapping over device, for a test that starts from a
-// volume some earlier promotion already unlocked.
+// volume some earlier promotion already unlocked. The mapping is sized the
+// way Open sizes one: from the device as it is scripted NOW.
 func (f *fakeLUKS) unlocked(name, device string) *fakeLUKS {
 	f.open[name] = device
+	f.mappingSize[name] = f.deviceSize[device] - luks.HeaderBytes
 	return f
 }
 
@@ -91,6 +116,9 @@ func (f *fakeLUKS) Open(_ context.Context, device, name string, key []byte) erro
 		return err
 	}
 	f.open[name] = device
+	// Sized ONCE, here, from the device as it is now: go-luks2's Unlock does
+	// the same, and nothing afterwards reloads it.
+	f.mappingSize[name] = f.deviceSize[device] - luks.HeaderBytes
 	return nil
 }
 
@@ -121,7 +149,12 @@ func (f *fakeLUKS) Mapping(_ context.Context, name string) (luks.MappingInfo, bo
 	if !ok {
 		return luks.MappingInfo{}, false, nil
 	}
-	return luks.MappingInfo{Backing: backing, BackingID: fakeIdentity(backing)}, true, nil
+	return luks.MappingInfo{
+		Backing:          backing,
+		BackingID:        fakeIdentity(backing),
+		SizeBytes:        f.mappingSize[name],
+		BackingSizeBytes: f.deviceSize[backing],
+	}, true, nil
 }
 
 func (f *fakeLUKS) Identity(_ context.Context, path string) (string, error) {
@@ -149,6 +182,14 @@ func (f *fakeRunner) record(name string, args ...string) {
 // the scripted runner and a fake LUKS backend.
 func newEncryptedProvider(t *testing.T) (*Provider, *fakeRunner, *fakeLUKS) {
 	t.Helper()
+	p, r, crypt, _ := newEncryptedProviderWithMounter(t)
+	return p, r, crypt
+}
+
+// newEncryptedProviderWithMounter is the same, handing back the mount fake for
+// the tests that assert on what Mount did and undid.
+func newEncryptedProviderWithMounter(t *testing.T) (*Provider, *fakeRunner, *fakeLUKS, *mount.Fake) {
+	t.Helper()
 
 	keyFile := filepath.Join(t.TempDir(), "luks.key")
 	if err := os.WriteFile(keyFile, []byte("a-test-passphrase-long-enough"), 0o600); err != nil {
@@ -157,13 +198,14 @@ func newEncryptedProvider(t *testing.T) (*Provider, *fakeRunner, *fakeLUKS) {
 
 	r := newFakeRunner(t)
 	crypt := newFakeLUKS(r)
+	m := &mount.Fake{}
 	settings := testSettings(t)
 	settings[SettingEncrypted] = "true"
 	settings[SettingLUKSKeyFile] = keyFile
 
 	p, err := New(settings,
 		WithRunner(r),
-		WithMounter(&mount.Fake{}),
+		WithMounter(m),
 		WithMountTable(r),
 		WithBlockDevices(r),
 		WithSecretProvider(testSecretProvider),
@@ -172,7 +214,7 @@ func newEncryptedProvider(t *testing.T) (*Provider, *fakeRunner, *fakeLUKS) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return p, r, crypt
+	return p, r, crypt, m
 }
 
 // cryptName is the device-mapper name the fixture provider gives a volume.

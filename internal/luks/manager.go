@@ -344,24 +344,104 @@ func (m *Manager) DataOffset(ctx context.Context, device string) (int64, error) 
 // open a volume that is already open, or a teardown skip a mapping it should
 // have closed.
 func (m *Manager) IsOpen(ctx context.Context, volID, backing string) (bool, error) {
+	_, open, err := m.ownMapping(ctx, volID, backing)
+	return open, err
+}
+
+// ownMapping is the lookup IsOpen and MeasureMapping share: the mapping under
+// the volume's name, if there is one, refused unless it is over backing.
+//
+// It is one function so the two callers cannot disagree about what "our
+// mapping" means. A measurement taken of a mapping the ownership check would
+// have refused is a measurement of somebody else's device, and a resize that
+// acted on it would grow — or refuse to grow — the wrong volume.
+func (m *Manager) ownMapping(ctx context.Context, volID, backing string) (MappingInfo, bool, error) {
 	name := m.MappingName(volID)
 
 	info, exists, err := m.backend.Mapping(ctx, name)
 	if err != nil {
-		return false, fmt.Errorf("%s: checking %s: %w", m.errScope, name, err)
+		return MappingInfo{}, false, fmt.Errorf("%s: checking %s: %w", m.errScope, name, err)
 	}
 	if !exists {
-		return false, nil
+		return MappingInfo{}, false, nil
 	}
 
 	want, err := m.backend.Identity(ctx, backing)
 	if err != nil {
-		return false, fmt.Errorf("%s: identifying %s: %w", m.errScope, backing, err)
+		return MappingInfo{}, false, fmt.Errorf("%s: identifying %s: %w", m.errScope, backing, err)
 	}
 	if info.BackingID != want {
-		return false, fmt.Errorf("%s: the device-mapper name %q is in use by a mapping over %s, "+
+		return MappingInfo{}, false, fmt.Errorf("%s: the device-mapper name %q is in use by a mapping over %s, "+
 			"not over this volume's %s; close it or rename it before operating on this volume",
 			m.errScope, name, info.Backing, backing)
 	}
-	return true, nil
+	return info, true, nil
+}
+
+// MappingSize is how an open mapping's length relates to the device it
+// decrypts, measured at one instant.
+type MappingSize struct {
+	// MappingBytes is the plaintext device's length: what the kernel presents,
+	// fixed when the mapping was loaded.
+	MappingBytes int64
+
+	// DataBytes is the backing device's current size less the container's
+	// data offset — the length a mapping opened NOW would be given. It is what
+	// MappingBytes was equal to at the moment the mapping was opened, and it
+	// moves when the device does.
+	DataBytes int64
+}
+
+// Stale reports whether the mapping has fallen behind its device: the device
+// grew after the mapping was opened, and the plaintext capacity did not follow.
+// A filesystem grown "to fit" a stale mapping grows to the OLD size.
+func (s MappingSize) Stale() bool { return s.MappingBytes < s.DataBytes }
+
+// MeasureMapping reports how the volume's open mapping relates to the device
+// under it.
+//
+// It exists because this seam has no resize — see Backend — so the one thing a
+// provider CAN do about a device that grew under an open mapping is notice.
+// go-luks2 sizes a "dynamic" segment's mapping from the backing device at the
+// moment it opens it and never again; after the device grows, the plaintext
+// device is still the size it was, and a filesystem grown to fill it fills
+// the old size while every layer above reports the new one. That is the silent
+// wrong answer this measurement exists to turn into a refusal.
+//
+// The mapping must be open and must be this volume's; the same ownership check
+// IsOpen makes is made here, and a name held by a mapping over some other
+// device is an error rather than a measurement. Everything else that cannot
+// be accounted for is an error too, fail-closed: a data offset the header does
+// not state, a backing device no larger than its own header, or a mapping
+// LONGER than the device's data area — which is a device that shrank under a
+// live mapping, a state nothing here can size correctly and one whose writes
+// past the end will fail.
+func (m *Manager) MeasureMapping(ctx context.Context, volID, backing string) (MappingSize, error) {
+	info, open, err := m.ownMapping(ctx, volID, backing)
+	if err != nil {
+		return MappingSize{}, err
+	}
+	if !open {
+		return MappingSize{}, fmt.Errorf("%s: %s has no open mapping to measure", m.errScope, backing)
+	}
+
+	offset, err := m.DataOffset(ctx, backing)
+	if err != nil {
+		return MappingSize{}, err
+	}
+	if info.SizeBytes <= 0 {
+		return MappingSize{}, fmt.Errorf("%s: the mapping over %s reports a length of %d bytes, which cannot be right",
+			m.errScope, backing, info.SizeBytes)
+	}
+	if info.BackingSizeBytes <= offset {
+		return MappingSize{}, fmt.Errorf("%s: %s is %d bytes, which is no larger than its own %d-byte LUKS header",
+			m.errScope, backing, info.BackingSizeBytes, offset)
+	}
+	size := MappingSize{MappingBytes: info.SizeBytes, DataBytes: info.BackingSizeBytes - offset}
+	if size.MappingBytes > size.DataBytes {
+		return MappingSize{}, fmt.Errorf("%s: the mapping over %s is %d bytes but the device now holds only %d past its header; "+
+			"the device shrank under a live mapping and no size can be established for it",
+			m.errScope, backing, size.MappingBytes, size.DataBytes)
+	}
+	return size, nil
 }

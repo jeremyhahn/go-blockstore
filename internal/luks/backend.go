@@ -38,16 +38,26 @@ import (
 // THERE IS NO RESIZE HERE, and its absence is load-bearing. Growing a dm-crypt
 // mapping in place means reloading the device-mapper table underneath the live
 // device, which needs the container's master key; go-luks2 exposes neither that
-// nor a resize of its own. The only mechanism reachable through it is to remove
-// the mapping and unlock again, which is a destructive operation wearing a
-// resize's name — the teardown is unconditional and the rebuild can fail, and
-// what the caller is left with is not an unresized volume but no plaintext
-// device. Rather than offer that behind a reassuring method name, the seam does
-// not offer it at all: Resize refuses an attached encrypted volume with
-// ErrResizeWhileAttached, and no implementation of this interface has an
-// operation capable of tearing down a mapping the caller is using. See
-// growDetachedEncryptedFilesystem for the path that does grow one, safely,
-// because it opens the mapping itself and owns it for the whole operation.
+// nor a resize of its own — re-measured against v0.2.0-alpha on 2026-09-17: its
+// device-mapper layer has createAndLoad, infoByName and remove, no reload, no
+// suspend/resume, and Unlock computes a "dynamic" segment's length once, from
+// the backing device's size at that moment. The only mechanism reachable
+// through it is to remove the mapping and unlock again, which is a destructive
+// operation wearing a resize's name — the teardown is unconditional and the
+// rebuild can fail, and what the caller is left with is not an unresized volume
+// but no plaintext device. Rather than offer that behind a reassuring method
+// name, the seam does not offer it at all: pkg/local's Resize refuses an
+// attached encrypted volume with ErrResizeWhileAttached, pkg/drbd's refuses a
+// mapping that has fallen behind its device with ErrMappingStale, and no
+// implementation of this interface has an operation capable of tearing down a
+// mapping the caller is using. What the seam offers instead is the MEASUREMENT
+// — MappingInfo carries the mapping's length and its backing device's current
+// size — so a provider can tell a mapping that still covers its device from one
+// that no longer does, and refuse to grow a filesystem into the latter. See
+// growDetachedEncryptedFilesystem (pkg/local) for the path that grows one
+// safely, because it opens the mapping itself and owns it for the whole
+// operation, and pkg/drbd's Promote for the open that sizes a replicated
+// volume's mapping.
 //
 // ctx is honored at call boundaries rather than throughout: go-luks2's API takes
 // no context, so an implementation checks for cancellation before it starts and
@@ -102,6 +112,22 @@ type MappingInfo struct {
 	// BackingID is that device's major:minor, and it — not Backing — is what
 	// ownership is decided on. The same device answers to several paths.
 	BackingID string
+
+	// SizeBytes is the mapping's length: the plaintext capacity the kernel
+	// presents. It was FIXED when the mapping was loaded — go-luks2 computes
+	// it at Unlock from the backing device's size less the data offset — and
+	// nothing reachable through this seam changes it afterwards, which is
+	// exactly why it has to be reported: it is the one number that stops
+	// tracking the device.
+	SizeBytes int64
+
+	// BackingSizeBytes is the backing device's size NOW. It is reported next
+	// to SizeBytes, from the same walk of sysfs, so that a caller comparing
+	// the two compares one instant: a mapping whose SizeBytes plus the
+	// container's data offset is less than this has fallen behind the device
+	// it decrypts, and a filesystem grown "to fit" it would grow to the old
+	// size and report success.
+	BackingSizeBytes int64
 }
 
 // ErrNoBackingDevice reports a mapping whose backing device could not be

@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	enclave "github.com/jeremyhahn/go-enclave"
@@ -52,6 +53,13 @@ type fakeRunner struct {
 	deviceAliases map[string]string
 	overMounted   map[string]string
 	mountTableErr error
+	// absentDevices are paths with no device node behind them. Production
+	// resolves a device to its major:minor by stat(2) BEFORE reading the
+	// table, so a path that is not there is a *mountinfo.DeviceError wrapping
+	// ENOENT, not an empty answer — and a plaintext mapping that is closed is
+	// exactly such a path. A fake that answered "not mounted" for any string
+	// masked that (#69 review).
+	absentDevices map[string]bool
 	tableLookups  int
 	tableHook     func()
 
@@ -227,11 +235,38 @@ func (f *fakeRunner) onMountTable(hook func()) *fakeRunner {
 	return f
 }
 
+// deviceAbsent scripts a device path as having no node behind it, so that any
+// mount lookup of it fails the way mountinfo.System's stat(2) does.
+func (f *fakeRunner) deviceAbsent(device string) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.absentDevices == nil {
+		f.absentDevices = make(map[string]bool)
+	}
+	f.absentDevices[device] = true
+	return f
+}
+
+// devicePresent is the reverse: the node exists again — a mapping was opened.
+func (f *fakeRunner) devicePresent(device string) *fakeRunner {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.absentDevices, device)
+	return f
+}
+
 // MountPointsFor returns where the device is mounted.
 func (f *fakeRunner) MountPointsFor(_ context.Context, device string) ([]string, error) {
 	f.mu.Lock()
 	f.tableLookups++
 	hook, tableErr := f.tableHook, f.mountTableErr
+	if f.absentDevices[device] {
+		// The exact shape internal/mountinfo.DeviceNumber produces for a
+		// path unix.Stat cannot find, which is what MountPointsFor resolves
+		// first: a typed DeviceError whose Unwrap is the errno, so that
+		// errors.Is(err, os.ErrNotExist) holds through it.
+		tableErr = &mountinfo.DeviceError{Path: device, Err: syscall.ENOENT}
+	}
 	targets := append([]string(nil), f.mounted[device]...)
 	// A device is one device however it is spelled, which is what matching by
 	// major:minor gives the real implementation and what this reproduces: a

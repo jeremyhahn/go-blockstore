@@ -249,6 +249,30 @@ type resourceMeta struct {
 	// device. Mount uses it when MountOptions.FSType does not override it.
 	FSType string `json:"fs_type,omitempty"`
 
+	// FSGrowPending records that the device reached SizeBytes while the
+	// filesystem on it could not be reached from this node's state — a
+	// Resize, or a restore that grew, run while the volume was Secondary,
+	// where DRBD will not open the device and an encrypted volume's container
+	// is closed. The device half of a resize is done and recorded; this says
+	// the filesystem half is owed, and Mount pays it: once the volume is
+	// mounted both filesystems this package manages grow online, resize2fs
+	// without a check and xfs_growfs by its only route.
+	//
+	// IT IS THIS NODE'S BOOKKEEPING, NOT THE PAIR'S. The filesystem is
+	// replicated and the record is not, so the peer may have grown the
+	// filesystem online after this node's Resize deferred it — the ordinary
+	// order, Secondary first and then the mounted Primary. That is why the
+	// debt is paid with an ONLINE grow that is idempotent and cheap when there
+	// is nothing to do, and never with the offline route, which begins with a
+	// forced e2fsck of the whole filesystem: a flag that can over-report must
+	// not cost a full check each time it does.
+	//
+	// It is absent from a record that owes nothing, so a record written before
+	// this field existed reads as owing nothing — which is what such a record
+	// was promised: its filesystem is grown by the next Resize from the
+	// Primary, as before.
+	FSGrowPending bool `json:"fs_grow_pending,omitempty"`
+
 	// Minor is the DRBD device minor, which fixes the device path.
 	Minor int `json:"minor"`
 

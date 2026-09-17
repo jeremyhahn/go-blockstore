@@ -515,12 +515,11 @@ func (p *Provider) resourceDown(ctx context.Context, res string) error {
 // is then grown to the requested size through the same sequence Resize runs,
 // which relocates the metadata properly. The filesystem inside it is grown only
 // where it can be, which on a freshly provisioned Secondary is nowhere: the
-// device is the requested size and the filesystem is the source's until the
-// volume is promoted and resized. That is the Resize contract, reached by the
-// same route. The copy is a full one, so the restored volume has no continuing
-// dependency on the snapshot and the snapshot can be deleted afterwards.
-// spec.SizeBytes must match the size the snapshot was taken at; growing the
-// restored volume is Resize's job, for the reason given in restoreSource.
+// device is the requested size and the filesystem is the source's, and the
+// record says so (FSGrowPending) so that the first Mount after a promotion
+// grows it online. That is the Resize contract, reached by the same route. The
+// copy is a full one, so the restored volume has no continuing dependency on
+// the snapshot and the snapshot can be deleted afterwards.
 //
 // The VolumeSpec is taken by value because common.VolumeProvider says so; a
 // provider that took a pointer would not implement the interface. The linter's
@@ -1012,19 +1011,12 @@ func (p *Provider) restoreSource(ctx context.Context, spec *common.VolumeSpec) (
 			common.ErrUnsupported, spec.SourceSnapshotID, src, spec.SizeBytes, dst)
 	}
 
-	// A restore that would have to GROW is refused on an encrypted provider,
-	// here, before a logical volume exists. The grow it would run is
-	// resizeLocked's, which refuses for the same reason — the copied container
-	// carries the source's filesystem, and recording the larger size over it
-	// is the same wrong answer a Resize would give — and letting Provision
-	// reach that refusal would mean creating, copying into and bringing up a
-	// volume only to roll all of it back. A restore at the source's own size
-	// involves no grow and is not affected. See ErrResizeEncrypted.
-	if dst > src && p.cfg.Encrypted {
-		return nil, fmt.Errorf("restoring snapshot %q into %d usable bytes would have to grow it from the source's %d-byte backing volume: %w",
-			spec.SourceSnapshotID, spec.SizeBytes, src, ErrResizeEncrypted)
-	}
-
+	// A restore that would have to GROW runs resizeLocked once the resource is
+	// up, on an encrypted provider like any other. The restored resource comes
+	// up Secondary, its container closed, so the grow it runs is the deferring
+	// one: the device grows, the record follows, and the filesystem — the
+	// source's, copied byte for byte — is owed a grow that the first Promote
+	// sizes the mapping for and the first Mount pays. See FSGrowPending.
 	return &restorePlan{
 		device:      p.lvPath(entry.Name),
 		fsType:      owner.FSType,
@@ -1280,7 +1272,58 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 	if id, finding := p.verifyMountPropagation(ctx, dev, target); finding != nil {
 		return p.unwindUnverifiedMount(ctx, dev, target, id, finding)
 	}
+
+	// A grow the record owes is paid HERE, after the mount, because this is
+	// the first point at which both filesystems this package manages can be
+	// grown online: resize2fs against a mounted ext4 needs no check, and
+	// xfs_growfs has no other form. It is not paid at Promote, where the only
+	// ext4 route is a forced e2fsck of the whole filesystem in the failover
+	// path and XFS cannot be grown at all, and the record cannot even be sure
+	// the debt is real — see FSGrowPending. A mount that returns an error has
+	// mounted nothing, the same promise the propagation check keeps.
+	if meta.FSGrowPending {
+		if err := p.payDeferredGrow(ctx, &meta, target); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// payDeferredGrow grows the filesystem Mount just mounted, because a Resize
+// left it behind its device, and clears the record's debt.
+//
+// An error unwinds the mount. The two silent alternatives are both wrong
+// answers: mounted behind an error reports a mount that did not happen, and
+// success with the grow undone reports a size the filesystem never reached.
+// The debt is left standing either way, so the next Mount tries again — and
+// for a stale mapping the error names what has to happen first.
+//
+// The unwind runs on a context of its own, like Promote's rollback: the
+// likeliest reason to be unwinding is that ctx died partway through the grow,
+// and an unmount on that context fails before it starts, leaving exactly the
+// mount this reports as undone.
+func (p *Provider) payDeferredGrow(ctx context.Context, meta *resourceMeta, target string) error {
+	grown, err := p.growFilesystem(ctx, meta)
+	if err == nil && grown {
+		meta.FSGrowPending = false
+		err = p.writeMeta(meta)
+	}
+	if err == nil && !grown {
+		// Unreachable by construction — mounted ext4 and xfs both grow — and
+		// a filesystem left short behind a successful mount is precisely the
+		// silent answer this refuses to give, so it is an error rather than a
+		// pass if the construction ever changes.
+		err = fmt.Errorf("volume %q: the grow it owes could not be performed even mounted at %q", meta.Name, target)
+	}
+	if err == nil {
+		return nil
+	}
+	cleanupCtx, cancel := cleanupContext(ctx)
+	defer cancel()
+	if unmountErr := p.mounter.Unmount(cleanupCtx, target); unmountErr != nil {
+		return errors.Join(err, fmt.Errorf("unmounting %q after the grow it owed failed: %w", target, unmountErr))
+	}
+	return err
 }
 
 // probeDevice reports what blkid recognizes on the device: the filesystem type
@@ -1542,16 +1585,33 @@ func (p *Provider) isMounted(ctx context.Context, dev string) (bool, error) {
 // checked first, which is what resize2fs demands — and XFS only while mounted,
 // having no offline form. Where the filesystem cannot be grown as things stand
 // (an unmounted XFS volume, or any filesystem on a Secondary, whose device DRBD
-// will not open) the device still grows and the call still succeeds; repeating
-// the same request once the volume is mounted, or promoted, finishes the job.
-// See growFilesystem.
+// will not open) the device still grows and the call still succeeds, the record
+// notes the grow it owes (FSGrowPending), and the next Mount from a Primary
+// pays it online; repeating the same request from the Primary finishes the job
+// as well. See growFilesystem.
 //
-// AN ENCRYPTED VOLUME IS REFUSED OUTRIGHT, with ErrResizeEncrypted, before
-// anything is extended. The converge-on-retry above depends on the filesystem
-// half being finishable by a later call, and over an open LUKS container it is
-// not: the plaintext device keeps the size it was opened at, so no repeat can
-// grow the filesystem and a device grown anyway would be reported at a size
-// its filesystem never reached. Issue #62 lifts this.
+// AN ENCRYPTED VOLUME follows the same rule with one more state in it. Its
+// filesystem lives on a dm-crypt mapping that Promote sized when it opened the
+// container, and nothing reloads that mapping (see ErrMappingStale). So:
+//
+//   - Container closed — a Secondary, or a Primary nothing has unlocked: the
+//     device grows, the record follows and owes the grow, and the next Promote
+//     opens the mapping over the device as it is by then, sized to it, for the
+//     next Mount to grow into.
+//   - Container open and the mapping still covering the device — the peer
+//     was grown first, or this is the repeat after the remedy: the filesystem
+//     is grown through the mapping, online if mounted.
+//   - Container open and the mapping STALE — the device grew under it, here or
+//     by the peer's resize landing: refused with ErrMappingStale after the
+//     device half, which stands, and before any grow tool runs. The record is
+//     not advanced. The error names the remedy — unmount, Demote, Promote,
+//     repeat — and the repeat converges.
+//
+// Grow the Secondary first, then the Primary. DRBD holds the device at the
+// smaller of the pair's two backing sizes, so a Primary grown first sees no
+// device change, grows nothing, and is left with a mapping that goes stale
+// the moment the peer catches up; the repeat from that Primary is then the
+// refused-and-cycled path above rather than the online one.
 //
 // newSize is USABLE capacity, in the same units Provision and Status use, so
 // the backing logical volume grows to backingBytes(newSize, encrypted) — by more than the
@@ -1592,18 +1652,6 @@ func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newS
 	}
 	if newSize < meta.SizeBytes {
 		return fmt.Errorf("%w: volume %q is %d bytes and this provider does not shrink", common.ErrUnsupported, meta.Name, meta.SizeBytes)
-	}
-	// An encrypted volume is refused HERE, before the role query that is the
-	// first command below, so that a refused resize leaves nothing behind:
-	// not an extended backing volume, not a resized resource, and above all
-	// not a record claiming a size the filesystem never reached. The three
-	// steps below are idempotent precisely so that a partial run can be
-	// finished by a repeat; on an encrypted volume the filesystem step cannot
-	// be finished by any repeat, so a partial run here would never converge
-	// and the up-front refusal is the only shape that fails closed. Why the
-	// filesystem cannot be grown, and what lifts this, is on ErrResizeEncrypted.
-	if p.cfg.Encrypted {
-		return fmt.Errorf("volume %q: %w", meta.Name, ErrResizeEncrypted)
 	}
 	// A request equal to the recorded size is NOT a no-op. Growing the device
 	// and growing the filesystem on it are two halves of one operation, and the
@@ -1676,11 +1724,21 @@ func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newS
 		return fmt.Errorf("resizing drbd resource %q: %w", meta.Name, err)
 	}
 
-	if err := p.growFilesystem(ctx, &meta); err != nil {
-		return err
+	grown, growErr := p.growFilesystem(ctx, &meta)
+	if growErr != nil {
+		// Nothing is recorded. The device half stands — it is idempotent and
+		// the repeat converges on it — but the record must never say a size
+		// the filesystem did not reach, and must not owe a grow a repeat
+		// would not perform (a stale mapping is refused again until the
+		// remedy is applied).
+		return growErr
 	}
 
 	meta.SizeBytes = newSize
+	// The record follows the device, and says whether the filesystem did. A
+	// grow that could not be performed from here is owed to the next Mount;
+	// one that was performed clears any debt an earlier call left.
+	meta.FSGrowPending = !grown
 	if err := p.writeMeta(&meta); err != nil {
 		return err
 	}
@@ -1688,7 +1746,8 @@ func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newS
 	return nil
 }
 
-// growFilesystem extends the filesystem on a volume whose device has just grown.
+// growFilesystem extends the filesystem on a volume whose device has just grown,
+// and reports whether it did.
 //
 // ext4 grows either way, but not by the same route. Mounted, resize2fs grows it
 // online. Unmounted, resize2fs refuses until the filesystem has been checked —
@@ -1709,34 +1768,47 @@ func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newS
 // offline form, so an unmounted XFS volume is left for the caller to grow after
 // mounting. A raw volume has nothing to grow but itself.
 //
-// A grow that is attempted and fails is a real failure and is returned.
-func (p *Provider) growFilesystem(ctx context.Context, meta *resourceMeta) error {
-	if meta.FSType == "" {
-		return nil
+// AN ENCRYPTED VOLUME'S FILESYSTEM LIVES ON THE MAPPING, and the mapping is
+// checked before anything else is decided. No mapping — the container is
+// closed, which a Secondary's always is — means no plaintext device to grow
+// into, so the grow is deferred exactly as a Secondary's is; the next Promote
+// opens a mapping sized to the device as it is then. A mapping that no longer
+// covers the device is refused with ErrMappingStale rather than grown into: a
+// resize2fs against it would fit the filesystem to the OLD size and exit 0,
+// and the caller would record the new one. This is the one place every grow
+// passes through, which is what makes the check unavoidable; see
+// requireFreshMapping. A raw encrypted volume is checked too, since its
+// consumer uses the plaintext device directly.
+//
+// The bool is the caller's bookkeeping: true when the filesystem now fills the
+// device (or there is none to fill it), false with a nil error when the grow
+// was DEFERRED — nothing could be done from this node's state, and nothing is
+// wrong. A grow that is attempted and fails is a real failure and is returned.
+func (p *Provider) growFilesystem(ctx context.Context, meta *resourceMeta) (bool, error) {
+	if p.cfg.Encrypted {
+		open, err := p.containerIsOpen(ctx, meta)
+		if err != nil {
+			return false, err
+		}
+		if !open {
+			// Deferred, unless there is nothing to defer: a raw volume's
+			// plaintext device is sized afresh by whichever Promote next
+			// opens it, and owes nothing.
+			return meta.FSType == "", nil
+		}
+		if err := p.requireFreshMapping(ctx, meta); err != nil {
+			return false, err
+		}
 	}
 
-	// An encrypted volume's filesystem CANNOT be grown here, and this is not
-	// the place that decides what to do about it. The dm-crypt mapping is sized
-	// from the replicated device at the moment Promote opens it and go-luks2
-	// exposes no table reload, so after a drbdadm resize the plaintext device
-	// is still its old size; a resize2fs against it would grow the filesystem
-	// to the OLD size and the caller would then record the new one. The only
-	// answer that does not misreport is to refuse the whole resize before the
-	// device is touched, which resizeLocked and restoreSource do with
-	// ErrResizeEncrypted. So this method is never reached for an encrypted
-	// volume, and if it ever is, the device above has already grown under a
-	// stale mapping and quietly returning nil would be exactly the silent
-	// wrong answer the refusal exists to prevent. Fail loudly instead; the
-	// caller's record is not advanced on an error.
-	if p.cfg.Encrypted {
-		return fmt.Errorf("volume %q: growFilesystem reached over an encrypted volume, whose plaintext device is still the size it was opened at: %w",
-			meta.Name, ErrResizeEncrypted)
+	if meta.FSType == "" {
+		return true, nil
 	}
 
 	dev := p.fsDevice(meta)
 	target, mounted, err := p.mountTarget(ctx, dev)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	switch meta.FSType {
@@ -1746,34 +1818,34 @@ func (p *Provider) growFilesystem(ctx context.Context, meta *resourceMeta) error
 			// device at all — so the role only has to be established here.
 			role, up, roleErr := p.localRole(ctx, meta.Name)
 			if roleErr != nil {
-				return roleErr
+				return false, roleErr
 			}
 			if !up || role != common.ReplRolePrimary {
-				return nil
+				return false, nil
 			}
 			if err := p.checkExtFilesystem(ctx, dev); err != nil {
-				return err
+				return false, err
 			}
 		}
 		// resize2fs takes the device and finds the mount point itself.
 		if _, err := p.runner.Run(ctx, binResize2fs, dev); err != nil {
-			return fmt.Errorf("growing the ext4 filesystem on %q: %w", dev, err)
+			return false, fmt.Errorf("growing the ext4 filesystem on %q: %w", dev, err)
 		}
 	case "xfs":
 		if !mounted {
-			return nil
+			return false, nil
 		}
 		// xfs_growfs takes the mount point; there is no offline form.
 		if _, err := p.runner.Run(ctx, binXFSGrowfs, target); err != nil {
-			return fmt.Errorf("growing the xfs filesystem at %q: %w", target, err)
+			return false, fmt.Errorf("growing the xfs filesystem at %q: %w", target, err)
 		}
 	default:
 		// Unreachable: FSType passed validateFSType at provision time, and the
 		// allowlist is these two. A third filesystem added there without a
 		// grow here would otherwise silently leave the filesystem short.
-		return fmt.Errorf("%w: no way to grow a %q filesystem", common.ErrUnsupported, meta.FSType)
+		return false, fmt.Errorf("%w: no way to grow a %q filesystem", common.ErrUnsupported, meta.FSType)
 	}
-	return nil
+	return true, nil
 }
 
 // checkExtFilesystem runs the forced check resize2fs demands before an offline
@@ -2202,7 +2274,7 @@ func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatu
 		}
 	}
 
-	mounted, err := p.isMounted(ctx, p.fsDevice(&meta))
+	mounted, err := p.fsDeviceMounted(ctx, &meta)
 	if err != nil {
 		return common.VolumeStatus{}, err
 	}
@@ -2210,6 +2282,39 @@ func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatu
 		status.State = common.VolumeStateMounted
 	}
 	return status, nil
+}
+
+// fsDeviceMounted reports whether the volume's filesystem device is mounted
+// anywhere, on a volume whose plaintext mapping may not exist.
+//
+// The mount table resolves a device by stat(2) BEFORE it reads anything, so
+// asking about a path with no node behind it is an error rather than an empty
+// answer — and on an encrypted provider the filesystem device is the mapping,
+// which exists only while the container is open. Every Secondary after a
+// Demote, and every volume resized Secondary-side with its container closed,
+// has no such node; asking anyway failed Status on exactly the volumes this
+// provider is supposed to be able to describe (#69 review).
+//
+// The container's state is the gate, through the same ownership check every
+// other path uses: a closed container has nothing mounted and is not looked
+// up; an open one is asked about like any device. What is NOT absorbed is an
+// error from that check — a mapping under our name over some other device —
+// because reading that as "closed" would report Attached about a volume whose
+// mapping is a conflict a human has to resolve. Nothing here is read as "not
+// mounted" because a lookup failed; the lookup is skipped because the device
+// provably does not exist. That is the difference from the fail-open the
+// mount-table lookup was moved off findmnt to remove.
+func (p *Provider) fsDeviceMounted(ctx context.Context, meta *resourceMeta) (bool, error) {
+	if p.cfg.Encrypted {
+		open, err := p.containerIsOpen(ctx, meta)
+		if err != nil {
+			return false, err
+		}
+		if !open {
+			return false, nil
+		}
+	}
+	return p.isMounted(ctx, p.fsDevice(meta))
 }
 
 // -----------------------------------------------------------------------------
