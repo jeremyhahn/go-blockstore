@@ -14,45 +14,152 @@ both bump MINOR, and PATCH is reserved for fixes that move no API.
 
 ## [Unreleased]
 
-### BLOCKED — do not release the go-luks2 migration
+## [0.4.0-alpha] - 2026-09-17
 
-The `pkg/local` move to go-luks2 below is **structurally complete and must not
-ship**, because go-luks2 `v0.1.7-alpha` does not write or read a conformant
-LUKS2 container. Four assertions in `pkg/local` fail deliberately and are the
-gate; they go green when upstream is fixed, and they are not to be relaxed.
+### Resolved — the go-luks2 migration ships
 
-- **Existing encrypted volumes would become unopenable.** A LUKS2 pbkdf2 digest
-  is the master key derived to the output length of the hash it declares — 64
-  bytes for the `sha512` this package pins. go-luks2 hardcodes 32
-  (`format.go:243`, `unlock.go:485`). Measured 2026-08-29 against cryptsetup
-  2.7.0: a container formatted with this package's exact parameters stores a
-  64-byte digest, and `luks2.TestKey` on it **with the correct passphrase**
-  returns "incorrect passphrase". Every encrypted volume provisioned before this
-  change is affected. Upstream go-luks2 #73.
-- **Containers written by go-luks2 cannot be read by cryptsetup at all** — not
-  "refuse the passphrase", but `cryptsetup isLuks` exit 1 and luksDump "is not a
-  valid LUKS device", so `luksDump`, `luksHeaderBackup`, `luksChangeKey` and
-  `luksOpen` are all unavailable and an encrypted volume has no recovery path.
-  Three separate defects, each measured and each pinned by a subtest: `tokens`
-  is omitted from the JSON area when empty (`types.go:67` `omitempty`);
-  `keyslots_size` stores offset+area instead of the area, overrunning the data
-  offset by 32768 (`format.go:207`); and the secondary header at `0x4000`
-  carries the primary magic instead of `SKUL\xba\xbe`, so the backup header is
-  unreadable. Patching all three into a go-luks2 container by hand makes
-  cryptsetup accept, dump and open it — so they are the whole gap. Not the
-  digest: cryptsetup derives its comparison to the length stored, and tolerates
-  32. **Fixing #73 alone does not restore interop.** Not yet filed upstream.
+The `pkg/local` move to go-luks2 was held back (from `v0.1.7-alpha`, below)
+because go-luks2 neither wrote nor read a conformant LUKS2 container: a
+32-byte pbkdf2 digest where the declared `sha512` needs 64, an omitted
+`tokens` object, a `keyslots_size` that overran the data offset, and a
+secondary header carrying the primary magic. All four are fixed upstream and
+this release pins **go-luks2 `v0.2.0-alpha`**. The gate was four assertions in
+`internal/luks` that were written to fail until upstream was right —
+`TestNativeFormatWritesASpecLengthDigest`,
+`TestNativeFormatWritesACryptsetupReadableHeader` (three subtests, each one
+defect), `TestNativeFormatProducesTheHeaderTheSizingConstantAssumes` and
+`TestNativeRoundTripIsNotEvidenceOfConformance` — and they pass, measured
+against a real `cryptsetup` 2.7 on 2026-09-17, not against go-luks2 agreeing
+with itself. Existing encrypted volumes open; `cryptsetup` can dump, back up
+and open what go-luks2 writes. `v0.2.0-alpha` also rides out the transient
+`EBUSY` a device-mapper close can return while udev still holds the node.
 
-Neither defect is detectable by round-tripping through go-luks2, whose Format
-and Unlock share the same assumptions and therefore agree with each other. See
-`TestNativeRoundTripIsNotEvidenceOfConformance`.
+### Added
+
+- `VERSION`, this `CHANGELOG.md`, `make release-alpha`, and
+  `.github/workflows/release.yml` — the release machinery the repo had been
+  operating without. The four tags below were cut by hand; the next one is cut
+  by the target (#8).
+- Unit tests that format real LUKS2 containers onto sparse files, needing
+  neither root nor a block device, and assert the FIPS parameters and the 16 MiB
+  data offset against the header that is actually written. Both were previously
+  checkable only through a `cryptsetup` command line or the root-only
+  integration suite.
+
+- **drbd: transit confidentiality — LUKS above the replicated device.** Setting
+  `encrypted=true` with `luks_key_file` (or an injected `KeyProvider` through
+  the new `WithKeyProvider`) puts a LUKS2 container over `/dev/drbd<minor>`, so
+  DRBD replicates ciphertext and each node's backing volume holds ciphertext.
+  Authenticating the peer and concealing the data are separate controls; this is
+  the second one. Configuration is refused at startup in both directions — a
+  provider told to encrypt with no way to obtain the passphrase, and one given a
+  passphrase with encryption off — and the LUKS key file may not be the
+  replication secret file, which is shared with the peer.
+
+- **`Promote` performs the `luksOpen` and `Demote` performs the `luksClose`.**
+  DRBD denies every open of a Secondary's device, so a promotion is the only
+  moment a container over the replicated device can be formatted or unlocked,
+  and the mapping has to be gone before the demotion because an open dm-crypt
+  target holds the device and DRBD will not demote a device somebody has open.
+  The first promotion of a volume whose device carries nothing at all formats the
+  container; every failover after that unlocks the one the peer wrote. A device
+  carrying anything else is refused rather than formatted over. A promotion whose
+  unlock fails is rolled back — on a context of its own, so a cancelled caller
+  cannot abort the cleanup — unless the node already held Primary on the way in.
+  `Detach` and `Delete` close a stranded mapping before taking the resource down.
+
+- **An encrypted volume's LUKS2 header is allocated on top of the request**,
+  the way DRBD's metadata already is. `SizeBytes` is usable capacity: the DRBD
+  device is sized at `SizeBytes + 16 MiB`, the backing volume at that plus DRBD's
+  metadata for it, and `Status` reports the device less the header — in every
+  state the device can be measured in. A same-size restore of an encrypted
+  snapshot plans exactly the backing size a fresh provision would. This is the
+  side of the request `pkg/local` has always put its header on; the two
+  backends now agree.
+
+- **`key-material-custody`, the fifth whole-tree guard (#37, closing the #29
+  umbrella).** The key-material custody model — a LUKS passphrase lives in a
+  go-enclave `MemoryEnclave`, becomes a `[]byte` only inside
+  `internal/luks.(*Manager).withKey` for one `Backend` call, and never crosses
+  a package boundary in the clear — was a convention no test could see broken.
+  It is now enforced by a type-checked scanner in `internal/guards`, run by
+  `make guards` and so by `make lint` and the CI Lint job. Five rules: no call
+  to the enclave's copying exits `Open`/`OpenString`; `WithBytes` only from the
+  named borrow windows, with `withKey` as an anchor that must borrow exactly
+  once; the key-taking `Backend` methods called only from `internal/luks`; a
+  borrowed `key`/`passphrase []byte` used only as a direct call argument; and
+  no exported signature carrying key material as a `string` or `[]byte`. Every
+  rule is proved to fire on a planted fixture, and the scanner fails rather
+  than passes on a file no build configuration selects, a type error, or a
+  tree that borrows from enclaves without the anchor. Measured on the tree it
+  landed on: 76 files examined, no findings; each rule planted in `pkg/local`
+  or `internal/luks` is reported at its file:line, and the sweep takes 2.9s.
+
+- **`pkg/drbd` verifies mount propagation, off by default, and says so when it
+  is off (#40).** `Mount` can now check that the mount it just made is visible
+  outside this mount namespace and refuse a private one, the way `pkg/local` has
+  since #34. Turn it on with `mount_propagation=shared`; the default is
+  `unchecked`, so a replicated cluster whose mounts nobody consumes from another
+  namespace is unaffected on upgrade.
+
+  A refusal **unwinds the mount** rather than leaving a filesystem the caller was
+  told did not appear — on a context of its own, so a caller whose deadline
+  passed mid-verification still gets the cleanup, and only when the target is
+  still the mount this call made, since `umount(2)` takes a path and would
+  otherwise detach whatever landed there since.
+
+  A mount table that **cannot answer** the propagation question is a failure, not
+  a pass: `CauseIndeterminate` rather than the `nil` a passing guard returns. A
+  provider configured for `shared` over an injected `MountTable` without
+  `PropagationOf` is refused at construction, so the impossible configuration
+  cannot be discovered after a mount has already happened.
+
+- **`pkg/drbd.Provider.Posture()`**, which the package had no equivalent of. It
+  names every guard this provider knows about — the four startup capability
+  checks, mount propagation, peer authentication and the delete-time wipe —
+  reporting each as `checked` or `NOT CHECKED` with the setting that changes it.
+  An off-by-default guard with no way to see that it is off is a guard that is
+  silently absent, which is the failure the guard exists to remove.
+
+- **A liveness-oracle seam, so a deployment can answer the question the provider
+  cannot.** `common.LivenessOracle` asks whether an attachment still has a live
+  owner; `pkg/local` takes one through `Options.LivenessOracle`. Whether an
+  attachment has an owner at all is a property of how a system is DEPLOYED — a
+  leased HA controller has one, a CSI node plugin has the pod, a host running
+  one component over local disks has none — so the provider exposes the question
+  and the deployment supplies the answer, rather than a library every deployment
+  consumes baking in one deployment's assumption. go-blockstore takes no
+  dependency on `pkg/ha`, on a CSI layer, or on anything upstream (#41).
+
+  The reaper consults it at **exactly one** point: a mapping this node made on
+  the boot that is still running. That is the only case the boot ID cannot
+  settle, and it is the case that motivates the whole guard — an init container
+  attaches, mounts, exits, and the host stays up, leaving a mapping every local
+  fact calls live. It is deliberately NOT consulted on an ended boot, which is
+  already proof and where an oracle outage could only erase a verdict reached
+  without one, nor on another node's mapping.
+
+- **`liveness unknown`, a verdict for an oracle that could not answer.** Not
+  `live`, which would make an oracle outage look like a fleet with no orphans,
+  and not `orphaned`, which would point anything acting on these verdicts at
+  volumes live workloads are using. `Liveness` is a two-valued enumeration
+  rather than a `bool` so that the reclaimable answer cannot arrive as an
+  implementation's zero value: `common.LivenessOf` refuses the zero value, an
+  unrecognized value, a nil oracle, and any value returned beside an error, all
+  as `ErrLivenessIndeterminate`.
+
+- **`Posture()` reports the oracle, present or absent.** `attachment liveness:
+  NOT CHECKED` names the consequence rather than the setting — a mapping made on
+  this boot is reported as live whether or not anything still holds it — because
+  an absent oracle is legitimate and otherwise indistinguishable from a
+  deployment that needs none.
 
 ### Changed
 
 - **`pkg/local` no longer forks `cryptsetup`.** Every LUKS2 operation — format,
   unlock, close, resize, passphrase check, header read, mapping lookup — is now
   performed in-process by [go-luks2](https://github.com/jeremyhahn/go-luks2)
-  `v0.1.7-alpha`, which parses and writes headers in Go and creates the
+  (`v0.1.7-alpha` at the time; `v0.2.0-alpha` now — see *Resolved* above), which parses and writes headers in Go and creates the
   plaintext mapping with device-mapper ioctls. The `stat` shell-out behind the
   mapping-ownership check is gone too, replaced by `stat(2)` and a sysfs read of
   `/sys/dev/block/<major>:<minor>/slaves`; the integration suite attaches its
@@ -61,8 +168,7 @@ and Unlock share the same assumptions and therefore agree with each other. See
   2026-08-29: everything is done in pure Go unless there is absolutely no other
   way.
 
-  **See the BLOCKED section above before acting on any of this.** The container
-  layout is unchanged and was re-measured rather than assumed: the
+  The container layout is unchanged and was re-measured rather than assumed: the
   pinned FIPS parameters (PBKDF2-SHA-512, AES-256-XTS, 512-bit key, 512-byte
   sectors) produce the same 16 MiB data offset go-blockstore has always sized
   volumes against, so the `SizeBytes`-is-usable-capacity contract and the
@@ -88,17 +194,95 @@ and Unlock share the same assumptions and therefore agree with each other. See
     opens the container itself, grows the filesystem inside it and locks it
     again, so a failure anywhere costs the caller nothing it was using.
 
-### Added
+- The LUKS2 machinery moved to `internal/luks` and is now shared by `pkg/local`
+  and `pkg/drbd`: the pinned cryptographic parameters, the key providers, the
+  passphrase borrow window and the mapping ownership check. `pkg/local`'s public
+  surface is unchanged — `KeyProvider`, `FileKeyProvider`, `StaticKeyProvider`
+  and every error message are as they were.
 
-- `VERSION`, this `CHANGELOG.md`, `make release-alpha`, and
-  `.github/workflows/release.yml` — the release machinery the repo had been
-  operating without. The four tags below were cut by hand; the next one is cut
-  by the target (#8).
-- Unit tests that format real LUKS2 containers onto sparse files, needing
-  neither root nor a block device, and assert the FIPS parameters and the 16 MiB
-  data offset against the header that is actually written. Both were previously
-  checkable only through a `cryptsetup` command line or the root-only
-  integration suite.
+- `pkg/drbd`'s preflight now requires the kernel-keyring capability when, and
+  only when, the provider is configured to encrypt. The measured claim it
+  replaces — "this package performs no LUKS operations at all" — was true when
+  it was written and is not any more.
+
+- The propagation guard and the posture report now live in `internal/mountguard`
+  and `internal/posture`, shared by `pkg/local` and `pkg/drbd` rather than
+  written twice. `local.MountPropagationPolicy`, `local.Posture` and
+  `local.GuardStatus` are unchanged as aliases; `pkg/local`'s behavior and its
+  tests are untouched. `Posture.String()` now names the provider it describes
+  (`go-blockstore/local guards:`, `go-blockstore/drbd guards:`).
+
+- **go-enclave v0.5.0-alpha (from v0.4.0-alpha), and with it the toolchain floor
+  is Go 1.27.0 (from 1.26.7).** The `go` directive, `GO_VERSION` in `ci.yml`
+  and `nightly.yml`, and therefore the `golang:` image `make test-container`
+  pulls, all read 1.27.0; the Makefile already derived its value from `go.mod`.
+  Every constructor, method and error this module uses is unchanged in v0.5.0:
+  `ErrLockedMemoryUnavailable` still carries the same text and every
+  `LockedMemoryError` still reports it through `errors.Is`, so the
+  RLIMIT_MEMLOCK refusal an operator sees is word-for-word what it was. The
+  go-luks2 pin stays at v0.2.0-alpha, which itself requires v0.4.0-alpha;
+  minimal version selection compiles it against v0.5.0 (the API is additive),
+  and go-luks2 #201 tracks its own adoption.
+
+- go-enclave is now distributed under the MIT License (it was AGPL-3.0).
+  Nothing in this module changes, but a consumer that inherits this module's
+  dependency tree no longer inherits a copyleft obligation from that one.
+
+- `golang.org/x/crypto` v0.55.0 → v0.56.0 (indirect, via go-luks2). Clears two
+  of the three module-level govulncheck advisories that scan reported at
+  v0.55.0; the one that remains (GO-2026-5932) has no fixed version yet and is
+  not reachable from this module — `make security-go` still reports 0
+  vulnerabilities in code this module calls.
+
+### Fixed
+
+- **drbd: an encrypted volume can be resized, and a stale mapping is an error
+  rather than a reported success.** The dm-crypt
+  mapping over the replicated device is sized when `Promote` opens it, and
+  go-luks2 v0.2.0-alpha exposes no table reload (re-measured: its device-mapper
+  layer has create-and-load, info and remove, and `Unlock` computes a dynamic
+  segment's length once from the device's size at that moment), so `Resize` is
+  size-at-open. It grows the backing volume and the DRBD device as before, then:
+  with the container closed — a Secondary — it completes, records the size, and
+  records that the filesystem is owed a grow (`FSGrowPending`); with an open
+  mapping that still covers the device it grows the filesystem through the
+  mapping, online when mounted; with an open mapping the device has OUTGROWN it
+  refuses with the new `ErrMappingStale`, after the idempotent device half and
+  before any grow tool runs, without advancing the record, naming the remedy
+  (unmount, `Demote`, `Promote` — which reopens the mapping over the device as
+  it is now — then repeat the `Resize`). A restore that has to grow its
+  destination on an encrypted provider takes the same path instead of being
+  refused. `ErrMappingStale` does not wrap `common.ErrUnsupported`: one role
+  cycle serves the request, which is the opposite of what that sentinel tells a
+  caller.
+
+- **`Mount` finishes a grow the record owes, online.** After a `Resize` (or a
+  growing restore) that ran while the volume was Secondary, the first `Mount`
+  from a Primary runs `resize2fs` against the mounted ext4 or `xfs_growfs`
+  against the mount point — the first point at which both filesystems can be
+  grown without a check — and clears the debt; a failed grow unwinds the mount
+  and leaves the debt standing. This is deliberately not done at `Promote`,
+  where the only ext4 route is a forced `e2fsck` of the whole filesystem in the
+  failover path, XFS cannot be grown at all, and a per-node record cannot know
+  whether the peer already grew the shared filesystem online. The record field
+  is absent from records written before it existed, which therefore owe
+  nothing and behave as before.
+
+- **`internal/luks`: a mapping reports its length and its backing device's
+  current size.** `MappingInfo` gains `SizeBytes` and `BackingSizeBytes`, read
+  from sysfs (no open of the device, which DRBD refuses on a Secondary), and
+  `Manager.MeasureMapping` decides freshness from them against the header's
+  data offset — fail-closed on any size it cannot establish, including a
+  mapping longer than the device's data area, which is a device that shrank
+  under a live mapping. The seam still offers no resize, and the comment on
+  it now records the measurement that keeps that absence load-bearing.
+
+### Unchanged
+
+- **Nothing tears a mapping down.** `InspectMappings` still reports and removes
+  nothing; the acting half deleted in #43 stays deleted. This lands the fact that
+  would make removal decidable, not the removal.
+
 
 ## [0.3.1-alpha] - 2026-08-27
 
