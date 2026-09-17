@@ -46,7 +46,16 @@ permissions:
   security-events: write
 
 env:
-  GO_VERSION: "1.26.7"        # latest 1.26 patch (owner ruling 2026-08-20): 1.27.0 is BLOCKED — cockroachdb/swiss fails to compile under it (undefined fastrand64; task #121). Bump within 1.26 as patches ship; move to 1.27 only in the #121 wave
+  # CUSTOMIZE (go-blockstore, #68): equal to the `go` directive in go.mod.
+  # go-enclave v0.5.0-alpha raised its module floor to 1.27.0, and a module
+  # cannot pin a dependency whose floor is above its own, so adopting it moved
+  # this repo to 1.27 with it. The template's "1.27.0 is BLOCKED —
+  # cockroachdb/swiss" ruling (2026-08-20, task #121) does not apply here: that
+  # module is not in this repo's graph (`go list -m all` measured 2026-09-17),
+  # and the ci-runner image already seeds go1.27.0 into the toolcache and bakes
+  # golangci-lint v2.13.2 built with go1.27.0 (see the lint job below). The
+  # Makefile reads the same number from go.mod for `make test-container`.
+  GO_VERSION: "1.27.0"
   COVERAGE_THRESHOLD: 90      # CUSTOMIZE: per testing-guidelines.md. The tree is at 100% today
 
   # CUSTOMIZE (go-blockstore): the build tags every go invocation below

@@ -8,8 +8,8 @@ github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc h1:U9qPSI2PIWSS1
 github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
-github.com/jeremyhahn/go-enclave v0.4.0-alpha h1:eOvaLklyLvRXV0rPpsccWiwuTcoR27uS/NyxaOlyMtE=
-github.com/jeremyhahn/go-enclave v0.4.0-alpha/go.mod h1:LQHzUbjvUy3Q6BI2Gvaia8JwcGtOcOjufaCxKgw98VU=
+github.com/jeremyhahn/go-enclave v0.5.0-alpha h1:F20BBwRSne7OPs+NeYMh+9nAWJXCo+m1hsRSRgY1ODQ=
+github.com/jeremyhahn/go-enclave v0.5.0-alpha/go.mod h1:bU9hT/V0f8tE+AtFVQ3H4+inajclOBDHNi+Tr5/LAI8=
 github.com/jeremyhahn/go-luks2 v0.2.0-alpha h1:VDK7ACWhAnPISf/IybwBSJeCZXjke4sXOBJ3LFYA9Rk=
 github.com/jeremyhahn/go-luks2 v0.2.0-alpha/go.mod h1:0KROmXZOqRe7pO0jGbIJXPypPtWkjSv8d9UV3rRuYF4=
 github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51 h1:Z9n2FFNUXsshfwJMBgNA0RU6/i7WVaAegv3PtuIHPMs=
