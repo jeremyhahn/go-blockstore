@@ -121,6 +121,16 @@ jobs:
           # itself. No -run filter on purpose: one matching nothing prints ok.
           go test -count=1 ./internal/guards/
 
+      # The public-releasability gate (#75). This tree ships publicly, so every
+      # tracked file is checked for lab addresses, internal domains, fleet
+      # hostnames and owner paths (case-insensitively, symlink targets
+      # included), shell scripts by extension AND shebang, agent files and key
+      # material. It fails closed on a binary or oversized file not listed in
+      # releasability-exempt.txt. Untagged for the reason the Guards step is:
+      # it reads text, it does not compile. See docs/release/public-releasability.md.
+      - name: Public releasability
+        run: go run ./internal/releasability/cmd/releasability
+
       # PREFER THE BAKED BINARY; NEVER INSTALL OVER IT (#30).
       #
       # `runs-on: ubuntu-latest` resolves to jeremyhahn/ci-runner on every Gitea
@@ -250,21 +260,21 @@ jobs:
       # exits 0 at default verbosity — so without this step the actionlint gate
       # below would be a paper gate for the shell inside `run:` steps, which is
       # exactly how a real SC2046 reached main (#21). Pinned and checksum-verified
-      # through the same scripts/install-shellcheck.sh that `make install-tools`
-      # runs, so the shellcheck in CI and on a dev box are the same binary. It
-      # installs to GOPATH/bin, which setup-go has already put on PATH.
+      # through the same Go installer (internal/toolinstall) that `make
+      # install-tools` runs, so the shellcheck in CI and on a dev box are the same
+      # binary. It installs to GOPATH/bin, which setup-go has already put on PATH.
       #
       # DELIBERATELY NOT GUARDED like the four steps above (#30). This one is
       # not in that class: it installs to GOPATH/bin and so overwrites nothing
       # the image bakes, and it is version-pinned AND SHA-256-verified against
       # the extracted binary — strictly stronger than trusting whatever is on
       # PATH. Adding a `command -v shellcheck` skip here would reinstate the
-      # trust-on-sight fast path that ci-template v1.12 removed from
-      # install-shellcheck.sh on purpose (this repo's #22). The cost is one
-      # pinned download per run; the benefit is that the SC* rules run against
-      # a known binary.
+      # trust-on-sight fast path that ci-template v1.12 removed from the
+      # installer on purpose (this repo's #22); its own fast path trusts only a
+      # binary whose bytes hash to the pin. The benefit is that the SC* rules
+      # run against a known binary.
       - name: Install shellcheck
-        run: ./scripts/install-shellcheck.sh "$(go env GOPATH)/bin"
+        run: go run ./internal/toolinstall/cmd/install-tool shellcheck "$(go env GOPATH)/bin"
 
       - name: actionlint
         run: actionlint

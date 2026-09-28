@@ -28,9 +28,9 @@ func TestParseConfigDefaults(t *testing.T) {
 	cfg, err := ParseConfig(map[string]string{
 		SettingVolumeGroup: testVG,
 		SettingNodeName:    testNode,
-		SettingNodeAddress: "10.10.0.1",
+		SettingNodeAddress: "192.0.2.1",
 		SettingPeerNode:    testPeer,
-		SettingPeerAddress: "10.10.0.2",
+		SettingPeerAddress: "192.0.2.2",
 	})
 	if err != nil {
 		t.Fatalf("ParseConfig: %v", err)
@@ -68,9 +68,9 @@ func TestParseConfigWipeOnDelete(t *testing.T) {
 		return map[string]string{
 			SettingVolumeGroup: testVG,
 			SettingNodeName:    testNode,
-			SettingNodeAddress: "10.10.0.1",
+			SettingNodeAddress: "192.0.2.1",
 			SettingPeerNode:    testPeer,
-			SettingPeerAddress: "10.10.0.2",
+			SettingPeerAddress: "192.0.2.2",
 		}
 	}
 	if SettingWipeOnDelete != "wipe_on_delete" {
@@ -113,9 +113,9 @@ func TestParseConfigRejections(t *testing.T) {
 		return map[string]string{
 			SettingVolumeGroup: testVG,
 			SettingNodeName:    testNode,
-			SettingNodeAddress: "10.10.0.1",
+			SettingNodeAddress: "192.0.2.1",
 			SettingPeerNode:    testPeer,
-			SettingPeerAddress: "10.10.0.2",
+			SettingPeerAddress: "192.0.2.2",
 		}
 	}
 
@@ -129,10 +129,10 @@ func TestParseConfigRejections(t *testing.T) {
 		{"missing peer address", func(s map[string]string) { delete(s, SettingPeerAddress) }},
 		{"unknown setting", func(s map[string]string) { s["protocol"] = "A" }},
 		{"volume group fails the name allowlist", func(s map[string]string) { s[SettingVolumeGroup] = "vg0;rm -rf /" }},
-		{"node address is not an IP", func(s map[string]string) { s[SettingNodeAddress] = "node-a.internal" }},
+		{"node address is not an IP", func(s map[string]string) { s[SettingNodeAddress] = "node-a.example" }},
 		{"node address is unspecified", func(s map[string]string) { s[SettingNodeAddress] = "0.0.0.0" }},
 		{"peer address is multicast", func(s map[string]string) { s[SettingPeerAddress] = "224.0.0.1" }},
-		{"addresses collide", func(s map[string]string) { s[SettingPeerAddress] = "10.10.0.1" }},
+		{"addresses collide", func(s map[string]string) { s[SettingPeerAddress] = "192.0.2.1" }},
 		{"address families differ", func(s map[string]string) { s[SettingPeerAddress] = "fd00::2" }},
 		{"peer is the local node", func(s map[string]string) { s[SettingPeerNode] = testNode }},
 		{"node ids collide", func(s map[string]string) { s[SettingNodeID] = "1"; s[SettingPeerNodeID] = "1" }},
@@ -217,24 +217,24 @@ func TestNodeIDsAgreeAcrossThePair(t *testing.T) {
 	pairs := [][2]string{
 		{"node-a", "node-b"},
 		{"node-b", "node-a"},
-		{"ci-node-1", "ci-node-2"},
-		{"zeta.storage.internal", "alpha.storage.internal"},
+		{"host-01", "host-02"},
+		{"zeta.storage.example", "alpha.storage.example"},
 	}
 
 	for _, pair := range pairs {
 		local, peer := pair[0], pair[1]
 		t.Run(local+"/"+peer, func(t *testing.T) {
 			here, err := ParseConfig(map[string]string{
-				SettingVolumeGroup: testVG, SettingNodeName: local, SettingNodeAddress: "10.10.0.1",
-				SettingPeerNode: peer, SettingPeerAddress: "10.10.0.2",
+				SettingVolumeGroup: testVG, SettingNodeName: local, SettingNodeAddress: "192.0.2.1",
+				SettingPeerNode: peer, SettingPeerAddress: "192.0.2.2",
 			})
 			if err != nil {
 				t.Fatalf("ParseConfig on %q: %v", local, err)
 			}
 			// The same deployment, parsed on the other host: the names swap.
 			there, err := ParseConfig(map[string]string{
-				SettingVolumeGroup: testVG, SettingNodeName: peer, SettingNodeAddress: "10.10.0.2",
-				SettingPeerNode: local, SettingPeerAddress: "10.10.0.1",
+				SettingVolumeGroup: testVG, SettingNodeName: peer, SettingNodeAddress: "192.0.2.2",
+				SettingPeerNode: local, SettingPeerAddress: "192.0.2.1",
 			})
 			if err != nil {
 				t.Fatalf("ParseConfig on %q: %v", peer, err)
@@ -257,8 +257,8 @@ func TestNodeIDsAgreeAcrossThePair(t *testing.T) {
 // whose ids were assigned before this provider existed.
 func TestExplicitNodeIDsAreKept(t *testing.T) {
 	cfg, err := ParseConfig(map[string]string{
-		SettingVolumeGroup: testVG, SettingNodeName: testNode, SettingNodeAddress: "10.10.0.1",
-		SettingPeerNode: testPeer, SettingPeerAddress: "10.10.0.2",
+		SettingVolumeGroup: testVG, SettingNodeName: testNode, SettingNodeAddress: "192.0.2.1",
+		SettingPeerNode: testPeer, SettingPeerAddress: "192.0.2.2",
 		SettingNodeID: "7", SettingPeerNodeID: "3",
 	})
 	if err != nil {

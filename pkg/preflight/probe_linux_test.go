@@ -639,7 +639,7 @@ func TestKeyringProbeWithAnInjectedCheck(t *testing.T) {
 // real, and a regular file answers ENOTTY — "this descriptor does not take this
 // ioctl" — which is exactly the answer that must NOT be read as a capability
 // problem. The path where the ioctl succeeds needs the control node and is
-// covered by scripts/preflight-container-matrix.sh.
+// covered by `make preflight-matrix` (internal/preflightmatrix).
 func TestDeviceMapperVersionOnADescriptorThatIsNotTheControlNode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "not-a-device")
 	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {

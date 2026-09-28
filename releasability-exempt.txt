@@ -1,0 +1,13 @@
+# Tracked files the public-releasability gate may ship UNREAD, each with the
+# reason it ships anyway. See docs/release/public-releasability.md.
+#
+# The gate reads every tracked file as text. A file it cannot read — a binary
+# (a NUL byte in its first 8 KiB), a file over 1 MiB, a submodule — FAILS the
+# gate unless it is listed here. An entry exempts ONLY that: a shell script, an
+# agent file or key material fails whatever this file says.
+#
+# Format: one repository-relative path, whitespace, then a one-line reason.
+# An entry with no reason, a duplicate entry, and an entry that exempts nothing
+# (untracked, or text the gate reads anyway) each fail the gate.
+#
+# This list is empty, and is meant to stay that way.

@@ -32,5 +32,7 @@ go.work.sum
 .env
 
 
-# staging directory for scripts/preflight-container-matrix.sh
-.preflight-matrix-tmp/
+# AI agent instructions and state never ship (docs/release/public-releasability.md)
+.claude/
+.serena/
+CLAUDE.md

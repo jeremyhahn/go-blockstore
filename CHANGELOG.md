@@ -310,7 +310,7 @@ With this the library is feature-complete for the DRBD-first storage program.
 
 The controller is a **control-plane fence only**: production deployments pair it
 with DRBD fencing/stonith or quorum. Embedded-coordinator deployments are gated
-on go-qrdb #174, and hardware acceptance on the dellemc pair (issue #4's
+on go-qrdb #174, and hardware acceptance on the two-node hardware pair (issue #4's
 acceptance list).
 
 ## [0.2.0-alpha] - 2026-08-27
@@ -329,7 +329,7 @@ acceptance list).
   sentinels, and the Delete-refuses rule.
 
 The real-cluster drbd suite had **not** been run at this tag — it is gated on
-issue #4's acceptance list (dellemc pair, week of 2026-08-31).
+issue #4's acceptance list (two-node hardware pair, week of 2026-08-31).
 
 ## [0.1.0-alpha] - 2026-08-26
 

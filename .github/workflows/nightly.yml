@@ -96,7 +96,7 @@ jobs:
       - name: Resolve pinned trivy version
         id: trivy_version
         # Read as ONE bare token and FAIL if the file is malformed, matching the
-        # Makefile's parser (and install-trivy.sh). The old `tr -d ' \t\n\r'`
+        # Makefile's parser (and internal/toolinstall). The old `tr -d ' \t\n\r'`
         # scrubbed all whitespace, so `0.74 .0` normalised to `0.74.0` and fed
         # the trivy-action `version:` inputs below a version nobody pinned — CI
         # would not catch what `make install-tools` now refuses. awk emits the
@@ -166,18 +166,24 @@ jobs:
       #
       # The template piped contrib/install.sh from a MUTABLE ref straight into
       # sh, which is arbitrary code execution on this runner for anyone who can
-      # change that file. scripts/install-trivy.sh downloads the pinned release
+      # change that file. internal/toolinstall downloads the pinned release
       # artifact and verifies its published SHA-256 before anything executes,
-      # and it is the SAME script `make install-tools` runs, so a developer's
-      # trivy and this one cannot drift. See the script's header for what the
-      # checksum does and does not prove.
+      # and it is the SAME Go program `make install-tools` runs, so a
+      # developer's trivy and this one cannot drift. See the package doc for
+      # what the checksum does and does not prove.
+      - name: Set up Go (Gitea)
+        if: github.server_url != 'https://github.com'
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
       - name: Install Trivy (Gitea)
         if: github.server_url != 'https://github.com'
         # Pass the already-resolved version so both nightly paths and the
-        # trivy-action inputs share the ONE strict value (the script would also
-        # read .trivy-version strictly on its own now, but this keeps the resolve
-        # step the single source).
-        run: ./scripts/install-trivy.sh /usr/local/bin "${{ steps.trivy_version.outputs.version }}"
+        # trivy-action inputs share the ONE strict value (the installer would
+        # also read .trivy-version strictly on its own, but this keeps the
+        # resolve step the single source).
+        run: go run ./internal/toolinstall/cmd/install-tool trivy /usr/local/bin "${{ steps.trivy_version.outputs.version }}"
 
       - name: Trivy gate (Gitea)
         if: github.server_url != 'https://github.com'

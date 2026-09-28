@@ -579,9 +579,9 @@ func testSettings(t *testing.T) map[string]string {
 		SettingConfigDir:   filepath.Join(dir, "drbd.d"),
 		SettingStateDir:    filepath.Join(dir, "state"),
 		SettingNodeName:    testNode,
-		SettingNodeAddress: "10.10.0.1",
+		SettingNodeAddress: "192.0.2.1",
 		SettingPeerNode:    testPeer,
-		SettingPeerAddress: "10.10.0.2",
+		SettingPeerAddress: "192.0.2.2",
 
 		// The startup privilege checks are off across the unit suite because
 		// these tests are about CONFIGURATION, RESOURCE RENDERING and the

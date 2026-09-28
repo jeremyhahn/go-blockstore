@@ -67,7 +67,13 @@ MODULE := github.com/jeremyhahn/go-blockstore
 # The remote is therefore named once, defaulted to what is actually configured,
 # and its existence is asserted before it is trusted. Override for a checkout
 # that does follow version-control.md's naming: RELEASE_REMOTE=dev.
-AGENT_GIT ?= /home/jhahn/sources/automatethethings/software/scripts/agent-git.sh
+# AGENT_GIT has NO default. It is the signing wrapper the release commit, tag
+# and push go through, and it lives outside this repository, on the machine the
+# release is cut from; a default would publish one machine's home directory in a
+# public tree and dangle everywhere else. Name it on the command line:
+#   make release-alpha VERSION=vX.Y.Z-alpha AGENT_GIT=/path/to/agent-git.sh
+# The recipe refuses to start without an executable at that path.
+AGENT_GIT ?=
 REPO_NAME ?= go-blockstore
 RELEASE_REMOTE ?= origin
 
@@ -98,8 +104,8 @@ TEST_TIMEOUT := 900s
 # when there is exactly one, trimming surrounding whitespace as a side effect.
 # An internally-spaced or multi-token file yields empty, which the trivy target
 # then surfaces as a mismatch against whatever is installed rather than acting
-# on a scrubbed guess. (scripts/install-trivy.sh independently re-validates the
-# file as a strict semver before it fetches anything, so install fails loud too.)
+# on a scrubbed guess. (internal/toolinstall independently re-validates the
+# value as a strict semver before it fetches anything, so install fails loud too.)
 TRIVY_VERSION := $(shell awk '{for(i=1;i<=NF;i++){n++;v=$$i}} END{if(n==1)print v}' .trivy-version 2>/dev/null)
 
 # THE ANALYSER VERSIONS, IN ONE PLACE (#30). These are the SAME numbers the
@@ -440,10 +446,12 @@ test-kernel-keypath:
 # profile still denying add_key — which nothing inside `go test` can reproduce.
 # It needs a Docker-capable host, which the shared runner is not, so it is run
 # here and by an operator. It ASSERTS rather than prints: a row that does not
-# behave as pkg/preflight claims exits non-zero.
+# behave as pkg/preflight claims exits non-zero. The rows, and why each one is
+# there, are in internal/preflightmatrix. PREFLIGHT_MATRIX_IMAGE overrides the
+# image (default alpine:3).
 preflight-matrix:
 	@echo "$(CYAN)$(BOLD)→ Running the preflight container matrix...$(RESET)"
-	./scripts/preflight-container-matrix.sh
+	$(GO) run ./internal/preflightmatrix/cmd/preflight-matrix
 	@echo "$(GREEN)✓ preflight container matrix complete$(RESET)"
 
 .PHONY: coverage
@@ -494,8 +502,20 @@ vet:
 	@echo "$(GREEN)✓ Vet passed$(RESET)"
 
 .PHONY: lint
-## lint: gofmt, vet, golangci-lint and actionlint (devops.md §4)
-lint: fmt-check vet golangci-lint actionlint guards
+## lint: gofmt, vet, golangci-lint, actionlint, the guards and the releasability gate (devops.md §4)
+lint: fmt-check vet golangci-lint actionlint guards releasability
+
+.PHONY: releasability
+## releasability: Refuse lab values, shell scripts, agent files and unreadable files in the tracked tree
+# This tree ships publicly, and everything tracked is published. The gate reads
+# the git INDEX, so a file is checked because it is tracked — an unstaged edit
+# is scanned from the working tree, a new file once it is `git add`ed. It fails
+# closed: a binary or oversized tracked file fails unless releasability-exempt.txt
+# names it with a reason. See docs/release/public-releasability.md.
+releasability:
+	@echo "$(CYAN)$(BOLD)→ Checking the tracked tree is publicly releasable...$(RESET)"
+	$(GO) run ./internal/releasability/cmd/releasability
+	@echo "$(GREEN)✓ Releasability gate passed$(RESET)"
 
 .PHONY: golangci-lint
 ## golangci-lint: Run golangci-lint (config is version "2" — needs the v2 binary)
@@ -579,10 +599,10 @@ actionlint:
 .PHONY: install-tools
 ## install-tools: Install the pinned linter and the security scanners
 # trivy and shellcheck are not `go install` targets, so they come from
-# scripts/install-trivy.sh and scripts/install-shellcheck.sh — the same scripts
-# CI runs (nightly.yml for trivy, the lint job for shellcheck), each of which
-# downloads the PINNED release artifact and verifies its SHA-256 before
-# executing anything. Nothing here pipes a fetched script into a shell. One
+# internal/toolinstall/cmd/install-tool — the same Go program CI runs
+# (nightly.yml for trivy, the lint job for shellcheck), which downloads the
+# PINNED release artifact and verifies its SHA-256 before executing anything.
+# Nothing here pipes a fetched script into a shell. One
 # installer per tool for both call sites, so the binary on a dev box and the one
 # in CI cannot drift apart. shellcheck backs actionlint's SC* rules; without it
 # actionlint disables those rules and exits 0, which is the fail-open the lint
@@ -604,17 +624,15 @@ install-tools:
 	@echo "$(CYAN)  actionlint $(ACTIONLINT_VERSION)$(RESET)"
 	@$(GO) install github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
 	@echo "$(CYAN)  shellcheck (pinned, checksum-verified)$(RESET)"
-	@./scripts/install-shellcheck.sh "$$($(GO) env GOPATH)/bin"
+	@$(GO) run ./internal/toolinstall/cmd/install-tool shellcheck "$$($(GO) env GOPATH)/bin"
 	@echo "$(CYAN)  trivy $(TRIVY_VERSION) (pinned, checksum-verified)$(RESET)"
 	@# Pass the STRICTLY-parsed version through, and refuse to install without it.
 	@# TRIVY_VERSION above resolves to empty on a malformed .trivy-version (embedded
-	@# whitespace or multiple tokens); without this guard install-trivy.sh would
-	@# then fall back to reading the file ITSELF with `tr -d`, scrub `0.74 .0` to
-	@# `0.74.0` and install that — the exact normalize-not-verify hole the read was
-	@# hardened to close, reopened one layer down. Failing here keeps the parsed
-	@# value the single source and never lets the scrubbing fallback run.
+	@# whitespace or multiple tokens); without this guard the installer would
+	@# then fall back to reading the file ITSELF. It reads it strictly too, but
+	@# failing here keeps the parsed value the single source.
 	@test -n "$(TRIVY_VERSION)" || { echo "$(RED)✗ .trivy-version is malformed (empty, whitespace, or multi-token) — refusing to install a scrubbed guess$(RESET)"; exit 1; }
-	@./scripts/install-trivy.sh "$$($(GO) env GOPATH)/bin" "$(TRIVY_VERSION)"
+	@$(GO) run ./internal/toolinstall/cmd/install-tool trivy "$$($(GO) env GOPATH)/bin" "$(TRIVY_VERSION)"
 	@echo "$(GREEN)✓ Tools installed to $$($(GO) env GOPATH)/bin$(RESET)"
 	@echo '$(YELLOW)  Put that directory on your PATH, or the security targets will not find them.$(RESET)'
 
@@ -932,7 +950,7 @@ release-alpha:
 	@test -n "$$REL_VERSION" || { echo 'ERROR: state the version explicitly: make release-alpha VERSION=vX.Y.Z-alpha (release-versioning.md decides patch/minor/major — the recipe refuses to guess)'; exit 1; }
 	@printf '%s' "$$REL_VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha$$' || { echo 'ERROR: VERSION is not of the form vX.Y.Z-alpha, with no leading zeros in X, Y or Z (SemVer rule 9 — and release.yml refuses what this would otherwise let you tag)'; exit 1; }
 	@test -n "$$REL_REPO" || { echo 'ERROR: REPO_NAME is empty — set it to the literal repo name in the Makefile, never $$(notdir $$(CURDIR))'; exit 1; }
-	@test -x "$$REL_AGENT_GIT" || { echo 'ERROR: AGENT_GIT does not point at an executable agent-git.sh — every git write in this recipe signs through it'; exit 1; }
+	@test -x "$$REL_AGENT_GIT" || { echo 'ERROR: AGENT_GIT is unset or does not point at an executable agent-git.sh — every git write in this recipe signs through it; pass AGENT_GIT=/path/to/agent-git.sh'; exit 1; }
 	@test "$$(git rev-parse --abbrev-ref HEAD)" = main || { echo "ERROR: releases are cut from main; you are on $$(git rev-parse --abbrev-ref HEAD). Pushing HEAD would publish this branch."; exit 1; }
 	@git remote get-url "$$REL_REMOTE" >/dev/null 2>&1 || { echo "ERROR: no git remote named $$REL_REMOTE. Set RELEASE_REMOTE to the Gitea remote; the duplicate-tag check below FAILS OPEN without it"; exit 1; }
 	@! git rev-parse -q --verify "refs/tags/$$REL_VERSION" >/dev/null || { echo "ERROR: tag $$REL_VERSION already exists locally"; exit 1; }
@@ -980,3 +998,4 @@ help:
 	@echo "  $(CYAN)VERSION$(RESET)            the release tag, required by release-alpha; no default"
 	@echo "                     e.g. make release-alpha VERSION=v0.3.2-alpha"
 	@echo "  $(CYAN)RELEASE_REMOTE$(RESET)     git remote the release is pushed to (default: origin)"
+	@echo "  $(CYAN)AGENT_GIT$(RESET)          the agent-git.sh release-alpha signs through; required, no default"

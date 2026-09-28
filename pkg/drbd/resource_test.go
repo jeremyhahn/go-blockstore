@@ -73,10 +73,10 @@ func TestRenderResource(t *testing.T) {
 		"protocol C;",
 		`on "node-a" {`,
 		"node-id 0;",
-		"address ipv4 10.10.0.1:7792;",
+		"address ipv4 192.0.2.1:7792;",
 		`on "node-b" {`,
 		"node-id 1;",
-		"address ipv4 10.10.0.2:7792;",
+		"address ipv4 192.0.2.2:7792;",
 		"# Generated: 2026-08-26T12:00:00Z",
 	} {
 		if !strings.Contains(got, want) {
@@ -297,9 +297,9 @@ func TestListMetaFailsClosedOnAnUnreadableRecord(t *testing.T) {
 		SettingConfigDir:   p.Config().ConfigDir,
 		SettingStateDir:    p.Config().StateDir,
 		SettingNodeName:    testNode,
-		SettingNodeAddress: "10.10.0.1",
+		SettingNodeAddress: "192.0.2.1",
 		SettingPeerNode:    testPeer,
-		SettingPeerAddress: "10.10.0.2",
+		SettingPeerAddress: "192.0.2.2",
 
 		// Same reason as testSettings: this test is about record handling, not
 		// about whether this host has a drbd module and CAP_NET_ADMIN.
@@ -342,9 +342,9 @@ func TestRecordsFromAnotherVolumeGroupAreRefused(t *testing.T) {
 		SettingConfigDir:   p.Config().ConfigDir,
 		SettingStateDir:    p.Config().StateDir,
 		SettingNodeName:    testNode,
-		SettingNodeAddress: "10.10.0.1",
+		SettingNodeAddress: "192.0.2.1",
 		SettingPeerNode:    testPeer,
-		SettingPeerAddress: "10.10.0.2",
+		SettingPeerAddress: "192.0.2.2",
 
 		// Same reason as testSettings: this test is about record handling, not
 		// about whether this host has a drbd module and CAP_NET_ADMIN.

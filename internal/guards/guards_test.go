@@ -71,13 +71,12 @@ var plantedViolations = map[string][]Finding{
 		{File: "skip_fixture.go", Line: 48}, // tb.Skip
 	},
 	"no-unexplained-fail-open": {
-		{File: "Makefile", Line: 5},   // a Makefile recipe, not only .sh
+		{File: "Makefile", Line: 10},  // || true, in a Makefile recipe
+		{File: "Makefile", Line: 11},  // ||true
+		{File: "Makefile", Line: 12},  // || :
+		{File: "Makefile", Line: 13},  // ||:
+		{File: "Makefile", Line: 14},  // a trailing comment stating no reason
 		{File: "deploy.yml", Line: 7}, // a CI workflow step
-		{File: "run.sh", Line: 8},     // || true
-		{File: "run.sh", Line: 10},    // ||true
-		{File: "run.sh", Line: 12},    // || :
-		{File: "run.sh", Line: 14},    // ||:
-		{File: "run.sh", Line: 17},    // a trailing comment stating no reason
 	},
 	"privileged-is-never-a-remedy": {
 		{File: "DEPLOY.md", Line: 3},  // prose offering the flag

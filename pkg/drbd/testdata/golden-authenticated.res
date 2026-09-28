@@ -16,11 +16,11 @@ resource "vol1" {
 
     on "node-a" {
         node-id 0;
-        address ipv4 10.10.0.1:7792;
+        address ipv4 192.0.2.1:7792;
     }
 
     on "node-b" {
         node-id 1;
-        address ipv4 10.10.0.2:7792;
+        address ipv4 192.0.2.2:7792;
     }
 }

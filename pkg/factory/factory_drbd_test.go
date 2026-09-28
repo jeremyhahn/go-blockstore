@@ -53,9 +53,9 @@ func drbdSettings(t *testing.T) map[string]string {
 		"config_dir":   filepath.Join(dir, "drbd.d"),
 		"state_dir":    filepath.Join(dir, "state"),
 		"node_name":    "node-a",
-		"node_address": "10.10.0.1",
+		"node_address": "192.0.2.1",
 		"peer_node":    "node-b",
-		"peer_address": "10.10.0.2",
+		"peer_address": "192.0.2.2",
 
 		"replication_secret_file": secret,
 	}

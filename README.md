@@ -563,6 +563,21 @@ Deliberate exceptions are declared in place with a reason —
 `# guard:fail-open <why>` on the line or the one above it — never by weakening
 a scanner.
 
+### Public releasability
+
+```
+make releasability   # also run by `make lint`, `make test`, and the CI Lint job
+```
+
+Everything tracked here is published, so `internal/releasability` reads every
+tracked file and refuses private-network addresses, internal domains, fleet
+hostnames and owner paths (case-insensitively, symlink targets included), shell
+scripts by extension or shebang, AI agent files, and key material. It fails
+closed: a binary or oversized tracked file fails unless
+`releasability-exempt.txt` names it with a reason. The rule, and what to use
+instead of each refused value, is in
+[docs/release/public-releasability.md](docs/release/public-releasability.md).
+
 ### Checking `internal/mountinfo` against a live kernel
 
 ```

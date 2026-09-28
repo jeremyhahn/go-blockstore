@@ -80,7 +80,7 @@ func TestValidateHostname(t *testing.T) {
 		ok bool
 	}{
 		{"node-a", true},
-		{"node-a.storage.internal", true},
+		{"node-a.storage.example", true},
 		{"NODE-A", true},
 		{"n", true},
 		{"", false},
