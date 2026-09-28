@@ -465,6 +465,14 @@ func TestLoadExemptionsSurfacesAnUnopenableFile(t *testing.T) {
 	}
 }
 
+func TestLoadExemptionsRefusesAMissingRoot(t *testing.T) {
+	_, err := LoadExemptions(filepath.Join(t.TempDir(), "absent"))
+	var exemptionErr *ExemptionError
+	if !errors.As(err, &exemptionErr) || exemptionErr.Err == nil {
+		t.Fatalf("LoadExemptions under a missing root = %v, want an ExemptionError, not an empty list", err)
+	}
+}
+
 func TestOutsideARepositoryIsAListError(t *testing.T) {
 	dir := t.TempDir()
 	var listErr *ListError

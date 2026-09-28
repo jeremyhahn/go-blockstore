@@ -128,7 +128,8 @@ type Result struct {
 
 // Root returns the top of the git work tree containing dir.
 func Root(dir string) (string, error) {
-	cmd := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel")
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = dir
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -142,7 +143,8 @@ func Root(dir string) (string, error) {
 // relative to it and sorted. The index is the right manifest: a file is
 // published because it is tracked, and untracked litter ships nowhere.
 func TrackedFiles(root string) ([]string, error) {
-	cmd := exec.Command("git", "-C", root, "ls-files", "-z", "--cached")
+	cmd := exec.Command("git", "ls-files", "-z", "--cached")
+	cmd.Dir = root
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -177,7 +179,12 @@ func ScanRepo(root string) (Result, error) {
 // LoadExemptions reads root's ExemptFile. A missing file is an empty list —
 // that exempts nothing, which is the fail-closed reading.
 func LoadExemptions(root string) (map[string]string, error) {
-	handle, err := os.Open(filepath.Join(root, ExemptFile))
+	tree, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, &ExemptionError{Reason: "cannot be read", Err: err}
+	}
+	defer func() { _ = tree.Close() }()
+	handle, err := tree.Open(ExemptFile)
 	if errors.Is(err, fs.ErrNotExist) {
 		return map[string]string{}, nil
 	}

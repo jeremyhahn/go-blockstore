@@ -66,6 +66,8 @@ func DockerHost(docker string) Host {
 			return err == nil
 		},
 		BuildProbe: func(ctx context.Context, out string) error {
+			// #nosec G204 -- fixed binary and package; out is the matrix's own
+			// temporary path, passed as one argument with no shell.
 			cmd := exec.CommandContext(ctx, "go", "build", "-o", out, ProbePackage)
 			cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 			if output, err := cmd.CombinedOutput(); err != nil {
