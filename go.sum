@@ -8,8 +8,8 @@ github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc h1:U9qPSI2PIWSS1
 github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
-github.com/jeremyhahn/go-enclave v0.5.0-alpha h1:F20BBwRSne7OPs+NeYMh+9nAWJXCo+m1hsRSRgY1ODQ=
-github.com/jeremyhahn/go-enclave v0.5.0-alpha/go.mod h1:bU9hT/V0f8tE+AtFVQ3H4+inajclOBDHNi+Tr5/LAI8=
+github.com/jeremyhahn/go-enclave v0.6.0-alpha h1:aQ0xOVKPFJ8fGRLOpiWSfXv6KpN/sHAoxB44t06fSK0=
+github.com/jeremyhahn/go-enclave v0.6.0-alpha/go.mod h1:NzaV85d7/iJuP8eTFIJogPZwGcGkKR3RHm3i2bthPNA=
 github.com/jeremyhahn/go-luks2 v0.2.0-alpha h1:VDK7ACWhAnPISf/IybwBSJeCZXjke4sXOBJ3LFYA9Rk=
 github.com/jeremyhahn/go-luks2 v0.2.0-alpha/go.mod h1:0KROmXZOqRe7pO0jGbIJXPypPtWkjSv8d9UV3rRuYF4=
 github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51 h1:Z9n2FFNUXsshfwJMBgNA0RU6/i7WVaAegv3PtuIHPMs=
@@ -22,7 +22,7 @@ github.com/tmc/scp v0.0.0-20170824174625-f7b48647feef h1:7D6Nm4D6f0ci9yttWaKjM1T
 github.com/tmc/scp v0.0.0-20170824174625-f7b48647feef/go.mod h1:WLFStEdnJXpjK8kd4qKLwQKX/1vrDzp5BcDyiZJBHJM=
 golang.org/x/crypto v0.56.0 h1:GUh5Ii4J5jtcseSMiRqr1jXCNHoxjeV9Fmekc2oLy6Y=
 golang.org/x/crypto v0.56.0/go.mod h1:OMW5y6CY9l38uPLmxU6l6pwcXp1obtLo3e6gT7gQR2I=
-golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
-golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
+golang.org/x/sys v0.48.0 h1:bbX/i/6MgT9BVLM9RT1thmxL04yeTAhbEz4SyadbXoo=
+golang.org/x/sys v0.48.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
 gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
