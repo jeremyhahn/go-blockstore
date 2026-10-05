@@ -429,3 +429,32 @@ func TestRootWalksUpToGoMod(t *testing.T) {
 		}
 	})
 }
+
+// TestFailOpenSkipsOnlyTheFleetManagedAutomerge pins the exemption to the one
+// path this repository cannot annotate. A sibling workflow carrying the same
+// unannotated swallow must still be found, so the exemption cannot spread into
+// a directory-wide blind spot.
+func TestFailOpenSkipsOnlyTheFleetManagedAutomerge(t *testing.T) {
+	root := t.TempDir()
+	workflows := filepath.Join(root, ".github", "workflows")
+	if err := os.MkdirAll(workflows, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	swallow := []byte("jobs:\n  x:\n    steps:\n      - run: false || true\n")
+	for _, name := range []string{"automerge.yml", "ci.yml"} {
+		if err := os.WriteFile(filepath.Join(workflows, name), swallow, 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+
+	result, err := FailOpenShell().Scan(root)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(result.Examined) != 1 || result.Examined[0] != ".github/workflows/ci.yml" {
+		t.Errorf("examined %v, want only .github/workflows/ci.yml", result.Examined)
+	}
+	if len(result.Findings) != 1 || result.Findings[0].File != ".github/workflows/ci.yml" {
+		t.Errorf("findings %v, want exactly one, in .github/workflows/ci.yml", result.Findings)
+	}
+}

@@ -1,4 +1,4 @@
-# ci-template: v1.9 (customized) — canonical CI for all first-party Go repos.
+# ci-template: v1.15 (customized) — canonical CI for all first-party Go repos.
 # Source of truth: software/templates/github-actions/ci.yml in the
 # automatethethings repo (devops.md §1/§8/§9). Copied in, never referenced by
 # workflow_call: the template lives inside the security boundary and cannot be
@@ -13,14 +13,12 @@
 # forward on the next template sync, or take it from the template once the
 # template adopts it.
 #
-# v1.9 is a FAIL-FAST STAGED PIPELINE. Gitea cannot cancel in-flight jobs (no
-# cancel route — measured, task #90), so fail-fast comes from ORDERING:
-#
-#   stage 1 (fast tier)   lint, build      — no `needs`
-#   stage 2 (expensive)   security, test   — `needs: [lint, build]`
-#
-# A tree that does not compile or does not lint says so in minutes and burns
-# nothing downstream.
+# v1.14/v1.15 (automatethethings#207, #209, #211): every job starts at once, so
+# a run takes as long as its slowest job. lint, build, security and test have
+# no `needs`; CI Gate, the one required check, needs every job and fails closed
+# on any result but success. This supersedes v1.9's staged ordering. push runs
+# on main only: automerge.yml v7's merge trains are PRs from merge-train/* and
+# get their CI from pull_request like any PR.
 #
 # `fips` and `trivy` live in nightly.yml, not here (owner ruling 2026-08-20):
 # both verify slow-moving properties, and neither gates a merge. They are
@@ -34,7 +32,9 @@ name: CI
 
 on:
   push:
-    branches: [main]                    # trunk-based: main is the ONLY trunk
+    # trunk-based: main is the ONLY trunk. automerge.yml's merge trains are
+    # PRs from merge-train/* and get CI from pull_request (v1.15).
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:                    # re-fire a whole workflow; also the
@@ -78,7 +78,7 @@ env:
   BUILD_TAGS: 'drbd'
 
 jobs:
-  # STAGE 1 — the fast tier. No `needs`; everything expensive stages behind it.
+  # No job has `needs` (v1.14): all of them start at once.
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -295,11 +295,10 @@ jobs:
       # CUSTOMIZE: no nested modules in this repo. A provider that grows its
       # own module builds here too.
 
-  # STAGE 2 — the expensive tier.
   security:
     name: Security
     runs-on: ubuntu-latest
-    needs: [lint, build]
+    # No `needs` (v1.14): starts with lint and build, not after them.
     # THE GO TOOLCHAIN IS CGROUP-UNAWARE. Inside a job container capped at
     # 16 GB, `nproc` still reports the HOST's cores and /proc/meminfo the
     # HOST's memory, so gosec defaults to a worker per host core and the GC has
@@ -473,7 +472,8 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    needs: [lint, build]
+    # No `needs` (v1.14): every job starts at once; CI Gate fails closed on
+    # any of them.
     timeout-minutes: 15       # CUSTOMIZE: two packages of unit tests; the
                               # 900s go-test bound below fires first on a hang
     steps:
@@ -515,16 +515,16 @@ jobs:
           RESULT_BUILD: ${{ needs.build.result }}
           RESULT_TEST: ${{ needs.test.result }}
         run: |
-          # skipped != failed, but BOTH fail the gate: under staged fail-fast a
-          # skip means an upstream stage failed, and naming it keeps a blocked
-          # stage loud instead of letting a red gate read as a test failure
-          # while the tests never ran (go-qrdb#42). An unreadable (empty)
+          # skipped != failed, but BOTH fail the gate: a job that never ran
+          # proved nothing, and naming it keeps it loud instead of letting a
+          # red gate read as a test failure while the tests never ran
+          # (go-qrdb#42). An unreadable (empty)
           # result fails closed rather than passing.
           BAD=0
           check() {
             case "$2" in
               success) echo "OK   $1" ;;
-              skipped) echo "SKIP $1 (an upstream stage failed — see its job)"; BAD=1 ;;
+              skipped) echo "SKIP $1 (did not run — see its job)";              BAD=1 ;;
               "")      echo "FAIL $1 result is unreadable — failing closed";    BAD=1 ;;
               *)       echo "FAIL $1 ($2)";                                     BAD=1 ;;
             esac

@@ -28,6 +28,26 @@ import (
 // it does not record what they decided or why, and it drifts out of sight.
 const failOpenMarker = "guard:fail-open"
 
+// fleetManagedFiles are files this repository does not own and cannot annotate,
+// so the fail-open scanner does not read them.
+//
+// automerge.yml is deployed into every repository byte-for-byte from the
+// company template by infra/gitea/scripts/deploy-gitea-workflows.sh, which
+// checks that each copy is identical. A `# guard:fail-open` line added here
+// would be overwritten on the next deploy, or would fail that check. This repo
+// cannot make the change, and a scanner that keeps main red over it fails every
+// PR. Its exit-swallows are reviewed where the file is written, in the company
+// repository (automatethethings software/templates/github-actions). Measured
+// 2026-10-05: automerge v7 line 616, `read ... < <(...; echo) || true`, turned
+// main's Lint red (#78).
+//
+// The match is on the exact path. Every other workflow, script and Makefile in
+// this repository, including any other file under .github/workflows/, is still
+// scanned.
+var fleetManagedFiles = map[string]struct{}{
+	".github/workflows/automerge.yml": {},
+}
+
 // failOpenPatterns are the shell constructions that turn a failed command into
 // a successful one.
 var failOpenPatterns = []string{"|| true", "||true", "|| :", "||:"}
@@ -64,6 +84,9 @@ func FailOpenShell() Scanner {
 		What: "a swallowed exit status makes a failing command look like a clean one",
 		Scan: func(root string) (Result, error) {
 			files, err := walk(root, func(rel string) bool {
+				if _, managed := fleetManagedFiles[rel]; managed {
+					return false
+				}
 				return hasExt(rel, ".sh", ".yml", ".yaml") ||
 					rel == "Makefile" || strings.HasSuffix(rel, "/Makefile")
 			})
