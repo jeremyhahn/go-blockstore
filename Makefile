@@ -108,20 +108,20 @@ TRIVY_VERSION := $(shell awk '{for(i=1;i<=NF;i++){n++;v=$$i}} END{if(n==1)print 
 # security` and `make lint` the contract CI mirrors, so a developer's tools and
 # CI's tools must not be different builds.
 #
-# golangci-lint was pinned at v2.12.2 here and in CI. That pin is not survivable
-# past the 1.27 wave: golangci-lint refuses to load a config when the Go it was
-# BUILT with is older than the module's target, and `go install` builds it with
-# whatever Go is on the developer's box. v2.13.2 is what the image ships, built
-# against the portfolio maximum. A developer left on v2.12.2 gets no local lint
-# signal at all on a 1.27 module — it fails to start rather than degrading —
-# while CI stays green, which is how a misspell shipped twice in go-enclave.
+# golangci-lint must not lag the image. golangci-lint refuses to load a config
+# when the Go it was BUILT with is older than the module's target, and `go
+# install` builds it with whatever Go is on the developer's box. v2.14.0 is what
+# the image ships, built against the portfolio maximum. A developer left on an
+# older build gets no local lint signal at all on a 1.27 module — it fails to
+# start rather than degrading — while CI stays green, which is how a misspell
+# shipped twice in go-enclave. Pins track the upstream latest, never below it.
 #
 # The rest were `@latest`, which made scans unreproducible: the same commit gets
 # a different analyser on a different day (go-luks2 #21).
-GOLANGCI_LINT_VERSION := v2.13.2
+GOLANGCI_LINT_VERSION := v2.14.0
 GOSEC_VERSION         := v2.29.0
-GOVULNCHECK_VERSION   := v1.7.0
-ACTIONLINT_VERSION    := v1.7.7
+GOVULNCHECK_VERSION   := v1.8.0
+ACTIONLINT_VERSION    := v1.7.12
 
 RESET := \033[0m
 BOLD := \033[1m
@@ -610,7 +610,7 @@ install-tools:
 	@# TRIVY_VERSION above resolves to empty on a malformed .trivy-version (embedded
 	@# whitespace or multiple tokens); without this guard install-trivy.sh would
 	@# then fall back to reading the file ITSELF with `tr -d`, scrub `0.74 .0` to
-	@# `0.74.0` and install that — the exact normalize-not-verify hole the read was
+	@# `0.75.0` and install that — the exact normalize-not-verify hole the read was
 	@# hardened to close, reopened one layer down. Failing here keeps the parsed
 	@# value the single source and never lets the scrubbing fallback run.
 	@test -n "$(TRIVY_VERSION)" || { echo "$(RED)✗ .trivy-version is malformed (empty, whitespace, or multi-token) — refusing to install a scrubbed guess$(RESET)"; exit 1; }

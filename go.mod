@@ -1,6 +1,6 @@
 module github.com/jeremyhahn/go-blockstore
 
-go 1.27.0
+go 1.27.1
 
 require (
 	github.com/jeremyhahn/go-enclave v0.6.0-alpha

@@ -47,7 +47,7 @@ set -eu
 
 # The pinned version. Its per-artifact SHA-256 lives in the checksum table
 # below; the two move together, in one reviewed commit, or not at all.
-PINNED_VERSION=0.10.0
+PINNED_VERSION=0.11.0
 
 INSTALL_DIR=${1:-}
 if [ -z "${INSTALL_DIR}" ]; then
@@ -65,7 +65,7 @@ fi
 # download URL and an artifact name, and a pinned installer that will fetch
 # whatever it is handed is not pinned.
 if ! printf '%s' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-	echo "error: shellcheck version '${VERSION}' is not a bare semver (expected e.g. 0.10.0)" >&2
+	echo "error: shellcheck version '${VERSION}' is not a bare semver (expected e.g. 0.11.0)" >&2
 	exit 1
 fi
 
@@ -107,12 +107,12 @@ esac
 EXPECTED_SHA256=
 EXPECTED_BIN_SHA256=
 case "${VERSION}:${ARTIFACT}" in
-	"0.10.0:shellcheck-v0.10.0.linux.x86_64.tar.xz")
-		EXPECTED_SHA256=6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
-		EXPECTED_BIN_SHA256=f35ae15a4677945428bdfe61ccc297490d89dd1e544cc06317102637638c6deb ;;
-	"0.10.0:shellcheck-v0.10.0.linux.aarch64.tar.xz")
-		EXPECTED_SHA256=324a7e89de8fa2aed0d0c28f3dab59cf84c6d74264022c00c22af665ed1a09bb
-		EXPECTED_BIN_SHA256=4111c09318d10b93653a42179381273f31061b34987978346fbd19a6e81a74c3 ;;
+	"0.11.0:shellcheck-v0.11.0.linux.x86_64.tar.xz")
+		EXPECTED_SHA256=8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+		EXPECTED_BIN_SHA256=4da528ddb3a4d1b7b24a59d4e16eb2f5fd960f4bd9a3708a15baddbdf1d5a55b ;;
+	"0.11.0:shellcheck-v0.11.0.linux.aarch64.tar.xz")
+		EXPECTED_SHA256=12b331c1d2db6b9eb13cfca64306b1b157a86eb69db83023e261eaa7e7c14588
+		EXPECTED_BIN_SHA256=127f13925eadd52c341bca0ebaf9ab0dbd78c6468f30a8f262a528bf8de47546 ;;
 	*)
 		echo "error: no pinned SHA-256 for ${ARTIFACT} at version ${VERSION}" >&2
 		echo "       Add it to the checksum table in $0 in the same commit that bumps the version." >&2
@@ -122,7 +122,7 @@ esac
 
 # Already the pinned binary? Skip — but decide that by HASHING the on-disk file,
 # never by its self-reported --version. A `--version` string is output the
-# binary chooses to print: a corrupted or planted `shellcheck` can claim 0.10.0
+# binary chooses to print: a corrupted or planted `shellcheck` can claim 0.11.0
 # and this fast path would then bless it and exit 0, having verified nothing.
 # The trust anchor is EXPECTED_BIN_SHA256 (the reviewed artifact's extracted
 # bytes). If the file on disk hashes to it, it IS the pinned binary and there is

@@ -47,15 +47,15 @@ permissions:
 
 env:
   # CUSTOMIZE (go-blockstore, #68): equal to the `go` directive in go.mod.
-  # go-enclave v0.5.0-alpha raised its module floor to 1.27.0, and a module
-  # cannot pin a dependency whose floor is above its own, so adopting it moved
-  # this repo to 1.27 with it. The template's "1.27.0 is BLOCKED —
-  # cockroachdb/swiss" ruling (2026-08-20, task #121) does not apply here: that
-  # module is not in this repo's graph (`go list -m all` measured 2026-09-17),
-  # and the ci-runner image already seeds go1.27.0 into the toolcache and bakes
-  # golangci-lint v2.13.2 built with go1.27.0 (see the lint job below). The
-  # Makefile reads the same number from go.mod for `make test-container`.
-  GO_VERSION: "1.27.0"
+  # go-enclave raised its module floor to 1.27, and a module cannot pin a
+  # dependency whose floor is above its own, so adopting it moved this repo to
+  # 1.27 with it. The template's "cockroachdb/swiss" block on 1.27 (2026-08-20,
+  # task #121) does not apply here: that module is not in this repo's graph
+  # (`go list -m all` measured 2026-09-17), and the ci-runner image seeds
+  # go1.27.1 into the toolcache and bakes golangci-lint v2.14.0 built with
+  # go1.27.1 (see the lint job below). The Makefile reads the same number from
+  # go.mod for `make test-container`.
+  GO_VERSION: "1.27.1"
   COVERAGE_THRESHOLD: 90      # CUSTOMIZE: per testing-guidelines.md. The tree is at 100% today
 
   # CUSTOMIZE (go-blockstore): the build tags every go invocation below
@@ -125,7 +125,7 @@ jobs:
       #
       # `runs-on: ubuntu-latest` resolves to jeremyhahn/ci-runner on every Gitea
       # runner host, and that image BAKES golangci-lint at /usr/local/bin. The
-      # step this replaces ran `go install ...@v2.12.2` unconditionally, so the
+      # step this replaces ran `go install ...@<old pin>` unconditionally, so the
       # baked binary was overwritten on every single run by an older one built
       # with whatever Go setup-go had just provisioned.
       #
@@ -133,7 +133,7 @@ jobs:
       # when the Go it was BUILT with is older than the module's target:
       #
       #   can't load config: the Go language version (go1.26) used to build
-      #   golangci-lint is lower than the targeted Go version (1.27.0)
+      #   golangci-lint is lower than the targeted Go version (1.27.1)
       #
       # A `go install` here is always built with GO_VERSION, so on the day this
       # repo's `go` directive moves to 1.27 the install path can never satisfy
@@ -144,8 +144,8 @@ jobs:
       # bump a fleet-wide red gate until each repo edits this line; requiring a
       # minimum lets the image move ahead while a STALE image (or a fallback
       # install that resolved something older) still fails loudly. Measured
-      # 2026-09-03 on this tree at v2.13.2 built with go1.27.0: 0 issues, and
-      # none of the v2.13.0 Go-1.26 panic recorded in the note this replaces.
+      # Measured 2026-10-07 on this tree at v2.14.0 built with go1.27.1: 0
+      # issues, and none of the Go-1.26 panic recorded in the note this replaces.
       #
       # The install is the ABSENT case only — the GitHub mirror's hosted
       # runners bake nothing. It is pinned to the floor rather than @latest so
@@ -153,7 +153,7 @@ jobs:
       # no path can end with a tool below it.
       - name: Provide golangci-lint
         env:
-          GOLANGCI_LINT_MIN: "2.13.2"    # keep in step with ci-runner/Dockerfile
+          GOLANGCI_LINT_MIN: "2.14.0"    # keep in step with ci-runner/Dockerfile
         run: |
           set -eu
           if command -v golangci-lint > /dev/null 2>&1; then
@@ -182,7 +182,7 @@ jobs:
             echo "ci-runner tool manifest:"; cat /etc/ci-runner-tools.txt
           fi
 
-          # `--version` prints "...has version 2.13.2 built with go1.27.0...";
+          # `--version` prints "...has version 2.14.0 built with go1.27.1...";
           # head -1 of the semver matches takes the TOOL's version, not the Go
           # one that follows it.
           GOT=$(golangci-lint --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
@@ -412,7 +412,7 @@ jobs:
 
       # Prefer the baked binary (#30), same reasoning as gosec above. Unlike
       # gosec, govulncheck DOES report its own version truthfully whichever way
-      # it was built ("Scanner: govulncheck@v1.7.0"), so the floor is checkable.
+      # it was built ("Scanner: govulncheck@v1.8.0"), so the floor is checkable.
       - name: Provide govulncheck
         env:
           GOVULNCHECK_MIN: "1.7.0"      # keep in step with ci-runner/Dockerfile
@@ -431,7 +431,7 @@ jobs:
           fi
           # The whole preamble goes in the log; the version is then read by
           # ANCHORING ON "govulncheck@v" rather than matching a bare semver.
-          # Line 1 is "Go: go1.27.0" — the Go the SCAN runs under — and a bare
+          # Line 1 is "Go: go1.27.1" — the Go the SCAN runs under — and a bare
           # semver match would take that instead of the scanner's version.
           govulncheck -version 2>&1 | head -4
           GOT=$(govulncheck -version 2>&1 | sed -n 's/.*govulncheck@v\([0-9.]*\).*/\1/p' | head -1)

@@ -37,7 +37,7 @@ permissions:
 # the fips job, which resolves to empty and hands setup-go no version. Declared
 # here; keep it equal to GO_VERSION in ci.yml.
 env:
-  GO_VERSION: "1.27.0"
+  GO_VERSION: "1.27.1"
   BUILD_TAGS: ''
 
 jobs:
@@ -97,7 +97,7 @@ jobs:
         id: trivy_version
         # Read as ONE bare token and FAIL if the file is malformed, matching the
         # Makefile's parser (and install-trivy.sh). The old `tr -d ' \t\n\r'`
-        # scrubbed all whitespace, so `0.74 .0` normalised to `0.74.0` and fed
+        # scrubbed all whitespace, so `0.75 .0` normalised to `0.75.0` and fed
         # the trivy-action `version:` inputs below a version nobody pinned — CI
         # would not catch what `make install-tools` now refuses. awk emits the
         # value only when the file holds exactly one token; otherwise this step

@@ -73,7 +73,7 @@ fi
 # download URL, and a pinned installer that will fetch whatever it is handed is
 # not pinned.
 if ! printf '%s' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-	echo "error: trivy version '${VERSION}' is not a bare semver (expected e.g. 0.74.0)" >&2
+	echo "error: trivy version '${VERSION}' is not a bare semver (expected e.g. 0.75.0)" >&2
 	exit 1
 fi
 
