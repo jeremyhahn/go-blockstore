@@ -21,7 +21,7 @@ func (vault) WithBytes(fn func([]byte) error) error { return fn(nil) }
 
 // backend has the seam's method NAMES and is not luks.Backend. Its parameter
 // is called buf rather than key on purpose: an exported method in this package
-// taking `key []byte` WOULD be a rule-5 finding, and rightly, because it is
+// taking `key []byte` WOULD be a rule-4 finding, and rightly, because it is
 // not the seam.
 type backend struct{}
 
@@ -67,7 +67,7 @@ func fixtureEnclaveQueries(enc *enclave.MemoryEnclave) bool {
 // use stands in for go-luks2: a callee the key is handed straight to.
 func use(key []byte) error { return nil }
 
-// fixtureArgumentOnly uses a borrowed key in every position rule 4 allows:
+// fixtureArgumentOnly uses a borrowed key in every position rule 3 allows:
 // straight into a call, into len, and inside a closure that declares key as
 // its OWN parameter.
 func fixtureArgumentOnly(ctx context.Context, key []byte) error {
@@ -87,6 +87,21 @@ func fixtureImmediateClosure(key []byte) error {
 	return func() error { return use(key) }()
 }
 
+// options mirrors a library's options struct: a borrowed key may sit in a
+// composite literal when the literal is itself the call's argument — it is
+// built for the call and passed with it, and outlives it no more than a bare
+// argument would.
+type options struct {
+	Device     string
+	Passphrase []byte
+}
+
+func format(options) error { return nil }
+
+func fixtureLiteralArgument(device string, key []byte) error {
+	return format(options{Device: device, Passphrase: key})
+}
+
 // A []byte that is not called key or passphrase is not a borrowed key, and a
 // string called key is a map key, not material.
 func fixtureOtherNames(buf []byte, key string) []byte {
@@ -96,7 +111,7 @@ func fixtureOtherNames(buf []byte, key string) []byte {
 }
 
 // Exported signatures whose parameter names carry a material WORD but name a
-// path, a file or an identifier — the refinement rule 5 makes, so that the
+// path, a file or an identifier — the refinement rule 4 makes, so that the
 // scanner fires on material and not on the name of the file holding it.
 func WithKeyFile(keyPath string) error         { return nil }
 func WithLUKSKeyFile(luksKeyFile string) error { return nil }
@@ -112,7 +127,7 @@ func Lookup(ctx context.Context, key string) ([]byte, error)    { return nil, ni
 func Store(ctx context.Context, key string, value []byte) error { return nil }
 func Unlock(ctx context.Context, keys []string)                 { _ = keys }
 
-// unexported, so not a package boundary: rule 5 is about what crosses one.
+// unexported, so not a package boundary: rule 4 is about what crosses one.
 func unlock(key string, passphrase []byte) error { return nil }
 
 // Enclaves cross the boundary, not bytes — that is the model, and it must

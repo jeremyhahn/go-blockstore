@@ -32,6 +32,7 @@ package luks
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jeremyhahn/go-enclave"
@@ -42,8 +43,8 @@ const FSType = "crypto_LUKS"
 
 // The LUKS2 parameters every container created through this package is
 // formatted with. They are pinned rather than left to the library because
-// go-luks2's defaults are not FIPS-approved: FormatOptions with an empty KDFType
-// formats with argon2id, and an empty HashAlgo derives with SHA-256.
+// go-luks2's defaults are not FIPS-approved: a FormatParams with a zero KDF.Type
+// formats with argon2id outside FIPS mode, and a zero Hash derives with SHA-256.
 const (
 	// pbkdf is PBKDF2, the only key-derivation function among go-luks2's
 	// choices that is FIPS-approved. Argon2id, its default, is not — and cannot
@@ -204,33 +205,40 @@ func (m *Manager) key(ctx context.Context, volID string) (*enclave.MemoryEnclave
 		return nil, fmt.Errorf("%s: obtaining key for %q: %w", m.errScope, volID, LockedMemoryError(m.errScope, err))
 	}
 	if enc == nil || !enc.IsAlive() || enc.Size() == 0 {
-		if enc != nil {
-			enc.Destroy()
+		refusal := fmt.Errorf("%s: KeyProvider returned no usable key for %q", m.errScope, volID)
+		if destroyErr := enc.Destroy(); destroyErr != nil {
+			return nil, errors.Join(refusal, fmt.Errorf("%s: releasing it: %w", m.errScope, destroyErr))
 		}
-		return nil, fmt.Errorf("%s: KeyProvider returned no usable key for %q", m.errScope, volID)
+		return nil, refusal
 	}
 	return enc, nil
 }
 
-// withKey borrows the volume's passphrase for exactly one LUKS operation.
+// withKey lends the volume's passphrase to exactly one LUKS operation.
 //
-// The borrow window is this function and nothing else: the passphrase becomes a
-// []byte when WithBytes hands one over, is passed to op, and stops being one
-// when the callback returns. The enclave is destroyed on the way out whatever
-// happened, so a failed operation does not leave locked pages holding a key
-// behind.
+// The passphrase never becomes a []byte in this package: it stays in its
+// enclave, is passed to op, and is destroyed on the way out whatever happened,
+// so a failed operation does not leave locked pages holding a key behind. The
+// only code that reads the bytes is go-luks2, inside its own borrow, for the
+// length of one derivation.
 //
-// op MUST NOT retain the slice. Every implementation of Backend is bound by the
-// same rule, and the native one keeps to it by handing the bytes straight to
-// go-luks2, which derives from them and holds nothing.
-func (m *Manager) withKey(ctx context.Context, volID string, op func(key []byte) error) error {
+// op MUST NOT destroy or retain the enclave. Every implementation of Backend is
+// bound by the same rule, and the native one keeps to it by handing the enclave
+// straight to go-luks2, which derives from it and holds nothing.
+func (m *Manager) withKey(ctx context.Context, volID string, op func(key *enclave.MemoryEnclave) error) error {
 	enc, err := m.key(ctx, volID)
 	if err != nil {
 		return err
 	}
-	defer enc.Destroy()
 
-	return enc.WithBytes(op)
+	opErr := op(enc)
+	if destroyErr := enc.Destroy(); destroyErr != nil {
+		// A release the kernel refused leaves locked pages behind. It is reported
+		// even when the operation failed too: the two are independent failures
+		// and neither explains the other.
+		return errors.Join(opErr, fmt.Errorf("releasing the key for %q: %w", volID, destroyErr))
+	}
+	return opErr
 }
 
 // Format writes a LUKS2 header onto the device.
@@ -263,10 +271,10 @@ func (m *Manager) withKey(ctx context.Context, volID string, op func(key []byte)
 // The passphrase never leaves the process. It was written to a cryptsetup
 // child's standard input before 2026-08-29 — never as an argument, which any
 // process on the host could have read out of /proc/<pid>/cmdline — and now it
-// is borrowed out of locked memory for one function call and no file descriptor
-// at all.
+// stays in its enclave and is lent to go-luks2, which borrows it for the
+// derivation, with no file descriptor at all.
 func (m *Manager) Format(ctx context.Context, volID, device string) error {
-	err := m.withKey(ctx, volID, func(key []byte) error {
+	err := m.withKey(ctx, volID, func(key *enclave.MemoryEnclave) error {
 		return m.backend.Format(ctx, device, key)
 	})
 	if err != nil {
@@ -277,7 +285,7 @@ func (m *Manager) Format(ctx context.Context, volID, device string) error {
 
 // Open unlocks the container and exposes its plaintext mapping.
 func (m *Manager) Open(ctx context.Context, volID, device string) error {
-	err := m.withKey(ctx, volID, func(key []byte) error {
+	err := m.withKey(ctx, volID, func(key *enclave.MemoryEnclave) error {
 		return m.backend.Open(ctx, device, m.MappingName(volID), key)
 	})
 	if err != nil {
@@ -302,7 +310,7 @@ func (m *Manager) Close(ctx context.Context, volID string) error {
 // establish that the volume it is about to produce will be openable before it
 // creates anything, rather than after it has copied the image.
 func (m *Manager) TestPassphrase(ctx context.Context, volID, device string) error {
-	return m.withKey(ctx, volID, func(key []byte) error {
+	return m.withKey(ctx, volID, func(key *enclave.MemoryEnclave) error {
 		return m.backend.TestKey(ctx, device, key)
 	})
 }

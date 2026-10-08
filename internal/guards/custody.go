@@ -30,12 +30,12 @@ import (
 	"unicode"
 )
 
-// enclavePackage is where the locked-memory primitive lives. Rules 1 and 2 are
-// stated against ITS MemoryEnclave and no other type, which is the whole reason
-// this scanner resolves types rather than matching names.
+// enclavePackage is where the locked-memory primitive lives. Rule 1 is stated
+// against ITS MemoryEnclave and no other type, which is the whole reason this
+// scanner resolves types rather than matching names.
 const enclavePackage = "github.com/jeremyhahn/go-enclave"
 
-// enclaveType is the type whose methods rules 1 and 2 are about.
+// enclaveType is the type whose methods rule 1 is about.
 const enclaveType = "MemoryEnclave"
 
 // luksDir is the package that owns the custody model, as a directory relative
@@ -44,25 +44,16 @@ const enclaveType = "MemoryEnclave"
 // the fixtures reproduce the layout to be scanned by the same rule.
 const luksDir = "internal/luks"
 
-// backendType is the sanctioned seam: the interface whose key-taking methods
-// are the ONE place a passphrase is allowed to cross a package boundary as a
-// []byte, and only into the package that owns the borrow.
+// backendType is the interface whose key-taking methods receive the passphrase
+// enclave. Only internal/luks may call them, because only internal/luks owns
+// the enclave's lifetime.
 const backendType = "Backend"
-
-// copyingExits are the MemoryEnclave methods that hand back a copy of the
-// contents on the ordinary heap. Nothing here may call them: a copy the
-// collector may move and the kernel may swap is exactly what the enclave
-// exists to prevent, and there is no wiping it afterwards.
-var copyingExits = map[string]struct{}{
-	"Open":       {},
-	"OpenString": {},
-}
 
 // borrowMethod is the one MemoryEnclave method that exposes the contents at
 // all, as a []byte scoped to a callback.
 const borrowMethod = "WithBytes"
 
-// keyTakingMethods are the Backend methods that receive the borrowed key.
+// keyTakingMethods are the Backend methods that receive the passphrase enclave.
 // Close, DataOffset, Mapping and Identity take no key and are not here.
 var keyTakingMethods = map[string]struct{}{
 	"Format":  {},
@@ -70,10 +61,10 @@ var keyTakingMethods = map[string]struct{}{
 	"TestKey": {},
 }
 
-// borrowedKeyNames are the parameter names rule 4 treats as a borrowed key
+// borrowedKeyNames are the parameter names rule 3 treats as a borrowed key
 // when the parameter's type is []byte. They are the names the custody model
-// uses — Backend's methods and withKey's callback say `key`, the documentation
-// says `passphrase` — and the rule is stated on the name rather than on every
+// uses — a WithBytes callback says `key`, the documentation says `passphrase`
+// — and the rule is stated on the name rather than on every
 // []byte because a []byte called buf that a provider fills from a descriptor
 // is not a borrowed key and has different rules.
 var borrowedKeyNames = map[string]struct{}{
@@ -82,8 +73,8 @@ var borrowedKeyNames = map[string]struct{}{
 }
 
 // materialWords are the words that, as the LAST word of a parameter or result
-// name, say the value IS the material rather than something about it. See
-// isMaterialName for the boundary rule and why it is the last word.
+// name (rule 4), say the value IS the material rather than something about
+// it. See isMaterialName for the boundary rule and why it is the last word.
 var materialWords = map[string]struct{}{
 	"key":        {},
 	"passphrase": {},
@@ -110,7 +101,7 @@ type borrowWindow struct {
 	Dir string
 
 	// Func is the top-level function, in the form go doc uses: FileKeyProvider,
-	// (*Manager).withKey, Native.Format. A closure inside one of these counts
+	// (*Provider).writeSharedSecret. A closure inside one of these counts
 	// as being in it — the providers do their borrows inside the closure they
 	// return, and a closure is not a place a rule can be stated on.
 	Func string
@@ -131,17 +122,18 @@ type borrowWindow struct {
 // so the place to add one is here, with its reason beside the others, where
 // the reviewer of a change to the model sees the model.
 //
-// The first entry is the anchor. The LUKS passphrase has exactly one read-out
-// window — the place its bytes are handed to code outside this table — and it
-// is (*Manager).withKey. The two providers below it BUILD enclaves: a fill
-// borrow writes a descriptor's bytes into locked pages, a clone borrow copies
-// locked pages into locked pages, and in neither does the material reach
-// anything but the enclave. pkg/drbd's two entries are the same two shapes for
-// the replication shared secret, which is a separate secret with the same
-// custody: read from a file into locked pages, then written from inside the
-// borrow straight to the resource file's descriptor.
+// The first entry is the anchor. The LUKS passphrase has NO read-out window:
+// it is lent to the Backend as an enclave and go-luks2 borrows it itself, so
+// (*Manager).withKey is deliberately not in this table and a WithBytes call in
+// it is a finding. The one place the passphrase's bytes enter the model is
+// FileKeyProvider, which fills locked pages from the key file's descriptor,
+// and that is the anchor. The other provider builds an enclave too, by a clone
+// borrow that copies locked pages into locked pages, and in neither does the
+// material reach anything but the enclave. pkg/drbd's two entries are the same
+// two shapes for the replication shared secret, which is a separate secret with
+// the same custody: read from a file into locked pages, then written from inside
+// the borrow straight to the resource file's descriptor.
 var borrowWindows = []borrowWindow{
-	{luksDir, "(*Manager).withKey", "the one read-out window: the LUKS passphrase is handed to Backend for one call"},
 	{luksDir, "FileKeyProvider", "a fill borrow: the key file's bytes go from the descriptor into locked pages"},
 	{luksDir, "StaticKeyProvider", "a clone borrow: locked pages are copied into a fresh enclave's locked pages"},
 	{"pkg/drbd", "FileSecretProvider", "a fill borrow: the replication secret file's bytes go into locked pages"},
@@ -184,12 +176,12 @@ var custodyBuildConfigs = []struct {
 //
 // A LUKS passphrase in this repository is never a plain []byte or string at
 // rest. A KeyProvider returns it as a go-enclave MemoryEnclave — mlock'd,
-// guarded, kept out of core dumps, wiped on release — and it becomes bytes in
-// exactly one place: internal/luks.(*Manager).withKey borrows it with
-// WithBytes for the length of one Backend call, and the Backend hands it
-// straight to go-luks2 and holds nothing. pkg/local and pkg/drbd call the
-// Manager and never see the key. The reason the enclave rather than a wiped
-// slice is the primitive is stated on internal/luks.KeyProvider: a []byte
+// guarded, kept out of core dumps, wiped on release — and it never becomes
+// bytes in this repository's own code at all: internal/luks.(*Manager).withKey
+// lends the enclave to one Backend call and destroys it, and the Backend hands
+// it straight to go-luks2, which does its own borrowing. pkg/local and pkg/drbd
+// call the Manager and never see the key. The reason the enclave rather than a
+// wiped slice is the primitive is stated on internal/luks.KeyProvider: a []byte
 // cannot be taken back, because the collector may already have copied it.
 //
 // Every word of that is a convention a future change can break without any
@@ -202,52 +194,51 @@ var custodyBuildConfigs = []struct {
 //
 // # The rules, and why each is shaped as it is
 //
-//  1. No copying exit from the enclave. A call to MemoryEnclave.Open or
-//     OpenString — or a method value of either, which is a deferred call —
-//     is a finding. They return a heap copy the enclave cannot wipe, so a
-//     single call anywhere undoes the guarantee for that key.
+// There is no rule against the enclave's copying exits. go-enclave v0.8.0
+// removed MemoryEnclave.Open and OpenString, so a call to either no longer
+// type-checks and the compiler states that rule better than a scanner could.
 //
-//  2. Exactly one read-out borrow window, and every borrow in a named place.
-//     MemoryEnclave.WithBytes may be called only from the functions in
-//     borrowWindows; anything else is a finding. The tree has five sites today
-//     and the table says what each one does, because "only from withKey" —
-//     the rule as first stated — was not true of the tree: the providers fill
-//     and clone enclaves with the same method, and pkg/drbd's replication
-//     secret has its own read-out window. The anchor is withKey: if the tree
-//     borrows from enclaves at all, withKey must exist and contain exactly one
-//     WithBytes, or the scan reports that it has lost its anchor — a scanner
-//     that would keep passing after the window it is anchored on was removed
-//     would be passing vacuously.
+//  1. Every borrow in a named place. MemoryEnclave.WithBytes may be called only
+//     from the functions in borrowWindows; anything else is a finding, and
+//     (*Manager).withKey in particular is not in the table, so the passphrase
+//     is not read out where it is lent. The tree has four sites today and the
+//     table says what each one does: the providers fill and clone enclaves with
+//     the method, and pkg/drbd's replication secret has its own read-out
+//     window. The anchor is FileKeyProvider: if the tree borrows from enclaves
+//     at all, it must exist and contain exactly one WithBytes, or the scan
+//     reports that it has lost its anchor — a scanner that would keep passing
+//     after the window it is anchored on was removed would be passing
+//     vacuously.
 //
-//  3. The key-taking Backend methods are called only from internal/luks. A
+//  2. The key-taking Backend methods are called only from internal/luks. A
 //     call to Format, Open or TestKey whose receiver's static type is
 //     internal/luks.Backend from any other package is a finding, whatever the
 //     receiver is called and whether it arrived by alias or embedding. Those
-//     three methods are where a []byte key exists, and the only code that may
-//     hold one is the code that owns the borrow.
+//     three methods are where the passphrase enclave is handed over, and the
+//     only code that may do so is the code that owns its lifetime: Manager
+//     takes a fresh enclave from the KeyProvider for each call and destroys it
+//     after, and a caller outside the package would be lending one it does not
+//     own.
 //
-//  4. A borrowed key is argument-only. In every function or closure with a
+//  3. A borrowed key is argument-only. In every function or closure with a
 //     []byte parameter named key or passphrase, that parameter may appear ONLY
 //     as a direct argument of a call — not on the right of an assignment or
 //     define, not in a slice expression, not captured by a closure that is not
 //     invoked on the spot, and not as an argument of append, copy or a type
-//     conversion, which are calls that copy. One refinement, learned from the
-//     tree: the native backend hands the key to go-luks2 inside
-//     luks2.FormatOptions{Passphrase: key}, so a composite literal is allowed
-//     when the literal is itself a direct argument of the call — it is built
-//     for the call and passed with it, and outlives it no more than a bare
-//     argument would. This is what makes "must not retain it" a property the
-//     build checks. It is a rule on the NAME because a []byte called buf that
-//     a provider fills from a descriptor is not a borrowed key; len(key) is
-//     the sanctioned way to inspect one.
+//     conversion, which are calls that copy. One refinement: a composite
+//     literal is allowed when the literal is itself a direct argument of the
+//     call — it is built for the call and passed with it, and outlives it no
+//     more than a bare argument would. This is what makes "must not retain
+//     it" a property the build checks. It is a rule on the NAME because a
+//     []byte called buf that a provider fills from a descriptor is not a
+//     borrowed key; len(key) is the sanctioned way to inspect one.
 //
-//  5. Key-material-shaped values do not cross a package boundary in the clear.
+//  4. Key-material-shaped values do not cross a package boundary in the clear.
 //     An exported function, method, interface method or func type whose
 //     parameter or named result is a string or []byte with a name ending in
-//     key, passphrase, secret, password or token is a finding — except the
-//     three key-taking methods of internal/luks.Backend, which are the seam
-//     and are named as such above. The match is on the LAST word of the name,
-//     split at case and underscore boundaries: keyPath, luksKeyFile, tokenID,
+//     key, passphrase, secret, password or token is a finding. The Backend
+//     seam is not an exception: it carries an enclave, not bytes. The match is
+//     on the LAST word of the name, split at case and underscore boundaries: keyPath, luksKeyFile, tokenID,
 //     secretName and passwordHash name a location, an identifier or a
 //     derivation, not the material, and they are what this tree's exported
 //     surface actually carries. keyBytes and secretData are still material and
@@ -275,11 +266,11 @@ var custodyBuildConfigs = []struct {
 // pass, because incomplete type information is exactly what would let a rule
 // keyed on types miss its target.
 //
-// What that leaves uncovered, stated rather than implied: rule 4 permits any
+// What that leaves uncovered, stated rather than implied: rule 3 permits any
 // ordinary call, so a callee that copies its argument — slices.Clone, or a
-// function of this repository's own — is a copy the rule does not see; rule 5
+// function of this repository's own — is a copy the rule does not see; rule 4
 // looks at parameters and results, not at exported struct fields; and a []byte
-// key under a name other than key or passphrase is outside rule 4. Each is a
+// key under a name other than key or passphrase is outside rule 3. Each is a
 // gap a reviewer reads for, and each is narrower than what the rules close.
 func KeyMaterialCustody() Scanner {
 	return Scanner{
@@ -448,8 +439,8 @@ func scanCustody(root string) (Result, custodyEvidence, error) {
 		result.Findings = append(result.Findings, findings[key])
 	}
 
-	// The anchor. If anything in the tree borrows from an enclave, the LUKS
-	// window must be there and must be the one place it borrows.
+	// The anchor. If anything in the tree borrows from an enclave, the key
+	// file's fill window must be there and must borrow exactly once.
 	if anchor.borrowsSeen > 0 {
 		switch {
 		case anchor.declLine == 0:
@@ -458,7 +449,7 @@ func scanCustody(root string) (Result, custodyEvidence, error) {
 		case anchor.count != 1:
 			result.Findings = append(result.Findings, Finding{
 				File: anchor.declFile, Line: anchor.declLine,
-				Message: fmt.Sprintf("%s calls %s.%s %d time(s); it is THE borrow window and must call it exactly once, so that the passphrase becomes a []byte in one place the reader can find. "+
+				Message: fmt.Sprintf("%s calls %s.%s %d time(s); it is the anchor window and must call it exactly once, so that the passphrase's bytes enter the model in one place the reader can find. "+
 					"If the window has moved, move the anchor in internal/guards/custody.go with it.",
 					anchorWindow.Func, enclaveType, borrowMethod, anchor.count),
 			})
@@ -572,7 +563,7 @@ func (p custodyPackage) line(pos token.Pos) int {
 	return p.fset.Position(pos).Line
 }
 
-// funcDecl applies rules 1–5 to one top-level function.
+// funcDecl applies rules 1–4 to one top-level function.
 func (p custodyPackage) funcDecl(rel string, decl *ast.FuncDecl) []Finding {
 	var findings []Finding
 	name := funcDeclName(decl)
@@ -584,7 +575,7 @@ func (p custodyPackage) funcDecl(rel string, decl *ast.FuncDecl) []Finding {
 	}
 
 	// Rule 5 on the declaration's own signature.
-	if decl.Name.IsExported() && !p.isSanctionedSeam(decl) {
+	if decl.Name.IsExported() {
 		findings = append(findings, p.clearTextSeam(rel, decl.Type, "func "+name)...)
 	}
 
@@ -592,7 +583,7 @@ func (p custodyPackage) funcDecl(rel string, decl *ast.FuncDecl) []Finding {
 		return findings
 	}
 
-	// Rules 1–3 on every selection in the body, and rule 2's bookkeeping.
+	// Rules 1 and 2 on every selection in the body, and rule 1's bookkeeping.
 	ast.Inspect(decl.Body, func(node ast.Node) bool {
 		sel, ok := node.(*ast.SelectorExpr)
 		if !ok {
@@ -625,7 +616,7 @@ func (p custodyPackage) funcDecl(rel string, decl *ast.FuncDecl) []Finding {
 	return findings
 }
 
-// methodUse applies rules 1–3 to one method selection, called or not.
+// methodUse applies rules 1 and 2 to one method selection, called or not.
 func (p custodyPackage) methodUse(rel string, sel *ast.SelectorExpr, fn *types.Func, recv *types.Named, enclosing string) []Finding {
 	recvPkg := ""
 	if recv.Obj().Pkg() != nil {
@@ -636,14 +627,6 @@ func (p custodyPackage) methodUse(rel string, sel *ast.SelectorExpr, fn *types.F
 
 	switch {
 	case recvPkg == enclavePackage && recv.Obj().Name() == enclaveType:
-		if _, copying := copyingExits[method]; copying {
-			return []Finding{{
-				File: rel, Line: line,
-				Message: fmt.Sprintf("%s.%s hands back a heap copy of the key material, which the enclave cannot wipe and the collector may move — a single call undoes the guarantee for that key. "+
-					"Borrow it instead: do the work inside a %s callback, or better, inside internal/luks.(*Manager).withKey, which is the one window the model allows.",
-					enclaveType, method, borrowMethod),
-			}}
-		}
 		if method != borrowMethod {
 			return nil
 		}
@@ -655,8 +638,8 @@ func (p custodyPackage) methodUse(rel string, sel *ast.SelectorExpr, fn *types.F
 		}
 		return []Finding{{
 			File: rel, Line: line,
-			Message: fmt.Sprintf("this calls luks.%s.%s, which takes the passphrase as a []byte, from outside %s. The only code allowed to hold a key as bytes is the code that owns the borrow: "+
-				"call the corresponding luks.Manager method instead, and let it borrow the key from the enclave for you.",
+			Message: fmt.Sprintf("this calls luks.%s.%s, which takes the passphrase enclave, from outside %s. Only the code that owns the enclave's lifetime may hand it over: "+
+				"call the corresponding luks.Manager method instead, and let it take a fresh enclave from the KeyProvider and destroy it for you.",
 				backendType, method, luksDir),
 		}}
 	}
@@ -699,7 +682,7 @@ func (p custodyPackage) borrow(rel string, sel *ast.SelectorExpr, enclosing stri
 	}}
 }
 
-// genDecl applies rule 5 to exported interface methods and func types.
+// genDecl applies rule 4 to exported interface methods and func types.
 func (p custodyPackage) genDecl(rel string, decl *ast.GenDecl) []Finding {
 	var findings []Finding
 	for _, spec := range decl.Specs {
@@ -709,13 +692,9 @@ func (p custodyPackage) genDecl(rel string, decl *ast.GenDecl) []Finding {
 		}
 		switch t := typeSpec.Type.(type) {
 		case *ast.InterfaceType:
-			sanctioned := p.dir == luksDir && typeSpec.Name.Name == backendType
 			for _, method := range t.Methods.List {
 				fnType, ok := method.Type.(*ast.FuncType)
 				if !ok || len(method.Names) == 0 || !method.Names[0].IsExported() {
-					continue
-				}
-				if _, keyTaking := keyTakingMethods[method.Names[0].Name]; sanctioned && keyTaking {
 					continue
 				}
 				findings = append(findings, p.clearTextSeam(rel, fnType, typeSpec.Name.Name+"."+method.Names[0].Name)...)
@@ -727,19 +706,7 @@ func (p custodyPackage) genDecl(rel string, decl *ast.GenDecl) []Finding {
 	return findings
 }
 
-// isSanctionedSeam reports whether a method declaration IMPLEMENTS one of the
-// key-taking Backend methods inside internal/luks — the native backend's
-// Format, Open and TestKey, which are the seam's other side and carry the same
-// []byte key.
-func (p custodyPackage) isSanctionedSeam(decl *ast.FuncDecl) bool {
-	if p.dir != luksDir || decl.Recv == nil {
-		return false
-	}
-	_, keyTaking := keyTakingMethods[decl.Name.Name]
-	return keyTaking
-}
-
-// clearTextSeam applies rule 5 to one signature.
+// clearTextSeam applies rule 4 to one signature.
 func (p custodyPackage) clearTextSeam(rel string, sig *ast.FuncType, what string) []Finding {
 	var findings []Finding
 	report := func(field *ast.Field, name *ast.Ident, role string) {
@@ -869,7 +836,7 @@ func splitWords(name string) []string {
 	return words
 }
 
-// borrowedKeys applies rule 4 to one function or closure: each []byte
+// borrowedKeys applies rule 3 to one function or closure: each []byte
 // parameter named key or passphrase may appear only as a direct call argument.
 func (p custodyPackage) borrowedKeys(rel string, sig *ast.FuncType, body *ast.BlockStmt) []Finding {
 	if body == nil {
@@ -932,7 +899,7 @@ func (p custodyPackage) borrowedKeys(rel string, sig *ast.FuncType, body *ast.Bl
 }
 
 // retains decides whether the identifier at the top of stack is in a position
-// rule 4 refuses, and says which. The stack runs from the function body down
+// rule 3 refuses, and says which. The stack runs from the function body down
 // to the identifier itself.
 func (p custodyPackage) retains(stack []ast.Node) string {
 	ident := stack[len(stack)-1]

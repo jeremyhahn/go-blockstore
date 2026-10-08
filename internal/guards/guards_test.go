@@ -85,38 +85,35 @@ var plantedViolations = map[string][]Finding{
 		{File: "deploy.yml", Line: 6}, // a workflow step passing it
 	},
 	"key-material-custody": {
-		// Rule 1: the two copying exits from the enclave.
-		{File: "pkg/other/custody_fixture.go", Line: 27}, // enc.Open()
-		{File: "pkg/other/custody_fixture.go", Line: 31}, // enc.OpenString()
-		// Rule 2: a borrow outside the window — in another package, and in
-		// internal/luks itself but not in withKey.
-		{File: "pkg/other/custody_fixture.go", Line: 37}, // enc.WithBytes from pkg/other
-		{File: "internal/luks/manager.go", Line: 39},     // enc.WithBytes from (*Manager).peek
-		// Rule 3: each key-taking Backend method, called from outside internal/luks.
-		{File: "pkg/other/custody_fixture.go", Line: 43}, // b.Format
-		{File: "pkg/other/custody_fixture.go", Line: 46}, // b.Open
-		{File: "pkg/other/custody_fixture.go", Line: 49}, // b.TestKey
-		// Rule 4: each position a borrowed key may not appear in.
-		{File: "pkg/other/custody_fixture.go", Line: 58}, // k := key
-		{File: "pkg/other/custody_fixture.go", Line: 63}, // holder{k: key} not passed to a call
-		{File: "pkg/other/custody_fixture.go", Line: 68}, // append(dst, key...)
-		{File: "pkg/other/custody_fixture.go", Line: 72}, // copy(dst, key)
-		{File: "pkg/other/custody_fixture.go", Line: 76}, // string(key)
-		{File: "pkg/other/custody_fixture.go", Line: 80}, // captured by a closure that is returned
-		{File: "pkg/other/custody_fixture.go", Line: 84}, // key[:4]
-		{File: "pkg/other/custody_fixture.go", Line: 88}, // p := passphrase
-		// Rule 5: each shape of an exported clear-text seam.
-		{File: "pkg/other/custody_fixture.go", Line: 95},  // key []byte parameter
-		{File: "pkg/other/custody_fixture.go", Line: 97},  // luksKey string: a qualified key is material even as a string
-		{File: "pkg/other/custody_fixture.go", Line: 99},  // passphrase []byte parameter
-		{File: "pkg/other/custody_fixture.go", Line: 101}, // secret
-		{File: "pkg/other/custody_fixture.go", Line: 103}, // password
-		{File: "pkg/other/custody_fixture.go", Line: 105}, // token
-		{File: "pkg/other/custody_fixture.go", Line: 107}, // a named result, rootPassword
-		{File: "pkg/other/custody_fixture.go", Line: 109}, // luksKeyBytes, the material-then-bytes shape
-		{File: "pkg/other/custody_fixture.go", Line: 112}, // an exported interface's method
-		{File: "pkg/other/custody_fixture.go", Line: 117}, // an exported method
-		{File: "pkg/other/custody_fixture.go", Line: 119}, // an exported func type
+		// Rule 1: a borrow outside the named windows — in another package, and
+		// in internal/luks itself but not in one of its providers.
+		{File: "pkg/other/custody_fixture.go", Line: 27}, // enc.WithBytes from pkg/other
+		{File: "internal/luks/manager.go", Line: 47},     // enc.WithBytes from (*Manager).peek
+		// Rule 2: each key-taking Backend method, called from outside internal/luks.
+		{File: "pkg/other/custody_fixture.go", Line: 33}, // b.Format
+		{File: "pkg/other/custody_fixture.go", Line: 36}, // b.Open
+		{File: "pkg/other/custody_fixture.go", Line: 39}, // b.TestKey
+		// Rule 3: each position a borrowed key may not appear in.
+		{File: "pkg/other/custody_fixture.go", Line: 48}, // k := key
+		{File: "pkg/other/custody_fixture.go", Line: 53}, // holder{k: key} not passed to a call
+		{File: "pkg/other/custody_fixture.go", Line: 58}, // append(dst, key...)
+		{File: "pkg/other/custody_fixture.go", Line: 62}, // copy(dst, key)
+		{File: "pkg/other/custody_fixture.go", Line: 66}, // string(key)
+		{File: "pkg/other/custody_fixture.go", Line: 70}, // captured by a closure that is returned
+		{File: "pkg/other/custody_fixture.go", Line: 74}, // key[:4]
+		{File: "pkg/other/custody_fixture.go", Line: 78}, // p := passphrase
+		// Rule 4: each shape of an exported clear-text seam.
+		{File: "pkg/other/custody_fixture.go", Line: 85},  // key []byte parameter
+		{File: "pkg/other/custody_fixture.go", Line: 87},  // luksKey string: a qualified key is material even as a string
+		{File: "pkg/other/custody_fixture.go", Line: 89},  // passphrase []byte parameter
+		{File: "pkg/other/custody_fixture.go", Line: 91},  // secret
+		{File: "pkg/other/custody_fixture.go", Line: 93},  // password
+		{File: "pkg/other/custody_fixture.go", Line: 95},  // token
+		{File: "pkg/other/custody_fixture.go", Line: 97},  // a named result, rootPassword
+		{File: "pkg/other/custody_fixture.go", Line: 99},  // luksKeyBytes, the material-then-bytes shape
+		{File: "pkg/other/custody_fixture.go", Line: 102}, // an exported interface's method
+		{File: "pkg/other/custody_fixture.go", Line: 107}, // an exported method
+		{File: "pkg/other/custody_fixture.go", Line: 109}, // an exported func type
 	},
 }
 

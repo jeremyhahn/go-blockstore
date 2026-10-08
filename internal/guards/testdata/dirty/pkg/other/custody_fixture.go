@@ -3,10 +3,10 @@
 // knows is wired up.
 //
 // There is one violation per SPELLING the scanner distinguishes — each
-// copying exit, each key-taking Backend method, each position a borrowed key
-// may not appear in, each shape of an exported clear-text seam — so dropping
-// any single check from the scanner fails the golden test rather than passing
-// on the strength of the others.
+// key-taking Backend method, each position a borrowed key may not appear in,
+// each shape of an exported clear-text seam — so dropping any single check from
+// the scanner fails the golden test rather than passing on the strength of the
+// others.
 //
 // luks.Backend is the REAL interface from internal/luks, imported the way a
 // provider imports it, so the receiver-type match is proved against the type
@@ -21,35 +21,25 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// Rule 1: a copying exit from the enclave hands back unprotected material.
-
-func fixtureOpen(enc *enclave.MemoryEnclave) ([]byte, error) {
-	return enc.Open()
-}
-
-func fixtureOpenString(enc *enclave.MemoryEnclave) (string, error) {
-	return enc.OpenString()
-}
-
-// Rule 2: a borrow window outside internal/luks.(*Manager).withKey.
+// Rule 1: a borrow window outside the named ones.
 
 func fixtureBorrow(enc *enclave.MemoryEnclave) error {
 	return enc.WithBytes(func(b []byte) error { return nil })
 }
 
-// Rule 3: the key-taking Backend methods, called from outside internal/luks.
+// Rule 2: the key-taking Backend methods, called from outside internal/luks.
 
-func fixtureBackend(ctx context.Context, b luks.Backend, key []byte) error {
-	if err := b.Format(ctx, "/dev/x", key); err != nil {
+func fixtureBackend(ctx context.Context, b luks.Backend, enc *enclave.MemoryEnclave) error {
+	if err := b.Format(ctx, "/dev/x", enc); err != nil {
 		return err
 	}
-	if err := b.Open(ctx, "/dev/x", "name", key); err != nil {
+	if err := b.Open(ctx, "/dev/x", "name", enc); err != nil {
 		return err
 	}
-	return b.TestKey(ctx, "/dev/x", key)
+	return b.TestKey(ctx, "/dev/x", enc)
 }
 
-// Rule 4: a borrowed key is argument-only. Each function below puts it in one
+// Rule 3: a borrowed key is argument-only. Each function below puts it in one
 // position the rule refuses.
 
 type holder struct{ k []byte }
@@ -89,7 +79,7 @@ func fixturePassphrase(passphrase []byte) {
 	_ = p
 }
 
-// Rule 5: key-material-shaped values must not cross a package boundary in the
+// Rule 4: key-material-shaped values must not cross a package boundary in the
 // clear. Each exported signature below carries one in a different shape.
 
 func UnlockWith(key []byte) error { return nil }

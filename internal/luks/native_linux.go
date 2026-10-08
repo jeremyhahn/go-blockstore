@@ -17,6 +17,7 @@ package luks
 
 import (
 	"context"
+	"crypto"
 	"errors"
 	"fmt"
 	"math"
@@ -25,7 +26,10 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/jeremyhahn/go-enclave"
+	"github.com/jeremyhahn/go-luks2/pkg/dmcrypt"
 	"github.com/jeremyhahn/go-luks2/pkg/luks2"
 	"golang.org/x/sys/unix"
 )
@@ -57,8 +61,8 @@ var _ Backend = Native{}
 // HeaderBytes was taken at.
 const sectorSize = 512
 
-// pbkdfIterTime is the wall-clock target, in milliseconds, that go-luks2
-// benchmarks PBKDF2 against when it picks an iteration count.
+// pbkdfIterTime is the wall-clock target go-luks2 calibrates PBKDF2 against when
+// it picks an iteration count.
 //
 // It is stated rather than defaulted, like every other format parameter, and it
 // happens to be go-luks2's own default. It BUYS nothing until go-luks2
@@ -75,25 +79,45 @@ const sectorSize = 512
 // the target it always claimed to be, and the derivation lands where the 2000ms
 // asks. See Manager.Format for why the old count was nonetheless acceptable for the
 // high-entropy material it stretches.
-const pbkdfIterTime = 2000
+const pbkdfIterTime = 2 * time.Second
+
+// hashFunc is hashAlgo as go-luks2 v1 spells it. It is both the digest and
+// anti-forensic hash (FormatParams.Hash) and the keyslot's PBKDF2 pseudo-random
+// function (KDFParams.Hash): v1 takes the two separately, and this package
+// states both so that one hash runs across the header.
+const hashFunc = crypto.SHA512
 
 // Format writes a LUKS2 header onto the device with every cryptographic
 // parameter pinned. See Manager.Format for what each one is and why.
-func (Native) Format(ctx context.Context, device string, key []byte) error {
-	if err := ctx.Err(); err != nil {
+func (Native) Format(ctx context.Context, device string, key *enclave.MemoryEnclave) error {
+	return withVolume(ctx, device, func(v *luks2.Volume) error {
+		return v.Format(ctx, key, luks2.FormatParams{
+			Cipher:     cipher + "-" + cipherMode,
+			KeySize:    keySizeBits,
+			Hash:       hashFunc,
+			SectorSize: sectorSize,
+			KDF: luks2.KDFParams{
+				Type:     luks2.KDFType(pbkdf),
+				Hash:     hashFunc,
+				IterTime: pbkdfIterTime,
+			},
+		})
+	})
+}
+
+// withVolume pins the device for one operation and releases the pin when it
+// returns. A failure to release is reported alongside the operation's own error
+// rather than instead of it.
+func withVolume(ctx context.Context, device string, op func(v *luks2.Volume) error, opts ...luks2.Option) error {
+	v, err := luks2.Open(ctx, device, opts...)
+	if err != nil {
 		return err
 	}
-	return luks2.Format(luks2.FormatOptions{
-		Device:        device,
-		Passphrase:    key,
-		Cipher:        cipher,
-		CipherMode:    cipherMode,
-		KeySize:       keySizeBits,
-		HashAlgo:      hashAlgo,
-		SectorSize:    sectorSize,
-		KDFType:       pbkdf,
-		PBKDFIterTime: pbkdfIterTime,
-	})
+	opErr := op(v)
+	if closeErr := v.Close(); closeErr != nil {
+		return errors.Join(opErr, closeErr)
+	}
+	return opErr
 }
 
 // Open unlocks the container and creates its plaintext mapping.
@@ -103,19 +127,22 @@ func (Native) Format(ctx context.Context, device string, key []byte) error {
 // mapping from the backing device at the moment it opens it. That is what makes
 // growing a container a matter of growing the logical volume and re-opening —
 // see each provider's resize path.
-func (Native) Open(ctx context.Context, device, name string, key []byte) error {
-	if err := ctx.Err(); err != nil {
+func (Native) Open(ctx context.Context, device, name string, key *enclave.MemoryEnclave) error {
+	return withVolume(ctx, device, func(v *luks2.Volume) error {
+		volumeKey, err := v.Unlock(ctx, key)
+		if err != nil {
+			return err
+		}
+		defer volumeKey.Destroy()
+
+		_, err = dmcrypt.Activate(ctx, v, volumeKey, name)
 		return err
-	}
-	return luks2.Unlock(device, key, name)
+	})
 }
 
 // Close removes the plaintext mapping.
 func (Native) Close(ctx context.Context, name string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return luks2.Lock(name)
+	return dmcrypt.Deactivate(ctx, name)
 }
 
 // TestKey checks a passphrase against the container's keyslots without
@@ -123,11 +150,15 @@ func (Native) Close(ctx context.Context, name string) error {
 // digest, and no device-mapper mapping is created. So a restore can establish
 // that the volume it is about to produce will be openable before it creates
 // anything, rather than after it has copied the image.
-func (Native) TestKey(ctx context.Context, device string, key []byte) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return luks2.TestKey(device, key)
+func (Native) TestKey(ctx context.Context, device string, key *enclave.MemoryEnclave) error {
+	return withVolume(ctx, device, func(v *luks2.Volume) error {
+		volumeKey, err := v.Unlock(ctx, key)
+		if err != nil {
+			return err
+		}
+		volumeKey.Destroy()
+		return nil
+	}, luks2.WithReadOnly())
 }
 
 // DataOffset reports where a container's data starts — the space its header
@@ -151,33 +182,29 @@ func (Native) TestKey(ctx context.Context, device string, key []byte) error {
 // and picking a segment out of that state would produce a capacity that is true
 // of neither the old layout nor the new one.
 func (Native) DataOffset(ctx context.Context, device string) (int64, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
+	var offset int64
+	err := withVolume(ctx, device, func(v *luks2.Volume) error {
+		header, err := v.Header(ctx)
+		if err != nil {
+			return err
+		}
+		segments := header.Segments()
+		if len(segments) != 1 {
+			return fmt.Errorf("the LUKS header reports %d data segments, not one; "+
+				"a container mid-reencryption has no single usable capacity", len(segments))
+		}
 
-	_, metadata, err := luks2.ReadHeader(device)
+		// go-luks2 parses the offset, which LUKS2 renders as a decimal STRING.
+		offset = segments[0].Offset
+		if offset <= 0 {
+			return fmt.Errorf("the LUKS header reports data offset %d, which leaves no room for a header", offset)
+		}
+		return nil
+	}, luks2.WithReadOnly())
 	if err != nil {
 		return 0, err
 	}
-	if len(metadata.Segments) != 1 {
-		return 0, fmt.Errorf("the LUKS header reports %d data segments, not one; "+
-			"a container mid-reencryption has no single usable capacity", len(metadata.Segments))
-	}
-
-	for _, segment := range metadata.Segments {
-		// LUKS2 renders the offset as a decimal STRING, not a JSON number, and
-		// go-luks2 carries it across unparsed.
-		offset, parseErr := strconv.ParseInt(strings.TrimSpace(segment.Offset), 10, 64)
-		if parseErr != nil {
-			return 0, fmt.Errorf("the LUKS header reports data offset %q: not a number", segment.Offset)
-		}
-		if offset <= 0 {
-			return 0, fmt.Errorf("the LUKS header reports data offset %d, which leaves no room for a header", offset)
-		}
-		return offset, nil
-	}
-	// Unreachable: the length was checked above.
-	return 0, errors.New("the LUKS header reports no data segment")
+	return offset, nil
 }
 
 // Mapping reports whether a plaintext mapping exists under name, what it is
@@ -198,21 +225,16 @@ func (Native) DataOffset(ctx context.Context, device string) (int64, error) {
 // set_capacity() published, which is the number a fresh Unlock would size the
 // mapping from.
 func (n Native) Mapping(ctx context.Context, name string) (MappingInfo, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return MappingInfo{}, false, err
-	}
-	if !luks2.IsUnlocked(name) {
+	mapping, err := dmcrypt.Lookup(ctx, name)
+	if errors.Is(err, dmcrypt.ErrNotActive) {
 		return MappingInfo{}, false, nil
 	}
-
-	path, err := luks2.GetMappedDevicePath(name)
 	if err != nil {
 		return MappingInfo{}, false, err
 	}
-	rdev, err := blockDeviceNumber(path)
-	if err != nil {
-		return MappingInfo{}, false, err
-	}
+	// The kernel's own answer for which device this is, rather than whatever
+	// /dev/mapper/<name> currently points at.
+	rdev := unix.Mkdev(mapping.Major, mapping.Minor)
 
 	backing, err := backingDevice(sysfsRoot, rdev)
 	if err != nil {

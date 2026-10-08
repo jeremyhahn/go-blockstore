@@ -94,8 +94,7 @@ func FileSecretProvider(path string) SecretProvider {
 			}
 			return nil
 		}); err != nil {
-			enc.Destroy()
-			return nil, err
+			return nil, errors.Join(err, enc.Destroy())
 		}
 		return enc, nil
 	}
@@ -191,9 +190,8 @@ func (p *Provider) writeSharedSecret(ctx context.Context, resource string, w io.
 	if enc == nil {
 		return fmt.Errorf("the secret provider returned no secret for %q", resource)
 	}
-	defer enc.Destroy()
 
-	return enc.WithBytes(func(buf []byte) error {
+	borrowErr := enc.WithBytes(func(buf []byte) error {
 		secret := trimSecretFileNewline(buf)
 		if err := validateSharedSecret(secret); err != nil {
 			return err
@@ -203,6 +201,9 @@ func (p *Provider) writeSharedSecret(ctx context.Context, resource string, w io.
 		}
 		return nil
 	})
+	// A Destroy that fails leaves locked pages holding the secret, which is
+	// worth reporting whether or not the write succeeded.
+	return errors.Join(borrowErr, enc.Destroy())
 }
 
 // errNoSecretProvider marks a provider configured without a way to obtain a

@@ -24,7 +24,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jeremyhahn/go-luks2/pkg/luks2"
+	"github.com/jeremyhahn/go-luks2/pkg/dmcrypt"
 	"golang.org/x/sys/unix"
 )
 
@@ -364,12 +364,12 @@ func TestClassifyKeyring(t *testing.T) {
 		want     Cause
 	}{
 		"available":                   {nil, true, ""},
-		"seccomp":                     {luks2.ErrKeyringBlocked, false, CauseSyscallBlocked},
-		"kernel without CONFIG_KEYS":  {luks2.ErrKeyringUnsupported, false, CauseKernelUnsupported},
-		"quota":                       {luks2.ErrKeyringQuotaExhausted, false, CauseResourceExhausted},
-		"an anomaly go-luks2 reports": {luks2.ErrKeyringKeyNotReleased, false, CauseIndeterminate},
+		"seccomp":                     {dmcrypt.ErrKeyringBlocked, false, CauseSyscallBlocked},
+		"kernel without CONFIG_KEYS":  {dmcrypt.ErrKeyringUnsupported, false, CauseKernelUnsupported},
+		"quota":                       {dmcrypt.ErrKeyringQuotaExhausted, false, CauseResourceExhausted},
+		"an anomaly go-luks2 reports": {dmcrypt.ErrKeyringKeyNotReleased, false, CauseIndeterminate},
 		"something else entirely":     {errors.New("unrelated"), false, CauseIndeterminate},
-		"a wrapped sentinel":          {wrapped(luks2.ErrKeyringBlocked), false, CauseSyscallBlocked},
+		"a wrapped sentinel":          {wrapped(dmcrypt.ErrKeyringBlocked), false, CauseSyscallBlocked},
 	}
 
 	for name, tc := range cases {
@@ -592,7 +592,7 @@ func TestMountProbeWithInjectedSteps(t *testing.T) {
 // interface trap that made a passing check panic.
 func TestKeyringProbeWithAnInjectedCheck(t *testing.T) {
 	t.Run("available", func(t *testing.T) {
-		if err := keyringProbe(func() error { return nil })(context.Background()); err != nil {
+		if err := keyringProbe(func(context.Context) error { return nil })(context.Background()); err != nil {
 			t.Fatalf("probe = %v, want a pass", err)
 		}
 	})
@@ -600,14 +600,14 @@ func TestKeyringProbeWithAnInjectedCheck(t *testing.T) {
 	t.Run("a pass is a true nil, not a typed one", func(t *testing.T) {
 		// The regression: returning classifyKeyring's *CapabilityError directly
 		// boxes a nil pointer in a non-nil error, which panics when rendered.
-		err := keyringProbe(func() error { return nil })(context.Background())
+		err := keyringProbe(func(context.Context) error { return nil })(context.Background())
 		if err != nil {
 			t.Fatalf("probe = %v (%T), want an untyped nil", err, err)
 		}
 	})
 
 	t.Run("blocked by seccomp", func(t *testing.T) {
-		err := keyringProbe(func() error { return luks2.ErrKeyringBlocked })(context.Background())
+		err := keyringProbe(func(context.Context) error { return dmcrypt.ErrKeyringBlocked })(context.Background())
 		if !errors.Is(err, ErrSyscallBlocked) {
 			t.Fatalf("probe = %v, want ErrSyscallBlocked", err)
 		}
@@ -624,7 +624,7 @@ func TestKeyringProbeWithAnInjectedCheck(t *testing.T) {
 	t.Run("the context is already canceled", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		probe := keyringProbe(func() error { t.Fatal("the check ran with a canceled context"); return nil })
+		probe := keyringProbe(func(context.Context) error { t.Fatal("the check ran with a canceled context"); return nil })
 		if err := probe(ctx); !errors.Is(err, context.Canceled) {
 			t.Fatalf("probe = %v, want it to carry context.Canceled", err)
 		}
@@ -714,7 +714,7 @@ func measureEnvironment(t *testing.T) environment {
 	env := environment{
 		hasCapSysAdmin:  effective&(1<<capSysAdmin) != 0,
 		inUserNamespace: inUserNS,
-		keyringErr:      luks2.CheckKeyringAvailable(),
+		keyringErr:      dmcrypt.CheckKeyring(context.Background()),
 	}
 
 	fd, openErr := unix.Open(DeviceMapperControl, unix.O_RDONLY|unix.O_CLOEXEC, 0)
@@ -849,7 +849,7 @@ func TestLiveDeviceMapperWitnessAgreesWithTheEnvironment(t *testing.T) {
 // keyring, on whatever machine the test runs.
 func TestLiveKeyringProbeAgreesWithGoLuks2(t *testing.T) {
 	env := measureEnvironment(t)
-	err := keyringProbe(luks2.CheckKeyringAvailable)(context.Background())
+	err := keyringProbe(dmcrypt.CheckKeyring)(context.Background())
 
 	if (env.keyringErr == nil) != (err == nil) {
 		t.Fatalf("go-luks2 says %v and the probe says %v; the verdicts must match", env.keyringErr, err)
@@ -937,7 +937,7 @@ func TestLiveProbesLeaveNothingBehind(t *testing.T) {
 	for _, probe := range []Probe{
 		deviceMapperProbe(liveDeviceMapperSteps()),
 		mountProbe(liveMountSteps()),
-		keyringProbe(luks2.CheckKeyringAvailable),
+		keyringProbe(dmcrypt.CheckKeyring),
 	} {
 		_ = probe(context.Background())
 	}

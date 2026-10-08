@@ -39,16 +39,14 @@ func writeTree(t *testing.T, root string, files map[string]string) {
 	}
 }
 
-// managerWithKey is a stand-in internal/luks whose withKey borrows once — the
-// anchor as the scanner expects to find it.
-const managerWithKey = `package luks
+// anchorOnly is a stand-in internal/luks whose FileKeyProvider borrows once —
+// the anchor as the scanner expects to find it.
+const anchorOnly = `package luks
 
 import "github.com/jeremyhahn/go-enclave"
 
-type Manager struct{ enc *enclave.MemoryEnclave }
-
-func (m *Manager) withKey(op func(key []byte) error) error {
-	return m.enc.WithBytes(op)
+func FileKeyProvider(enc *enclave.MemoryEnclave) error {
+	return enc.WithBytes(func([]byte) error { return nil })
 }
 `
 
@@ -56,7 +54,7 @@ func (m *Manager) withKey(op func(key []byte) error) error {
 // tree it describes.
 //
 // An entry naming a function that no longer borrows is an exemption waiting
-// for something to wear it: rename withKey, add a WithBytes call under the old
+// for something to wear it: rename FileKeyProvider, add a WithBytes call under the old
 // name somewhere else, and a stale entry would let it through. So every entry
 // has to correspond to a site the scan actually met, and the anchor to exactly
 // one.
@@ -79,28 +77,26 @@ func TestCustodyEveryBorrowWindowIsReal(t *testing.T) {
 	}
 }
 
-// TestCustodyLosingTheAnchorIsNotAPass is rule 2's fail-closed half.
+// TestCustodyLosingTheAnchorIsNotAPass is rule 1's fail-closed half.
 //
-// If withKey stops calling WithBytes while the tree still borrows elsewhere,
-// the "only from withKey" rule is being checked against nothing, and a scanner
+// If FileKeyProvider stops calling WithBytes while the tree still borrows
+// elsewhere, the window table is being checked against nothing, and a scanner
 // in that state must say so at the anchor rather than report the tree clean.
-// If withKey is gone altogether, the scanner has nothing to anchor on and the
-// scan itself fails.
+// If FileKeyProvider is gone altogether, the scanner has nothing to anchor on
+// and the scan itself fails.
 func TestCustodyLosingTheAnchorIsNotAPass(t *testing.T) {
-	t.Run("withKey no longer borrows", func(t *testing.T) {
+	t.Run("the anchor no longer borrows", func(t *testing.T) {
 		root := t.TempDir()
 		writeTree(t, root, map[string]string{
-			"internal/luks/manager.go": `package luks
+			"internal/luks/key.go": `package luks
 
 import "github.com/jeremyhahn/go-enclave"
 
-type Manager struct{ enc *enclave.MemoryEnclave }
-
-func (m *Manager) withKey(op func(key []byte) error) error {
-	return op(nil)
+func FileKeyProvider() error {
+	return nil
 }
 
-func FileKeyProvider(enc *enclave.MemoryEnclave) error {
+func StaticKeyProvider(enc *enclave.MemoryEnclave) error {
 	return enc.WithBytes(func([]byte) error { return nil })
 }
 `,
@@ -112,30 +108,28 @@ func FileKeyProvider(enc *enclave.MemoryEnclave) error {
 		}
 		var atAnchor bool
 		for _, finding := range result.Findings {
-			if finding.File == "internal/luks/manager.go" && finding.Line == 7 &&
+			if finding.File == "internal/luks/key.go" && finding.Line == 5 &&
 				strings.Contains(finding.Message, "exactly once") {
 				atAnchor = true
 			}
 		}
 		if !atAnchor {
-			t.Errorf("withKey borrows zero times and the scan did not say so at its declaration: %v", result.Findings)
+			t.Errorf("the anchor borrows zero times and the scan did not say so at its declaration: %v", result.Findings)
 		}
 	})
 
-	t.Run("withKey borrows twice", func(t *testing.T) {
+	t.Run("the anchor borrows twice", func(t *testing.T) {
 		root := t.TempDir()
 		writeTree(t, root, map[string]string{
-			"internal/luks/manager.go": `package luks
+			"internal/luks/key.go": `package luks
 
 import "github.com/jeremyhahn/go-enclave"
 
-type Manager struct{ enc *enclave.MemoryEnclave }
-
-func (m *Manager) withKey(op func(key []byte) error) error {
-	if err := m.enc.WithBytes(op); err != nil {
+func FileKeyProvider(enc *enclave.MemoryEnclave) error {
+	if err := enc.WithBytes(func([]byte) error { return nil }); err != nil {
 		return err
 	}
-	return m.enc.WithBytes(op)
+	return enc.WithBytes(func([]byte) error { return nil })
 }
 `,
 		})
@@ -144,12 +138,12 @@ func (m *Manager) withKey(op func(key []byte) error) error {
 		if err != nil {
 			t.Fatalf("Scan: %v", err)
 		}
-		if len(result.Findings) != 1 || result.Findings[0].Line != 7 {
-			t.Errorf("withKey borrows twice; want one finding at its declaration, got %v", result.Findings)
+		if len(result.Findings) != 1 || result.Findings[0].Line != 5 {
+			t.Errorf("the anchor borrows twice; want one finding at its declaration, got %v", result.Findings)
 		}
 	})
 
-	t.Run("withKey does not exist", func(t *testing.T) {
+	t.Run("the anchor does not exist", func(t *testing.T) {
 		root := t.TempDir()
 		writeTree(t, root, map[string]string{
 			"pkg/other/other.go": `package other
@@ -164,7 +158,7 @@ func Borrow(enc *enclave.MemoryEnclave) error {
 
 		_, err := KeyMaterialCustody().Scan(root)
 		if err == nil {
-			t.Fatal("a tree that borrows from enclaves with no withKey anywhere scanned as if the anchor were present")
+			t.Fatal("a tree that borrows from enclaves with no FileKeyProvider anywhere scanned as if the anchor were present")
 		}
 		if !strings.Contains(err.Error(), "anchored") {
 			t.Errorf("the error does not say the anchor is missing: %v", err)
@@ -186,6 +180,37 @@ func Borrow(enc *enclave.MemoryEnclave) error {
 			t.Errorf("examined %v, want the one file", result.Examined)
 		}
 	})
+}
+
+// TestCustodyWithKeyIsNotABorrowWindow pins the design decision the table
+// states: the passphrase is lent to the Backend as an enclave, so withKey
+// reading it out with WithBytes is a finding even though it sits in the
+// package that owns the model.
+func TestCustodyWithKeyIsNotABorrowWindow(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		"internal/luks/manager.go": anchorOnly + `
+type Manager struct{ enc *enclave.MemoryEnclave }
+
+func (m *Manager) withKey(op func(key []byte) error) error {
+	return m.enc.WithBytes(op)
+}
+`,
+	})
+
+	result, err := KeyMaterialCustody().Scan(root)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	var found bool
+	for _, finding := range result.Findings {
+		if strings.Contains(finding.Message, "from internal/luks.(*Manager).withKey") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a WithBytes in withKey was not reported: %v", result.Findings)
+	}
 }
 
 // TestCustodyAFileNoConfigurationSelectsIsAScanFailure keeps the type-checked
@@ -248,11 +273,11 @@ func TestCustodyExaminesEveryConfigurationsFiles(t *testing.T) {
 }
 
 // TestCustodyATreeWhoseOnlyBorrowIsTheAnchorIsClean is the anchor path's
-// positive control: a withKey that borrows exactly once is what the model
+// positive control: an anchor that borrows exactly once is what the model
 // looks like, and it produces nothing.
 func TestCustodyATreeWhoseOnlyBorrowIsTheAnchorIsClean(t *testing.T) {
 	root := t.TempDir()
-	writeTree(t, root, map[string]string{"internal/luks/manager.go": managerWithKey})
+	writeTree(t, root, map[string]string{"internal/luks/manager.go": anchorOnly})
 
 	result, err := KeyMaterialCustody().Scan(root)
 	if err != nil {
@@ -263,7 +288,7 @@ func TestCustodyATreeWhoseOnlyBorrowIsTheAnchorIsClean(t *testing.T) {
 	}
 }
 
-// TestCustodyMaterialNames is the rule-5 name boundary, spelled out one case
+// TestCustodyMaterialNames is the rule-4 name boundary, spelled out one case
 // per line so the refinement in the scanner's documentation is what the code
 // does.
 func TestCustodyMaterialNames(t *testing.T) {
@@ -344,7 +369,7 @@ func (*T) P(enc *enclave.MemoryEnclave) error    { return enc.WithBytes(nil) }
 func (G[X]) Q(enc *enclave.MemoryEnclave) error  { return enc.WithBytes(nil) }
 func (*G[X]) R(enc *enclave.MemoryEnclave) error { return enc.WithBytes(nil) }
 `,
-		"internal/luks/manager.go": managerWithKey,
+		"internal/luks/manager.go": anchorOnly,
 	})
 
 	result, err := KeyMaterialCustody().Scan(root)

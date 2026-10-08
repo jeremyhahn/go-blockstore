@@ -19,17 +19,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
-	"github.com/jeremyhahn/go-luks2/pkg/luks2"
+	"github.com/jeremyhahn/go-enclave"
+
+	"github.com/jeremyhahn/go-blockstore/internal/luks/luktest"
 )
 
 // These tests format REAL LUKS2 containers and read the headers back, and they
@@ -48,10 +49,30 @@ import (
 // device, which needs root and /dev/mapper/control. Those paths stay in the
 // integration suite.
 
-// luksTestPassphraseBytes is a passphrase for these tests. It clears go-luks2's
+// luksTestPassphrase seals a passphrase for these tests. It clears go-luks2's
 // 8-byte floor, which the fake-backed tests never exercise because the fake does
-// not enforce one.
-var luksTestPassphraseBytes = []byte("correct-horse-battery-staple")
+// not enforce one. Every call seals a fresh enclave, destroyed with the test.
+func luksTestPassphrase(t *testing.T) *enclave.MemoryEnclave {
+	t.Helper()
+	return sealTestPassphrase(t, "correct-horse-battery-staple")
+}
+
+// sealTestPassphrase seals the given passphrase into an enclave destroyed with
+// the test. NewMemoryEnclave takes ownership of its argument and wipes it, so
+// the conversion from a string hands it a copy nobody else holds.
+func sealTestPassphrase(t *testing.T, passphrase string) *enclave.MemoryEnclave {
+	t.Helper()
+	sealed, err := enclave.NewMemoryEnclave([]byte(passphrase))
+	if err != nil {
+		t.Fatalf("NewMemoryEnclave: %v", err)
+	}
+	t.Cleanup(func() {
+		if destroyErr := sealed.Destroy(); destroyErr != nil {
+			t.Errorf("Destroy: %v", destroyErr)
+		}
+	})
+	return sealed
+}
 
 // newContainerFile writes a LUKS2 container onto a sparse file of the given size
 // with exactly the parameters this provider pins, and returns its path.
@@ -70,7 +91,7 @@ func newContainerFile(t *testing.T, size int64) string {
 		t.Fatalf("closing the backing file: %v", closeErr)
 	}
 
-	if err := (Native{}).Format(context.Background(), path, luksTestPassphraseBytes); err != nil {
+	if err := (Native{}).Format(context.Background(), path, luksTestPassphrase(t)); err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	return path
@@ -87,11 +108,7 @@ func newContainerFile(t *testing.T, size int64) string {
 // or both, and nothing about the resulting volume says so.
 func TestNativeFormatPinsFIPSParameters(t *testing.T) {
 	device := newContainerFile(t, 32<<20)
-
-	_, metadata, err := luks2.ReadHeader(device)
-	if err != nil {
-		t.Fatalf("ReadHeader: %v", err)
-	}
+	metadata := luktest.Read(t, device)
 
 	keyslot, ok := metadata.Keyslots["0"]
 	if !ok {
@@ -131,10 +148,8 @@ func TestNativeFormatPinsFIPSParameters(t *testing.T) {
 	// argon2 must appear nowhere: it is the library's default and is not
 	// FIPS-approved, so a header mentioning it means a parameter stopped being
 	// stated somewhere.
-	for _, kdf := range []*luks2.KDF{keyslot.KDF} {
-		if strings.Contains(strings.ToLower(kdf.Type), "argon2") {
-			t.Errorf("the header names %q; argon2 is not FIPS-approved", kdf.Type)
-		}
+	if strings.Contains(strings.ToLower(keyslot.KDF.Type), "argon2") {
+		t.Errorf("the header names %q; argon2 is not FIPS-approved", keyslot.KDF.Type)
 	}
 	for id, digest := range metadata.Digests {
 		if strings.Contains(strings.ToLower(digest.Type), "argon2") {
@@ -201,11 +216,7 @@ func TestNativeFormatProducesTheHeaderTheSizingConstantAssumes(t *testing.T) {
 func TestNativeFormatClearsTheIterationFloor(t *testing.T) {
 	device := newContainerFile(t, 32<<20)
 
-	_, metadata, err := luks2.ReadHeader(device)
-	if err != nil {
-		t.Fatalf("ReadHeader: %v", err)
-	}
-	keyslot, ok := metadata.Keyslots["0"]
+	keyslot, ok := luktest.Read(t, device).Keyslots["0"]
 	if !ok {
 		t.Fatal("the header has no keyslot 0")
 	}
@@ -234,7 +245,7 @@ func TestNativeFormatRefusesAShortPassphrase(t *testing.T) {
 		t.Fatalf("closing the backing file: %v", closeErr)
 	}
 
-	if err := (Native{}).Format(context.Background(), path, []byte("short")); err == nil {
+	if err := (Native{}).Format(context.Background(), path, sealTestPassphrase(t, "short")); err == nil {
 		t.Fatal("Format accepted a passphrase below go-luks2's 8-byte floor")
 	}
 }
@@ -246,10 +257,10 @@ func TestNativeTestKeyVerifiesWithoutUnlocking(t *testing.T) {
 	device := newContainerFile(t, 32<<20)
 	backend := Native{}
 
-	if err := backend.TestKey(context.Background(), device, luksTestPassphraseBytes); err != nil {
+	if err := backend.TestKey(context.Background(), device, luksTestPassphrase(t)); err != nil {
 		t.Fatalf("TestKey refused the passphrase the container was formatted with: %v", err)
 	}
-	if err := backend.TestKey(context.Background(), device, []byte("not-the-passphrase")); err == nil {
+	if err := backend.TestKey(context.Background(), device, sealTestPassphrase(t, "not-the-passphrase")); err == nil {
 		t.Fatal("TestKey accepted a passphrase that opens no keyslot")
 	}
 }
@@ -281,37 +292,34 @@ func TestNativeDataOffsetRefusesWhatIsNotAContainer(t *testing.T) {
 // None of these shapes can be produced by formatting: they are what a container
 // that is MID-REENCRYPTION, or one whose header has been corrupted or written by
 // something else, looks like. Each is built by rewriting the header of a real
-// container — go-luks2 re-checksums both copies on write, so what comes back is
+// container — rewriteMetadata re-checksums both copies, so what comes back is
 // a header this package genuinely has to cope with rather than a mangled file.
 //
 // Guessing at any of them would be worse than failing. Two segments have no
 // single usable capacity; a zero offset would say the container costs nothing
 // and hand the caller its own header as usable space.
 func TestNativeDataOffsetRefusesAnUnusableSegmentTable(t *testing.T) {
-	rewrites := map[string]func(*luks2.LUKS2Metadata){
-		"two segments": func(m *luks2.LUKS2Metadata) {
-			second := *m.Segments["0"]
-			second.Offset = strconv.FormatInt(32<<20, 10)
-			m.Segments["1"] = &second
+	rewrites := map[string]func(map[string]any) error{
+		"two segments": func(m map[string]any) error {
+			segments := m["segments"].(map[string]any)
+			second := maps.Clone(segments["0"].(map[string]any))
+			second["offset"] = strconv.FormatInt(32<<20, 10)
+			segments["1"] = second
+			return nil
 		},
-		"no segments":         func(m *luks2.LUKS2Metadata) { m.Segments = map[string]*luks2.Segment{} },
-		"offset not a number": func(m *luks2.LUKS2Metadata) { m.Segments["0"].Offset = "sixteen" },
-		"offset zero":         func(m *luks2.LUKS2Metadata) { m.Segments["0"].Offset = "0" },
-		"offset negative":     func(m *luks2.LUKS2Metadata) { m.Segments["0"].Offset = "-4096" },
+		"no segments": func(m map[string]any) error {
+			m["segments"] = map[string]any{}
+			return nil
+		},
+		"offset not a number": func(m map[string]any) error { return luktest.SetSegmentOffset(m, "sixteen") },
+		"offset zero":         func(m map[string]any) error { return luktest.SetSegmentOffset(m, "0") },
+		"offset negative":     func(m map[string]any) error { return luktest.SetSegmentOffset(m, "-4096") },
 	}
 
 	for name, rewrite := range rewrites {
 		t.Run(name, func(t *testing.T) {
 			device := newContainerFile(t, 32<<20)
-
-			hdr, metadata, err := luks2.ReadHeader(device)
-			if err != nil {
-				t.Fatalf("ReadHeader: %v", err)
-			}
-			rewrite(metadata)
-			if err := luks2.WriteHeader(device, hdr, metadata); err != nil {
-				t.Fatalf("WriteHeader: %v", err)
-			}
+			luktest.Rewrite(t, device, rewrite)
 
 			if offset, err := (Native{}).DataOffset(context.Background(), device); err == nil {
 				t.Fatalf("DataOffset = %d, want a refusal", offset)
@@ -329,15 +337,15 @@ func TestNativeDataOffsetReadsAForeignHeader(t *testing.T) {
 	const foreign = 4 << 20
 	device := newContainerFile(t, 32<<20)
 
-	hdr, metadata, err := luks2.ReadHeader(device)
-	if err != nil {
-		t.Fatalf("ReadHeader: %v", err)
-	}
-	metadata.Segments["0"].Offset = strconv.FormatInt(foreign, 10)
-	metadata.Config.KeyslotsSize = strconv.FormatInt(foreign, 10)
-	if writeErr := luks2.WriteHeader(device, hdr, metadata); writeErr != nil {
-		t.Fatalf("WriteHeader: %v", writeErr)
-	}
+	luktest.Rewrite(t, device, func(m map[string]any) error {
+		if err := luktest.SetSegmentOffset(m, strconv.FormatInt(foreign, 10)); err != nil {
+			return err
+		}
+		// go-luks2 refuses a header whose keyslot area overruns the data, so
+		// the area is shrunk to end where the data starts: the two 16 KiB
+		// header copies sit in front of it.
+		return luktest.SetKeyslotsSize(m, strconv.FormatInt(foreign-2*16384, 10))
+	})
 
 	offset, err := (Native{}).DataOffset(context.Background(), device)
 	if err != nil {
@@ -348,19 +356,6 @@ func TestNativeDataOffsetReadsAForeignHeader(t *testing.T) {
 	}
 	if offset == HeaderBytes {
 		t.Error("DataOffset returned the constant instead of reading the header")
-	}
-}
-
-// TestNativeMappingReportsAnAbsentNameAsAbsent is the negative answer luksIsOpen
-// is allowed to act on, and the only one. A name nothing has ever opened is not
-// an error.
-func TestNativeMappingReportsAnAbsentNameAsAbsent(t *testing.T) {
-	info, exists, err := (Native{}).Mapping(context.Background(), "bs-vg0_no-such-volume-"+strconv.Itoa(os.Getpid()))
-	if err != nil {
-		t.Fatalf("Mapping: %v", err)
-	}
-	if exists {
-		t.Fatalf("Mapping reported %+v for a name nothing has opened", info)
 	}
 }
 
@@ -377,7 +372,7 @@ func TestNativeMappingOperationsFailRatherThanSucceedQuietly(t *testing.T) {
 	absentMapping := "bs-vg0_no-such-volume-" + strconv.Itoa(os.Getpid())
 
 	ops := map[string]func() error{
-		"Open":  func() error { return backend.Open(ctx, absentDevice, absentMapping, luksTestPassphraseBytes) },
+		"Open":  func() error { return backend.Open(ctx, absentDevice, absentMapping, luksTestPassphrase(t)) },
 		"Close": func() error { return backend.Close(ctx, absentMapping) },
 	}
 
@@ -402,10 +397,10 @@ func TestNativeOperationsHonorACancelledContext(t *testing.T) {
 	device := filepath.Join(t.TempDir(), "container.img")
 
 	ops := map[string]func() error{
-		"Format":     func() error { return backend.Format(ctx, device, luksTestPassphraseBytes) },
-		"Open":       func() error { return backend.Open(ctx, device, "bs-vg0_data", luksTestPassphraseBytes) },
+		"Format":     func() error { return backend.Format(ctx, device, luksTestPassphrase(t)) },
+		"Open":       func() error { return backend.Open(ctx, device, "bs-vg0_data", luksTestPassphrase(t)) },
 		"Close":      func() error { return backend.Close(ctx, "bs-vg0_data") },
-		"TestKey":    func() error { return backend.TestKey(ctx, device, luksTestPassphraseBytes) },
+		"TestKey":    func() error { return backend.TestKey(ctx, device, luksTestPassphrase(t)) },
 		"DataOffset": func() error { _, err := backend.DataOffset(ctx, device); return err },
 		"Mapping":    func() error { _, _, err := backend.Mapping(ctx, "bs-vg0_data"); return err },
 		"Identity":   func() error { _, err := backend.Identity(ctx, device); return err },
@@ -664,10 +659,7 @@ var hashOutputBytes = map[string]int{
 func TestNativeFormatWritesASpecLengthDigest(t *testing.T) {
 	device := newContainerFile(t, 32<<20)
 
-	_, metadata, err := luks2.ReadHeader(device)
-	if err != nil {
-		t.Fatalf("ReadHeader: %v", err)
-	}
+	metadata := luktest.Read(t, device)
 	if len(metadata.Digests) == 0 {
 		t.Fatal("the header carries no digest")
 	}
@@ -727,7 +719,7 @@ func TestNativeFormatWritesACryptsetupReadableHeader(t *testing.T) {
 	// cryptsetup answers `JSON area "" is missing "tokens" (object)
 	// specification` and fails validation before it looks at anything else.
 	t.Run("json area declares tokens", func(t *testing.T) {
-		jsonArea, jsonErr := luksJSONArea(raw, 0)
+		jsonArea, jsonErr := luktest.JSONArea(raw, 0)
 		if jsonErr != nil {
 			t.Fatalf("reading the JSON area: %v", jsonErr)
 		}
@@ -748,10 +740,7 @@ func TestNativeFormatWritesACryptsetupReadableHeader(t *testing.T) {
 	// metadata copies occupy. Measured: `keyslots_size is too large 16777216
 	// (bytes). Data offset: 16777216, keyslots offset: 32768`.
 	t.Run("keyslots area fits in front of the data", func(t *testing.T) {
-		_, metadata, readErr := luks2.ReadHeader(device)
-		if readErr != nil {
-			t.Fatalf("ReadHeader: %v", readErr)
-		}
+		metadata := luktest.Read(t, device)
 		keyslotsSize, err := strconv.ParseInt(metadata.Config.KeyslotsSize, 10, 64)
 		if err != nil {
 			t.Fatalf("keyslots_size %q: %v", metadata.Config.KeyslotsSize, err)
@@ -804,7 +793,7 @@ func TestNativeFormatWritesACryptsetupReadableHeader(t *testing.T) {
 func TestNativeRoundTripIsNotEvidenceOfConformance(t *testing.T) {
 	device := newContainerFile(t, 32<<20)
 
-	if err := (Native{}).TestKey(context.Background(), device, luksTestPassphraseBytes); err != nil {
+	if err := (Native{}).TestKey(context.Background(), device, luksTestPassphrase(t)); err != nil {
 		t.Fatalf("go-luks2 cannot open a container go-luks2 formatted: %v", err)
 	}
 
@@ -814,26 +803,4 @@ func TestNativeRoundTripIsNotEvidenceOfConformance(t *testing.T) {
 		"by the previous cryptsetup implementation still be opened?) and " +
 		"TestNativeFormatWritesACryptsetupReadableHeader (can an operator recover a " +
 		"volume written by this one?).")
-}
-
-// luksJSONArea returns the JSON metadata that follows a LUKS2 binary header,
-// trimmed at its NUL padding.
-func luksJSONArea(raw []byte, headerOffset int) ([]byte, error) {
-	const binaryHeaderLen = 4096
-	// hdr_size is a big-endian u64 at byte 8 of the binary header, and covers
-	// the binary header plus the JSON area.
-	if len(raw) < headerOffset+binaryHeaderLen {
-		return nil, fmt.Errorf("the container is %d bytes, too small to hold a header", len(raw))
-	}
-	headerSize := binary.BigEndian.Uint64(raw[headerOffset+8 : headerOffset+16])
-	end := headerOffset + int(headerSize) // #nosec G115 -- bounded by the length check below
-	if headerSize > uint64(len(raw)) || end > len(raw) {
-		return nil, fmt.Errorf("the header declares %d bytes, past the end of a %d-byte container",
-			headerSize, len(raw))
-	}
-	area := raw[headerOffset+binaryHeaderLen : end]
-	if nul := bytes.IndexByte(area, 0); nul >= 0 {
-		area = area[:nul]
-	}
-	return area, nil
 }

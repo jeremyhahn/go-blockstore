@@ -406,6 +406,19 @@ test-kernel-mountinfo:
 	$(GO) test -tags=kernel_mountinfo -count=1 -timeout=$(TEST_TIMEOUT) -run TestAgainstARunningKernel -v ./internal/mountinfo/
 	@echo "$(GREEN)✓ Live-kernel mountinfo checks complete$(RESET)"
 
+.PHONY: test-kernel-dm
+## test-kernel-dm: Check internal/luks against a LIVE device-mapper (needs /dev/mapper/control)
+# Behind the kernel_dm tag because go-luks2 reaches device-mapper through
+# /dev/mapper/control and a host without the node cannot answer "no such
+# mapping" — it answers that it cannot be asked. Selecting the tag is a
+# statement that this host provides the node, so its absence is a hard failure
+# (conventions/testing-guidelines.md §No Skip Guards).
+test-kernel-dm:
+	@echo "$(CYAN)$(BOLD)→ Checking internal/luks against this kernel's device-mapper...$(RESET)"
+	@echo "$(YELLOW)  REQUIRES: /dev/mapper/control, readable by this user$(RESET)"
+	$(GO) test -tags=kernel_dm -count=1 -timeout=$(TEST_TIMEOUT) -run TestNativeMapping -v ./internal/luks/
+	@echo "$(GREEN)✓ Live device-mapper checks complete$(RESET)"
+
 .PHONY: test-kernel-keypath
 ## test-kernel-keypath: Check the key-path guard against a LIVE kernel (needs unprivileged user namespaces)
 # Behind the kernel_keypath tag for the reason test-kernel-mountinfo is behind

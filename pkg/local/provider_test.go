@@ -1590,8 +1590,8 @@ func TestResizeGrowsExt4(t *testing.T) {
 //
 // Growing a dm-crypt mapping in place needs the device-mapper table reloaded
 // underneath the live device, which needs the container's master key.
-// go-luks2 v0.1.8-alpha exposes neither, so the only way to make the mapping
-// bigger through it is to REMOVE the mapping and unlock again — and if the
+// go-luks2 v1.0.0-rc.2 exposes no table reload, so the only way to make the
+// mapping bigger through it is to REMOVE the mapping and unlock again — and if the
 // second half fails, the caller is left with no plaintext device at all. It is
 // not hypothetical: a KeyProvider mis-rotated since the volume was attached
 // makes the teardown succeed and the rebuild fail, which is exactly what this

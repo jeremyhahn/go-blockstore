@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // Native is what the providers get for their LUKS operations on a platform
@@ -48,13 +49,17 @@ func unsupported(op string) error {
 		common.ErrUnsupported, op)
 }
 
-func (Native) Format(context.Context, string, []byte) error { return unsupported("format") }
+func (Native) Format(context.Context, string, *enclave.MemoryEnclave) error {
+	return unsupported("format")
+}
 
-func (Native) Open(context.Context, string, string, []byte) error { return unsupported("open") }
+func (Native) Open(context.Context, string, string, *enclave.MemoryEnclave) error {
+	return unsupported("open")
+}
 
 func (Native) Close(context.Context, string) error { return unsupported("close") }
 
-func (Native) TestKey(context.Context, string, []byte) error {
+func (Native) TestKey(context.Context, string, *enclave.MemoryEnclave) error {
 	return unsupported("passphrase check")
 }
 

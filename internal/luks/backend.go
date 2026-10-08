@@ -16,6 +16,8 @@ package luks
 import (
 	"context"
 	"errors"
+
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // Backend is the seam between the storage providers and the LUKS2 implementation
@@ -30,18 +32,20 @@ import (
 // rather than by forking cryptsetup. Owner ruling 2026-08-29: everything is
 // done in pure Go unless there is absolutely no other way.
 //
-// EVERY key parameter is a []byte borrowed from locked memory for the duration
-// of one call and nothing longer. An implementation must not retain it, copy it
-// or let it outlive the call — see Manager.withKey, which owns that window, and
-// KeyProvider, which explains what the borrow is protecting.
+// EVERY key parameter is a *enclave.MemoryEnclave the caller lends for the
+// duration of one call and nothing longer. An implementation must not destroy
+// it, retain it or let it outlive the call — see Manager.withKey, which owns the
+// enclave and destroys it, and KeyProvider, which explains what the enclave is
+// protecting. No implementation reads the passphrase as a []byte itself: the
+// native one hands the enclave to go-luks2, which borrows it for the derivation.
 //
 // THERE IS NO RESIZE HERE, and its absence is load-bearing. Growing a dm-crypt
 // mapping in place means reloading the device-mapper table underneath the live
 // device, which needs the container's master key; go-luks2 exposes neither that
-// nor a resize of its own — re-measured against v0.2.0-alpha on 2026-09-17: its
-// device-mapper layer has createAndLoad, infoByName and remove, no reload, no
-// suspend/resume, and Unlock computes a "dynamic" segment's length once, from
-// the backing device's size at that moment. The only mechanism reachable
+// nor a resize of its own — measured against v0.2.0-alpha on 2026-09-17 and
+// still true of v1.0.0-rc.2: pkg/dmcrypt has Activate, Lookup and Deactivate, no
+// reload, no suspend/resume, and Activate computes a "dynamic" segment's length
+// once, from the backing device's size at that moment. The only mechanism reachable
 // through it is to remove the mapping and unlock again, which is a destructive
 // operation wearing a resize's name — the teardown is unconditional and the
 // rebuild can fail, and what the caller is left with is not an unresized volume
@@ -59,28 +63,24 @@ import (
 // operation, and pkg/drbd's Promote for the open that sizes a replicated
 // volume's mapping.
 //
-// ctx is honored at call boundaries rather than throughout: go-luks2's API takes
-// no context, so an implementation checks for cancellation before it starts and
-// runs the operation to completion once it has. That is deliberate. A LUKS
-// format or unlock manipulates on-disk metadata and kernel state, and abandoning
-// one halfway leaves a container in a state neither the caller nor the next
-// operation can reason about; the operations are also bounded by a key
-// derivation rather than by a network, so there is no unbounded wait to escape.
+// ctx is passed to go-luks2, whose API takes one on every operation. What a
+// cancellation does halfway through a format or an unlock is go-luks2's to
+// define; this package adds nothing to it.
 type Backend interface {
 	// Format writes a LUKS2 header onto device with this package's pinned
 	// parameters. It destroys whatever was there.
-	Format(ctx context.Context, device string, key []byte) error
+	Format(ctx context.Context, device string, key *enclave.MemoryEnclave) error
 
 	// Open unlocks the container on device and exposes its plaintext mapping
 	// under the device-mapper name.
-	Open(ctx context.Context, device, name string, key []byte) error
+	Open(ctx context.Context, device, name string, key *enclave.MemoryEnclave) error
 
 	// Close tears the plaintext mapping down.
 	Close(ctx context.Context, name string) error
 
 	// TestKey reports whether key opens the container on device WITHOUT
 	// unlocking it — no mapping is created and no plaintext device appears.
-	TestKey(ctx context.Context, device string, key []byte) error
+	TestKey(ctx context.Context, device string, key *enclave.MemoryEnclave) error
 
 	// DataOffset reports where a container's data starts, which is what its
 	// header costs.

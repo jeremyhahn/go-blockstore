@@ -14,6 +14,7 @@
 package local
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/jeremyhahn/go-enclave"
 
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
 	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
@@ -353,13 +356,30 @@ const luksBinary = "luks"
 // Mounter, so one object describes the whole host a test is pretending to be.
 var _ luksBackend = (*fakeRunner)(nil)
 
-func (f *fakeRunner) Format(ctx context.Context, device string, key []byte) error {
-	_, err := f.Run(ctx, key, luksBinary, "format", device)
+// keyBytes copies what a lent enclave holds, so the call log can show a test
+// which passphrase an operation was given. The fake is the only place a test
+// reads a key back; the production Backend never does.
+func keyBytes(key *enclave.MemoryEnclave) []byte {
+	if key == nil {
+		return nil
+	}
+	var out []byte
+	if err := key.WithBytes(func(b []byte) error {
+		out = bytes.Clone(b)
+		return nil
+	}); err != nil {
+		return []byte("<unreadable: " + err.Error() + ">")
+	}
+	return out
+}
+
+func (f *fakeRunner) Format(ctx context.Context, device string, key *enclave.MemoryEnclave) error {
+	_, err := f.Run(ctx, keyBytes(key), luksBinary, "format", device)
 	return err
 }
 
-func (f *fakeRunner) Open(ctx context.Context, device, name string, key []byte) error {
-	_, err := f.Run(ctx, key, luksBinary, "open", device, name)
+func (f *fakeRunner) Open(ctx context.Context, device, name string, key *enclave.MemoryEnclave) error {
+	_, err := f.Run(ctx, keyBytes(key), luksBinary, "open", device, name)
 	return err
 }
 
@@ -368,8 +388,8 @@ func (f *fakeRunner) Close(ctx context.Context, name string) error {
 	return err
 }
 
-func (f *fakeRunner) TestKey(ctx context.Context, device string, key []byte) error {
-	_, err := f.Run(ctx, key, luksBinary, "test-key", device)
+func (f *fakeRunner) TestKey(ctx context.Context, device string, key *enclave.MemoryEnclave) error {
+	_, err := f.Run(ctx, keyBytes(key), luksBinary, "test-key", device)
 	return err
 }
 

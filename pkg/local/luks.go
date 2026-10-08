@@ -118,10 +118,9 @@ func encryptedTagFor(headerBytes int64) string {
 //
 // It exists because growing a dm-crypt mapping in place means reloading the
 // device-mapper table underneath the live device, and that needs the
-// container's master key. go-luks2 v0.1.8-alpha exposes neither a resize nor
-// any way to obtain that key (getMasterKey and unlockKeyslot are unexported),
-// so the only mechanism available through it is to REMOVE the mapping and
-// unlock again. That is a destructive shape wearing a resize's name: the
+// container's master key. go-luks2 v1.0.0-rc.2 exposes no resize and no table
+// reload (pkg/dmcrypt has Activate, Lookup and Deactivate), so the only
+// mechanism available through it is to REMOVE the mapping and unlock again. That is a destructive shape wearing a resize's name: the
 // teardown is unconditional and the rebuild can fail — a KeyProvider rotated
 // since the volume was attached, a damaged header, any device-mapper refusal —
 // and what the caller is left with is not an unresized volume but no plaintext

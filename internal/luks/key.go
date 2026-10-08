@@ -107,8 +107,7 @@ func FileKeyProvider(scope, path string) KeyProvider {
 			}
 			return nil
 		}); err != nil {
-			enc.Destroy()
-			return nil, err
+			return nil, errors.Join(err, enc.Destroy())
 		}
 		return enc, nil
 	}
@@ -155,8 +154,7 @@ func StaticKeyProvider(scope string, stored *enclave.MemoryEnclave) (KeyProvider
 				copy(dst, src)
 				return nil
 			}); fillErr != nil {
-				created.Destroy()
-				return fillErr
+				return errors.Join(fillErr, created.Destroy())
 			}
 			fresh = created
 			return nil

@@ -43,9 +43,9 @@ The library is built from three pieces:
   device-mapper ioctls — so **no `cryptsetup` binary is forked or needs to be
   installed**. LUKS passphrases arrive through a `KeyProvider` callback as a
   [go-enclave](https://github.com/jeremyhahn/go-enclave) `MemoryEnclave` — mlock'd,
-  guard-paged, wiped on release — and become a `[]byte` only inside the borrow
-  that hands them to go-luks2 for one call; they never leave the process, and
-  never appear on a command line. If the kernel will not lock memory the
+  guard-paged, wiped on release — and are lent to go-luks2 as that enclave for
+  one call, never converted to a `[]byte` by this repository; they never leave
+  the process, and never appear on a command line. If the kernel will not lock memory the
   operation fails naming `RLIMIT_MEMLOCK` rather than falling back to
   unprotected memory. Where the key came from (a file, an operator, a
   TPM-sealed blob) is the caller's business. Needs LVM 2.03.12+.
@@ -531,22 +531,25 @@ compile-based check.
 
 The fourth, `key-material-custody`, is the custody model made mechanical. A
 LUKS passphrase here is never a plain `[]byte` or `string` at rest: it lives in
-a go-enclave `MemoryEnclave` and becomes bytes in exactly one place,
-`internal/luks.(*Manager).withKey`, for the length of one `Backend` call. The
-scanner type-checks every non-test package — under both the Linux and a
-non-Linux build configuration, so the `_other.go` stubs are read too, and with
-a scan failure for any file no configuration selects — and refuses five things:
-a call to the enclave's copying exits `Open`/`OpenString`; a `WithBytes` borrow
-anywhere but the named windows, with `withKey` as an anchor that must borrow
+a go-enclave `MemoryEnclave` that `internal/luks.(*Manager).withKey` lends to
+one `Backend` call and then destroys; go-luks2 does the borrowing. The scanner
+type-checks every non-test package — under both the Linux and a non-Linux build
+configuration, so the `_other.go` stubs are read too, and with a scan failure
+for any file no configuration selects — and refuses four things: a `WithBytes`
+borrow anywhere but the named windows (the key and secret providers, which fill
+and clone enclaves, and the replication secret's write-out; `withKey` is
+deliberately not one), with `FileKeyProvider` as an anchor that must borrow
 exactly once so the rule cannot pass vacuously; a call to the key-taking
 `Backend` methods from outside `internal/luks`; a borrowed `key []byte` used
 anywhere but as a direct call argument; and an exported signature that carries
 a `key`, `passphrase`, `secret`, `password` or `token` as a `string` or
 `[]byte`. It resolves types rather than matching names, so `os.Open` and
-`luks.Backend.Open` do not fire and go-enclave's does. The two refinements it
-needed on this tree — a struct literal passed straight to go-luks2, and a bare
-`key string` being a key/value key in `pkg/common.Coordinator` — are written
-in the scanner's doc comment, not tuned into silence.
+`luks.Backend.Open` do not fire and go-enclave's does. The copying exits
+`Open`/`OpenString` need no rule: go-enclave v0.8.0 removed them, so a call no
+longer compiles. The two refinements it needed on this tree — a struct literal
+passed straight to a call, and a bare `key string` being a key/value key in
+`pkg/common.Coordinator` — are written in the scanner's doc comment, not tuned
+into silence.
 
 Two properties of the runner are load-bearing:
 

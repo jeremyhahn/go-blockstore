@@ -23,7 +23,7 @@ import (
 	"path/filepath"
 	"unsafe"
 
-	"github.com/jeremyhahn/go-luks2/pkg/luks2"
+	"github.com/jeremyhahn/go-luks2/pkg/dmcrypt"
 	"golang.org/x/sys/unix"
 )
 
@@ -122,7 +122,7 @@ func platformProbes() map[Capability]Probe {
 	return map[Capability]Probe{
 		CapabilityDeviceMapper:  deviceMapperProbe(liveDeviceMapperSteps()),
 		CapabilityMount:         mountProbe(liveMountSteps()),
-		CapabilityKernelKeyring: keyringProbe(luks2.CheckKeyringAvailable),
+		CapabilityKernelKeyring: keyringProbe(dmcrypt.CheckKeyring),
 		CapabilityNetAdmin:      netAdminProbe(liveNetAdminSteps()),
 		CapabilityDRBDControl:   drbdControlProbe(liveDRBDControlSteps()),
 	}
@@ -406,12 +406,12 @@ func mountProbe(steps mountSteps) Probe {
 //
 // The probe is DELEGATED rather than reimplemented. go-luks2 owns the kernel
 // keyring in this stack: it is the package that adds the volume key, it decides
-// which ring and which key type, and its CheckKeyringAvailable exercises that
+// which ring and which key type, and dmcrypt.CheckKeyring exercises that
 // exact sequence — an add and a verified release of a throwaway 64-byte probe
 // under a randomized description. A second implementation here would probe a
 // slightly different thing and would drift, which is the failure mode a guard
 // can least afford.
-func keyringProbe(check func() error) Probe {
+func keyringProbe(check func(context.Context) error) Probe {
 	return func(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return &CapabilityError{
@@ -426,7 +426,7 @@ func keyringProbe(check func() error) Probe {
 		// error interface produces a non-nil error holding a nil pointer, which
 		// panics the first time anything renders it. Package factory guards the
 		// same trap on the way out of a provider constructor.
-		if failure := classifyKeyring(check()); failure != nil {
+		if failure := classifyKeyring(check(ctx)); failure != nil {
 			return failure
 		}
 		return nil
@@ -604,9 +604,9 @@ var keyringCauses = []struct {
 	sentinel error
 	cause    Cause
 }{
-	{luks2.ErrKeyringBlocked, CauseSyscallBlocked},
-	{luks2.ErrKeyringUnsupported, CauseKernelUnsupported},
-	{luks2.ErrKeyringQuotaExhausted, CauseResourceExhausted},
+	{dmcrypt.ErrKeyringBlocked, CauseSyscallBlocked},
+	{dmcrypt.ErrKeyringUnsupported, CauseKernelUnsupported},
+	{dmcrypt.ErrKeyringQuotaExhausted, CauseResourceExhausted},
 }
 
 // classifyKeyring turns go-luks2's answer into a typed finding, or nil when the

@@ -1,23 +1,23 @@
 // A fixture proving the key-material-custody scanner does NOT fire on the
-// custody model itself: the anchor borrow window, the sanctioned Backend seam,
-// and the shapes internal/luks legitimately uses. Every construction here is
-// one the real internal/luks uses today.
+// custody model itself: the anchor borrow window, the Backend seam, and the
+// shapes internal/luks legitimately uses. Every construction here is one the
+// real internal/luks uses today.
 
 package luks
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// Backend mirrors the real seam: the three key-taking methods are exempt from
-// rule 5 because they ARE the sanctioned boundary, and a scanner that fired on
-// the seam it exists to protect would be switched off.
+// Backend mirrors the real seam: the key travels as an enclave, so none of its
+// methods carries material in the clear and rule 4 has nothing to say about it.
 type Backend interface {
-	Format(ctx context.Context, device string, key []byte) error
-	Open(ctx context.Context, device, name string, key []byte) error
-	TestKey(ctx context.Context, device string, key []byte) error
+	Format(ctx context.Context, device string, key *enclave.MemoryEnclave) error
+	Open(ctx context.Context, device, name string, key *enclave.MemoryEnclave) error
+	TestKey(ctx context.Context, device string, key *enclave.MemoryEnclave) error
 	Close(ctx context.Context, name string) error
 }
 
@@ -27,66 +27,41 @@ type Manager struct {
 	backend Backend
 }
 
-// withKey is the anchor: the one borrow window.
-func (m *Manager) withKey(ctx context.Context, volID string, op func(key []byte) error) error {
+// withKey lends the enclave for one call and destroys it. It never borrows:
+// the passphrase does not become a []byte in this package.
+func (m *Manager) withKey(ctx context.Context, volID string, op func(key *enclave.MemoryEnclave) error) error {
 	enc, err := m.keys(ctx, volID)
 	if err != nil {
 		return err
 	}
-	defer enc.Destroy()
-	return enc.WithBytes(op)
+	return errors.Join(op(enc), enc.Destroy())
 }
 
 // Format calls the key-taking seam from INSIDE internal/luks, which is the one
 // package allowed to; the closure declares key itself and passes it straight on.
 func (m *Manager) Format(ctx context.Context, volID, device string) error {
-	return m.withKey(ctx, volID, func(key []byte) error {
+	return m.withKey(ctx, volID, func(key *enclave.MemoryEnclave) error {
 		return m.backend.Format(ctx, device, key)
 	})
 }
 
 // Open does the same through Open, and TestPassphrase through TestKey.
 func (m *Manager) Open(ctx context.Context, volID, device string) error {
-	return m.withKey(ctx, volID, func(key []byte) error {
+	return m.withKey(ctx, volID, func(key *enclave.MemoryEnclave) error {
 		return m.backend.Open(ctx, device, volID, key)
 	})
 }
 
-// TestPassphrase is exported with a material WORD in its name; rule 5 is about
+// TestPassphrase is exported with a material WORD in its name; rule 4 is about
 // parameters and results, not function names.
 func (m *Manager) TestPassphrase(ctx context.Context, volID, device string) error {
-	return m.withKey(ctx, volID, func(key []byte) error {
+	return m.withKey(ctx, volID, func(key *enclave.MemoryEnclave) error {
 		return m.backend.TestKey(ctx, device, key)
 	})
 }
 
-// options mirrors go-luks2's FormatOptions: the native backend hands the key
-// over inside a struct literal that is itself the call's argument.
-type options struct {
-	Device     string
-	Passphrase []byte
-}
-
-func format(options) error { return nil }
-
-// Native mirrors the real backend's Format: the key appears in a composite
-// literal, but the literal is built for the call and passed with it, so the key
-// does not outlive the call any more than a bare argument would.
-type Native struct{}
-
-// Format is the shape native_linux.go has today.
-func (Native) Format(ctx context.Context, device string, key []byte) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if len(key) == 0 {
-		return nil
-	}
-	return format(options{Device: device, Passphrase: key})
-}
-
-// FileKeyProvider mirrors the real one: a fill borrow that reads a descriptor
-// into locked pages. It is one of the named windows.
+// FileKeyProvider mirrors the real one and is the anchor: a fill borrow that
+// reads a descriptor into locked pages, with exactly one WithBytes.
 func FileKeyProvider(scope, keyPath string) func(context.Context, string) (*enclave.MemoryEnclave, error) {
 	return func(context.Context, string) (*enclave.MemoryEnclave, error) {
 		enc, err := enclave.NewMemoryEnclaveSized(8)
@@ -94,8 +69,7 @@ func FileKeyProvider(scope, keyPath string) func(context.Context, string) (*encl
 			return nil, err
 		}
 		if err := enc.WithBytes(func(buf []byte) error { return nil }); err != nil {
-			enc.Destroy()
-			return nil, err
+			return nil, errors.Join(err, enc.Destroy())
 		}
 		return enc, nil
 	}
@@ -115,8 +89,7 @@ func StaticKeyProvider(scope string, stored *enclave.MemoryEnclave) func(context
 				copy(dst, src)
 				return nil
 			}); fillErr != nil {
-				created.Destroy()
-				return fillErr
+				return errors.Join(fillErr, created.Destroy())
 			}
 			fresh = created
 			return nil

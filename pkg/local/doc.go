@@ -150,14 +150,15 @@
 //
 // A passphrase never exists as an ordinary []byte. It arrives through a
 // KeyProvider callback as a go-enclave MemoryEnclave — mlock'd pages, fenced by
-// guard pages, kept out of core dumps and wiped on release — and becomes a
-// []byte only inside the WithBytes borrow that hands it to go-luks2 for one
-// call, which the provider then destroys. It does not leave the process at all:
-// before 2026-08-29 that borrow wrote it to a cryptsetup child's standard
-// input, and now there is no child. A []byte would have been
-// unfixable: zeroing the slice a caller holds reaches neither the copies the
-// garbage collector may have made nor the pages the kernel may have swapped,
-// and the material would be in any core dump taken meanwhile.
+// guard pages, kept out of core dumps and wiped on release — and this package
+// never turns it into a []byte at all: the Manager lends the enclave to go-luks2
+// for one call, go-luks2 borrows it for the derivation, and the Manager then
+// destroys it. It does not leave the process at all: before 2026-08-29 it was
+// written to a cryptsetup child's standard input, and now there is no child. A
+// []byte would have been unfixable: zeroing the slice a caller holds reaches
+// neither the copies the garbage collector may have made nor the pages the
+// kernel may have swapped, and the material would be in any core dump taken
+// meanwhile.
 //
 // If the kernel will not lock pages — RLIMIT_MEMLOCK, almost always — the
 // operation FAILS with an error naming the limit. It does not fall back to

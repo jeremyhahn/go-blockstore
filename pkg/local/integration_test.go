@@ -53,11 +53,15 @@ import (
 	"testing"
 
 	"github.com/jeremyhahn/go-enclave"
+	"github.com/jeremyhahn/go-luks2/pkg/dmcrypt"
+	"github.com/jeremyhahn/go-luks2/pkg/loop"
 	"github.com/jeremyhahn/go-luks2/pkg/luks2"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/jeremyhahn/go-blockstore/internal/blkdev"
+	"github.com/jeremyhahn/go-blockstore/internal/luks"
+	"github.com/jeremyhahn/go-blockstore/internal/luks/luktest"
 	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 	"github.com/jeremyhahn/go-blockstore/pkg/preflight"
@@ -106,15 +110,15 @@ func testVG(t *testing.T) string {
 	// The loop device is attached with the LOOP_CTL_GET_FREE / LOOP_SET_FD
 	// ioctls rather than by forking losetup(8), which is the same rule the
 	// provider itself now follows for LUKS: pure Go unless there is no other
-	// way. go-luks2 owns that code because it needs it for its own tests.
-	loop, err := luks2.SetupLoopDevice(backing)
+	// way. go-luks2's pkg/loop owns that code.
+	loopDev, err := loop.Attach(context.Background(), backing)
 	if err != nil {
 		t.Fatalf("attaching a loop device to %s: %v", backing, err)
 	}
-	t.Cleanup(func() { _ = luks2.DetachLoopDevice(loop) })
+	t.Cleanup(func() { _, _ = loopDev.Detach(context.Background()) })
 
-	run(t, "pvcreate", "--force", "--yes", loop)
-	run(t, "vgcreate", vg, loop)
+	run(t, "pvcreate", "--force", "--yes", loopDev.Path())
+	run(t, "vgcreate", vg, loopDev.Path())
 
 	// ORDER MATTERS, and t.Cleanup is LIFO: the LAST registered runs FIRST.
 	// vgremove cannot remove a volume group whose logical volume a dm-crypt
@@ -183,16 +187,44 @@ func mustStaticKeyIT(t *testing.T, passphrase string) KeyProvider {
 	return kp
 }
 
+// unlockByHand opens the container on device and activates it under name
+// without going through the provider, so a test can plant a mapping the
+// provider did not make.
+func unlockByHand(ctx context.Context, device, passphrase, name string) error {
+	pass, err := enclave.NewMemoryEnclave([]byte(passphrase))
+	if err != nil {
+		return err
+	}
+	v, err := luks2.Open(ctx, device)
+	if err != nil {
+		return errors.Join(err, pass.Destroy())
+	}
+	key, err := v.Unlock(ctx, pass)
+	if err != nil {
+		return errors.Join(err, v.Close(), pass.Destroy())
+	}
+	_, err = dmcrypt.Activate(ctx, v, key, name)
+	key.Destroy()
+	return errors.Join(err, v.Close(), pass.Destroy())
+}
+
 // luksUUID reads a container's UUID out of its binary header. It is the
 // identity that tells a verbatim copy from a reformat, and it is read in
 // process rather than by shelling out to `cryptsetup luksUUID`.
 func luksUUID(t *testing.T, device string) string {
 	t.Helper()
-	hdr, _, err := luks2.ReadHeader(device)
+	ctx := context.Background()
+	v, err := luks2.Open(ctx, device, luks2.WithReadOnly())
+	if err != nil {
+		t.Fatalf("opening the LUKS container on %s: %v", device, err)
+	}
+	defer func() { _ = v.Close() }()
+
+	header, err := v.Header(ctx)
 	if err != nil {
 		t.Fatalf("reading the LUKS header on %s: %v", device, err)
 	}
-	return strings.TrimSpace(string(luks2.TrimRight(hdr.UUID[:], "\x00")))
+	return header.UUID()
 }
 
 // moveDataOffset rewrites a container's data segment to start at offset,
@@ -200,31 +232,41 @@ func luksUUID(t *testing.T, device string) string {
 //
 // It exists because go-luks2 offers no offset option: every container it writes
 // puts its data at 16 MiB, so a test about a FOREIGN header has no way to ask
-// for one. The header is read, the one field is changed, and go-luks2 writes it
-// back — which recomputes both copies' checksums, so the result is a valid
-// container rather than a corrupted one. The keyslot area ends at 290816 bytes,
-// far below any offset a caller of this would choose, so nothing is overwritten
-// and the container still opens with its original passphrase.
+// for one. The JSON area is rewritten on disk and both copies' checksums are
+// recomputed, so the result is a valid container rather than a corrupted one.
+// The keyslot area ends at 290816 bytes, far below any offset a caller of this
+// would choose, so nothing is overwritten and the container still opens with
+// its original passphrase.
 func moveDataOffset(t *testing.T, device string, offset int64) {
 	t.Helper()
 
-	hdr, metadata, err := luks2.ReadHeader(device)
-	if err != nil {
-		t.Fatalf("reading the LUKS header on %s: %v", device, err)
-	}
-	segment, ok := metadata.Segments["0"]
-	if !ok {
-		t.Fatalf("the container on %s has no data segment 0", device)
-	}
-	segment.Offset = strconv.FormatInt(offset, 10)
-	// The keyslots area is declared as everything before the data, so it has to
-	// move with it or the header contradicts itself.
-	metadata.Config.KeyslotsSize = strconv.FormatInt(offset, 10)
-
-	if err := luks2.WriteHeader(device, hdr, metadata); err != nil {
-		t.Fatalf("rewriting the LUKS header on %s: %v", device, err)
-	}
+	luktest.Rewrite(t, device, func(metadata map[string]any) error {
+		if err := luktest.SetSegmentOffset(metadata, strconv.FormatInt(offset, 10)); err != nil {
+			return err
+		}
+		// The keyslots area is declared as everything between the two header
+		// copies and the data, so it has to move with it or the header
+		// contradicts itself and go-luks2 refuses it.
+		return luktest.SetKeyslotsSize(metadata, strconv.FormatInt(offset-2*luksHeaderCopyBytes, 10))
+	})
 }
+
+// The parameters a container this provider formats must carry, spelled out
+// here rather than imported: internal/luks does not export its constants, and a
+// test that read them from there would pass whatever they said. These are the
+// FIPS-deployable choices the header is checked against.
+const (
+	luksPBKDF       = "pbkdf2"
+	luksHash        = "sha512"
+	luksCipher      = "aes"
+	luksCipherMode  = "xts-plain64"
+	luksKeySizeBits = 512
+	luksSectorSize  = 4096
+)
+
+// luksHeaderCopyBytes is the size of one of the two header copies go-luks2
+// writes in front of the keyslots area.
+const luksHeaderCopyBytes = 16384
 
 // assertFIPSHeader reads a real LUKS2 header and checks the parameters that
 // make the container FIPS-deployable. The library's defaults are not approved —
@@ -238,10 +280,7 @@ func moveDataOffset(t *testing.T, device string, offset int64) {
 func assertFIPSHeader(t *testing.T, device string) {
 	t.Helper()
 
-	_, metadata, err := luks2.ReadHeader(device)
-	if err != nil {
-		t.Fatalf("reading the LUKS header on %s: %v", device, err)
-	}
+	metadata := luktest.Read(t, device)
 
 	wantCipher := luksCipher + "-" + luksCipherMode
 	for id, keyslot := range metadata.Keyslots {
@@ -1249,17 +1288,17 @@ func TestIntegrationForeignMappingIsRefused(t *testing.T) {
 	// Open "theirs" by hand under the name the provider reserves for "ours".
 	run(t, "lvchange", "--activate", "y", "--yes", p.lvRef(theirs.ID))
 	stolen := p.mappingName(ours.ID)
-	if err := luks2.Unlock(p.lvPath(theirs.ID), []byte("foreign-mapping-passphrase"), stolen); err != nil {
+	if err := unlockByHand(ctx, p.lvPath(theirs.ID), "foreign-mapping-passphrase", stolen); err != nil {
 		t.Fatalf("setting up the foreign mapping: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = luks2.Lock(stolen)
+		_ = dmcrypt.Deactivate(ctx, stolen)
 		_ = exec.Command("lvchange", "--activate", "n", "--yes", p.lvRef(theirs.ID)).Run()
 	})
 
 	// The mapping really is live under our name — the hazard is present, not
 	// hypothetical.
-	if !luks2.IsUnlocked(stolen) {
+	if _, err := dmcrypt.Lookup(ctx, stolen); err != nil {
 		t.Fatalf("the foreign mapping %q is not active; this test proves nothing", stolen)
 	}
 
@@ -1930,8 +1969,16 @@ func TestIntegrationDetachedForeignHeaderReportsCorrectly(t *testing.T) {
 	t.Cleanup(func() { _ = exec.Command("lvremove", "--force", vg+"/foreign").Run() })
 	run(t, "lvchange", "--activate", "y", "--yes", vg+"/foreign")
 
-	if err := (nativeLUKS{}).Format(ctx, "/dev/"+vg+"/foreign", []byte(passphrase)); err != nil {
-		t.Fatalf("formatting the foreign container: %v", err)
+	foreignKey, err := enclave.NewMemoryEnclave([]byte(passphrase))
+	if err != nil {
+		t.Fatalf("NewMemoryEnclave: %v", err)
+	}
+	formatErr := (luks.Native{}).Format(ctx, "/dev/"+vg+"/foreign", foreignKey)
+	if destroyErr := foreignKey.Destroy(); destroyErr != nil {
+		t.Errorf("Destroy: %v", destroyErr)
+	}
+	if formatErr != nil {
+		t.Fatalf("formatting the foreign container: %v", formatErr)
 	}
 	moveDataOffset(t, "/dev/"+vg+"/foreign", foreignHeader)
 
@@ -2158,7 +2205,7 @@ func TestIntegrationResizeDoesNotDestroyTheMappingItCannotGrow(t *testing.T) {
 
 	// THE assertion. Everything below this line would fail against a resize
 	// that tore the mapping down before finding out it could not rebuild it.
-	if !luks2.IsUnlocked(p.mappingName(vol.ID)) {
+	if _, err := dmcrypt.Lookup(ctx, p.mappingName(vol.ID)); err != nil {
 		t.Fatal("the plaintext mapping is gone after a refused resize; the resize destroyed " +
 			"a working mapping it was never able to replace")
 	}

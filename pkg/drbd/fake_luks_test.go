@@ -22,6 +22,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/jeremyhahn/go-enclave"
+
 	"github.com/jeremyhahn/go-blockstore/internal/luks"
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
 )
@@ -101,15 +103,15 @@ func (f *fakeLUKS) record(op string, args ...string) error {
 	return f.fail[op]
 }
 
-func (f *fakeLUKS) Format(_ context.Context, device string, key []byte) error {
-	if len(key) == 0 {
+func (f *fakeLUKS) Format(_ context.Context, device string, key *enclave.MemoryEnclave) error {
+	if !f.holdsKey(key) {
 		f.r.t.Errorf("Format was handed an empty passphrase for %s", device)
 	}
 	return f.record("format", device)
 }
 
-func (f *fakeLUKS) Open(_ context.Context, device, name string, key []byte) error {
-	if len(key) == 0 {
+func (f *fakeLUKS) Open(_ context.Context, device, name string, key *enclave.MemoryEnclave) error {
+	if !f.holdsKey(key) {
 		f.r.t.Errorf("Open was handed an empty passphrase for %s", device)
 	}
 	if err := f.record("open", device, name); err != nil {
@@ -130,7 +132,22 @@ func (f *fakeLUKS) Close(_ context.Context, name string) error {
 	return nil
 }
 
-func (f *fakeLUKS) TestKey(_ context.Context, device string, _ []byte) error {
+// holdsKey reports whether key is a live enclave with something in it.
+func (f *fakeLUKS) holdsKey(key *enclave.MemoryEnclave) bool {
+	if key == nil {
+		return false
+	}
+	empty := true
+	if err := key.WithBytes(func(b []byte) error {
+		empty = len(b) == 0
+		return nil
+	}); err != nil {
+		return false
+	}
+	return !empty
+}
+
+func (f *fakeLUKS) TestKey(_ context.Context, device string, _ *enclave.MemoryEnclave) error {
 	return f.record("test-key", device)
 }
 
