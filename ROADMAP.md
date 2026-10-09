@@ -11,15 +11,15 @@ Consumed through go-quicbaas, not called directly by applications.
 
 ## Current milestone
 
-[Release candidate (M10)](http://git.example.internal/jeremyhahn/go-blockstore/milestone/10), target kind RC.
+[Release candidate (M10)](../../milestone/10), target kind RC.
 Projected 2026-10-15.
 
 ## Now
 
-- [#75](http://git.example.internal/jeremyhahn/go-blockstore/issues/75) public release readiness signed off — in review
+- [#75](../../issues/75) public release readiness signed off — in review
 - readiness: readiness PR #76 merged — in review
-- [#86](http://git.example.internal/jeremyhahn/go-blockstore/issues/86) release artifacts signed (IS-14) — open
-- [#87](http://git.example.internal/jeremyhahn/go-blockstore/issues/87) docs index and Serena config conform — open
+- [#86](../../issues/86) release artifacts signed (IS-14) — open
+- [#87](../../issues/87) docs index and Serena config conform — open
 
 ## Next
 
