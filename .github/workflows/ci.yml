@@ -55,7 +55,7 @@ env:
   # go1.27.1 into the toolcache and bakes golangci-lint v2.14.0 built with
   # go1.27.1 (see the lint job below). The Makefile reads the same number from
   # go.mod for `make test-container`.
-  GO_VERSION: "1.27.1"
+  GO_VERSION: "1.27.2"
   COVERAGE_THRESHOLD: 90      # CUSTOMIZE: per testing-guidelines.md. The tree is at 100% today
 
   # CUSTOMIZE (go-blockstore): the build tags every go invocation below

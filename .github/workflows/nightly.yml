@@ -37,7 +37,7 @@ permissions:
 # the fips job, which resolves to empty and hands setup-go no version. Declared
 # here; keep it equal to GO_VERSION in ci.yml.
 env:
-  GO_VERSION: "1.27.1"
+  GO_VERSION: "1.27.2"
   BUILD_TAGS: ''
 
 jobs:
