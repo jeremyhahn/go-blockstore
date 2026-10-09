@@ -32,5 +32,10 @@ go.work.sum
 .env
 
 
+# Serena: only .serena/project.yml is tracked
+.serena/cache/
+.serena/memories/
+.serena/project.local.yml
+
 # staging directory for scripts/preflight-container-matrix.sh
 .preflight-matrix-tmp/
