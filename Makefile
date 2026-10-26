@@ -35,7 +35,36 @@
 TAGS ?= drbd
 
 comma := ,
-TAG_FLAGS := $(if $(strip $(TAGS)),-tags=$(strip $(TAGS)),)
+empty :=
+space := $(empty) $(empty)
+
+# GO_BUILD_TAGS is the ci-template (v1.21+) hook: every stage it calls gets the
+# CI tag set as `make <target> GO_BUILD_TAGS='a b'`, SPACE-separated (handbook
+# devcontainer.md §6). It is ADDED to whatever a target already builds with —
+# TAGS here, a target's own fixed tags below — and never replaces them. Empty,
+# the default, changes no command line (#98; `make check-build-tags` proves it).
+#
+# The merge happens once, here: `tags_flag` takes a word list (TAGS commas
+# split to spaces), drops repeats keeping first-seen order, and emits
+# `-tags=a,b` — or nothing for an empty list. Every recipe calls it rather
+# than spelling its own -tags=, so no target can miss GO_BUILD_TAGS.
+GO_BUILD_TAGS ?=
+uniq = $(if $1,$(firstword $1) $(call uniq,$(filter-out $(firstword $1),$1)))
+tag_csv = $(subst $(space),$(comma),$(strip $(call uniq,$(subst $(comma),$(space),$1))))
+tags_flag = $(if $(strip $(call tag_csv,$1)),-tags=$(call tag_csv,$1),)
+# With GO_BUILD_TAGS, never without: a target's fixed tags plus the CI set.
+with_ci_tags = $(call tags_flag,$1 $(GO_BUILD_TAGS))
+
+BUILD_TAGS_LIST := $(TAGS) $(GO_BUILD_TAGS)
+TAG_FLAGS := $(call tags_flag,$(BUILD_TAGS_LIST))
+
+# golangci-lint takes its tags from `run.build-tags` in .golangci.yml, and a
+# --build-tags flag REPLACES that list rather than adding to it. So the flag is
+# passed only when GO_BUILD_TAGS is set, and then carries the config's tags as
+# well as the merged set. GOLANGCI_CONFIG_TAGS mirrors run.build-tags;
+# scripts/check-build-tags.sh fails if the two drift.
+GOLANGCI_CONFIG_TAGS := drbd
+LINT_TAG_FLAGS := $(if $(strip $(GO_BUILD_TAGS)),--build-tags=$(call tag_csv,$(GOLANGCI_CONFIG_TAGS) $(BUILD_TAGS_LIST)),)
 
 GO := go
 GOBUILD := $(GO) build $(TAG_FLAGS)
@@ -185,7 +214,7 @@ build:
 # -race is part of `make test` itself, not a separate opt-in (devops.md §4).
 # `race` below is the same detector without coverage instrumentation, for when
 # a suspected data race should be reproduced on uninstrumented code.
-test:
+test: check-build-tags
 	@echo "$(CYAN)$(BOLD)→ Running unit tests (race detector, coverage)...$(RESET)"
 	@mkdir -p $(COVERAGE_DIR)
 	$(GOTEST) -race -count=1 -timeout=$(TEST_TIMEOUT) -covermode=atomic -coverprofile=$(COVERAGE_PROFILE) ./...
@@ -193,6 +222,14 @@ test:
 # guard:fail-open a display line only — the coverage THRESHOLD is enforced by the `coverage` target, which does not swallow
 	@$(GO) tool cover -func=$(COVERAGE_PROFILE) | tail -1 | awk '{print "  $(GREEN)Total coverage: " $$NF "$(RESET)"}' || true
 	@echo "$(GREEN)✓ Unit tests complete$(RESET)"
+
+.PHONY: check-build-tags
+## check-build-tags: Prove GO_BUILD_TAGS reaches every template target, and empty is a no-op (#98)
+# Reads `make -n`, so it compiles nothing and costs about a second. Part of
+# `make test` because a target that drops GO_BUILD_TAGS still passes — on the
+# wrong tag set — and nothing else would say so.
+check-build-tags:
+	@./scripts/check-build-tags.sh
 
 .PHONY: race
 ## race: Run the race detector without coverage instrumentation
@@ -220,7 +257,7 @@ race:
 #
 integration-test:
 	@echo "$(CYAN)$(BOLD)→ Running integration tests...$(RESET)"
-	$(GO) test -tags=integration$(if $(strip $(TAGS)),$(comma)$(strip $(TAGS)),) -count=1 -timeout=$(TEST_TIMEOUT) ./...
+	$(GO) test $(call tags_flag,integration $(BUILD_TAGS_LIST)) -count=1 -timeout=$(TEST_TIMEOUT) ./...
 	@echo "$(YELLOW)  note: the destructive real-provider suites are NOT included:$(RESET)"
 	@echo "$(YELLOW)        drbd real-cluster    → make integration-test-drbd$(RESET)"
 	@echo "$(YELLOW)        local real LVM/LUKS  → make integration-test-local$(RESET)"
@@ -235,7 +272,7 @@ integration-test:
 integration-test-drbd:
 	@echo "$(CYAN)$(BOLD)→ Running the drbd real-cluster suite...$(RESET)"
 	@echo "$(YELLOW)  DESTRUCTIVE: creates and destroys LVs and DRBD resources on this host$(RESET)"
-	$(GO) test -tags=drbd,drbd_integration -count=1 -timeout=$(TEST_TIMEOUT) -run Integration ./pkg/drbd/
+	$(GO) test $(call with_ci_tags,drbd drbd_integration) -count=1 -timeout=$(TEST_TIMEOUT) -run Integration ./pkg/drbd/
 	@echo "$(GREEN)✓ drbd real-cluster suite complete$(RESET)"
 
 .PHONY: integration-test-local
@@ -260,7 +297,7 @@ integration-test-drbd:
 integration-test-local:
 	@echo "$(CYAN)$(BOLD)→ Running the local provider real LVM/LUKS suite...$(RESET)"
 	@echo "$(YELLOW)  DESTRUCTIVE: creates and destroys loop devices, VGs and LUKS volumes on this host$(RESET)"
-	$(GO) test -tags=local_integration -count=1 -timeout=$(TEST_TIMEOUT) -run Integration ./pkg/local/
+	$(GO) test $(call with_ci_tags,local_integration) -count=1 -timeout=$(TEST_TIMEOUT) -run Integration ./pkg/local/
 	@echo "$(GREEN)✓ local provider real suite complete$(RESET)"
 
 .PHONY: integration-clean-local
@@ -362,7 +399,7 @@ integration-test-cryptsetup:
 	@echo "$(CYAN)$(BOLD)→ Running the cryptsetup compatibility gate...$(RESET)"
 	@echo "$(YELLOW)  DESTRUCTIVE: creates and destroys loop devices, VGs and LUKS volumes on this host$(RESET)"
 	@echo "$(YELLOW)  REQUIRES: root, loop devices, lvm2 AND the cryptsetup binary$(RESET)"
-	$(GO) test -tags=local_integration,cryptsetup_compat -count=1 -timeout=$(TEST_TIMEOUT) -run Integration ./pkg/local/
+	$(GO) test $(call with_ci_tags,local_integration cryptsetup_compat) -count=1 -timeout=$(TEST_TIMEOUT) -run Integration ./pkg/local/
 	@echo "$(GREEN)✓ cryptsetup compatibility gate complete$(RESET)"
 
 .PHONY: guards
@@ -403,7 +440,7 @@ guards:
 test-kernel-mountinfo:
 	@echo "$(CYAN)$(BOLD)→ Checking internal/mountinfo against this kernel...$(RESET)"
 	@echo "$(YELLOW)  REQUIRES: a host that permits unprivileged user + mount namespaces$(RESET)"
-	$(GO) test -tags=kernel_mountinfo -count=1 -timeout=$(TEST_TIMEOUT) -run TestAgainstARunningKernel -v ./internal/mountinfo/
+	$(GO) test $(call with_ci_tags,kernel_mountinfo) -count=1 -timeout=$(TEST_TIMEOUT) -run TestAgainstARunningKernel -v ./internal/mountinfo/
 	@echo "$(GREEN)✓ Live-kernel mountinfo checks complete$(RESET)"
 
 .PHONY: test-kernel-dm
@@ -416,7 +453,7 @@ test-kernel-mountinfo:
 test-kernel-dm:
 	@echo "$(CYAN)$(BOLD)→ Checking internal/luks against this kernel's device-mapper...$(RESET)"
 	@echo "$(YELLOW)  REQUIRES: /dev/mapper/control, readable by this user$(RESET)"
-	$(GO) test -tags=kernel_dm -count=1 -timeout=$(TEST_TIMEOUT) -run TestNativeMapping -v ./internal/luks/
+	$(GO) test $(call with_ci_tags,kernel_dm) -count=1 -timeout=$(TEST_TIMEOUT) -run TestNativeMapping -v ./internal/luks/
 	@echo "$(GREEN)✓ Live device-mapper checks complete$(RESET)"
 
 .PHONY: test-kernel-keypath
@@ -442,7 +479,7 @@ test-kernel-dm:
 test-kernel-keypath:
 	@echo "$(CYAN)$(BOLD)→ Checking the key-path guard against this kernel...$(RESET)"
 	@echo "$(YELLOW)  REQUIRES: a host that permits unprivileged user + mount namespaces$(RESET)"
-	$(GO) test -tags=kernel_keypath -count=1 -timeout=$(TEST_TIMEOUT) -run TestAgainstARunningKernel -v ./pkg/local/
+	$(GO) test $(call with_ci_tags,kernel_keypath) -count=1 -timeout=$(TEST_TIMEOUT) -run TestAgainstARunningKernel -v ./pkg/local/
 	@echo "$(GREEN)✓ Live-kernel key-path checks complete$(RESET)"
 
 .PHONY: preflight-matrix
@@ -540,7 +577,7 @@ golangci-lint:
 		exit 1; \
 	fi; \
 	echo "$(CYAN)  Using $$BIN ($$FOUND)$(RESET)"; \
-	"$$BIN" run --timeout=5m ./...
+	"$$BIN" run $(strip --timeout=5m $(LINT_TAG_FLAGS)) ./...
 	@echo "$(GREEN)✓ golangci-lint passed$(RESET)"
 
 .PHONY: actionlint
@@ -654,9 +691,10 @@ GOSEC_ARGS = -concurrency 4 -stdout -verbose=text \
 	-exclude-dir=test -exclude-dir=examples \
 	-severity=medium -confidence=medium
 
-# gosec spells the flag the same way but parses it itself; TAGS is already
-# comma-separated, so it passes straight through.
-GOSEC_TAG_FLAGS := $(if $(strip $(TAGS)),-tags=$(strip $(TAGS)),)
+# gosec spells the flag the same way but parses it itself; TAG_FLAGS is
+# already comma-separated (TAGS plus GO_BUILD_TAGS), so it passes straight
+# through.
+GOSEC_TAG_FLAGS := $(TAG_FLAGS)
 
 .PHONY: security
 ## security: The full devops.md §8 suite — gosec, govulncheck, go mod verify, trivy fs
@@ -990,6 +1028,8 @@ help:
 	@echo "$(BOLD)Variables$(RESET)"
 	@echo "  $(CYAN)TAGS$(RESET)               build tags for every go invocation (default: none)"
 	@echo "                     e.g. make test TAGS=drbd"
+	@echo "  $(CYAN)GO_BUILD_TAGS$(RESET)      extra tags added to every target's own (space-separated)"
+	@echo "                     e.g. make build GO_BUILD_TAGS='cephrbd'"
 	@echo "  $(CYAN)VERSION$(RESET)            the release tag, required by release-alpha; no default"
 	@echo "                     e.g. make release-alpha VERSION=v0.3.2-alpha"
 	@echo "  $(CYAN)RELEASE_REMOTE$(RESET)     git remote the release is pushed to (default: origin)"

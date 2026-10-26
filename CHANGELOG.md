@@ -14,6 +14,23 @@ both bump MINOR, and PATCH is reserved for fixes that move no API.
 
 ## [Unreleased]
 
+### Fixed — the make targets read GO_BUILD_TAGS (#98)
+
+- **Every target ci-template v1.21+ calls now honours `GO_BUILD_TAGS`.** The
+  template passes the CI tag set as `make <target> GO_BUILD_TAGS='a b'`
+  (space-separated); the Makefile read only `TAGS`, so those tags never reached
+  `go build` or `go test`. `build`, `test`, `race`, `coverage`, `bench`, `vet`,
+  `security`/`security-go` (gosec and govulncheck), `integration-test` and the
+  operator-run suites now add it, comma-joined and de-duplicated, to the tags
+  each already uses (`TAGS`, or a target's fixed `integration`,
+  `drbd_integration`, `local_integration`, ... tags). `golangci-lint` gets it
+  as `--build-tags`, together with `run.build-tags` from `.golangci.yml`. An
+  empty `GO_BUILD_TAGS` leaves every command exactly as before.
+- **`make check-build-tags`** (run by `make test`, script
+  `scripts/check-build-tags.sh`) reads `make -n` and fails if any of those
+  targets drops `GO_BUILD_TAGS`, if an empty value changes a command, or if the
+  Makefile's copy of the golangci-lint config tags drifts from `.golangci.yml`.
+
 ## [0.5.0-alpha] - 2026-10-08
 
 ### Changed — BREAKING: go-enclave v0.8.0-alpha and go-luks2 v1.0.0-rc.2 (#84)
