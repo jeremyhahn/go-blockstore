@@ -17,4 +17,3 @@ self-hosted-runner:
     - codex
     - codex-task
     - claude
-    - qwen
