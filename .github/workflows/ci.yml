@@ -333,24 +333,29 @@ jobs:
       - name: Provide gosec
         env:
           GOSEC_VERSION: "v2.29.0"      # keep in step with ci-runner/Dockerfile
+          # x/tools in gosec v2.29.0's go.mod cannot read Go 1.27 export data; remove this when the gosec pin names such an x/tools.
+          XTOOLS_VERSION: "v0.52.0"
         run: |
           set -eu
-          if command -v gosec > /dev/null 2>&1; then
-            echo "using the image's gosec: $(command -v gosec)"
-          else
-            echo "gosec absent (expected on the GitHub mirror, NOT on ci-runner)"
-            # RETRIED: same sum.golang.org flake class as the lint install — a
-            # tool-install network failure must not fail a job that never ran
-            # its analysis. Full sumdb verification kept.
-            ok=0
-            for i in 1 2 3; do
-              if go install -ldflags "-X main.Version=${GOSEC_VERSION}" \
-                   "github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}"; then ok=1; break; fi
-              echo "install attempt $i failed; retrying"; sleep 10
-            done
-            [ "$ok" = 1 ] || { echo "gosec install failed after 3 attempts"; exit 1; }
-          fi
-          echo "gosec reports: $(gosec --version 2>&1 | head -1)"
+          # The image's gosec returns when the ci-runner image carries a gosec that reads Go 1.27 export data.
+          # Built in a throwaway module so it links XTOOLS_VERSION, as make install-tools does.
+          # RETRIED: same sum.golang.org flake class as the lint install — a
+          # tool-install network failure must not fail a job that never ran
+          # its analysis. Full sumdb verification kept.
+          ok=0
+          for i in 1 2 3; do
+            d=$(mktemp -d)
+            if (cd "$d" && export GOWORK=off && go mod init gosec-build \
+                  && go get "github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}" "golang.org/x/tools@${XTOOLS_VERSION}" \
+                  && GOBIN="${RUNNER_TEMP}/gosec-bin" go install -ldflags "-X main.Version=${GOSEC_VERSION}" \
+                       github.com/securego/gosec/v2/cmd/gosec); then ok=1; fi
+            rm -rf "$d"
+            [ "$ok" = 1 ] && break
+            echo "install attempt $i failed; retrying"; sleep 10
+          done
+          [ "$ok" = 1 ] || { echo "gosec install failed after 3 attempts"; exit 1; }
+          echo "${RUNNER_TEMP}/gosec-bin" >> "$GITHUB_PATH"
+          echo "gosec reports: $("${RUNNER_TEMP}/gosec-bin/gosec" --version 2>&1 | head -1)"
           if [ -r /etc/ci-runner-tools.txt ]; then
             echo "ci-runner tool manifest:"; cat /etc/ci-runner-tools.txt
           fi

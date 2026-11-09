@@ -149,6 +149,9 @@ TRIVY_VERSION := $(shell awk '{for(i=1;i<=NF;i++){n++;v=$$i}} END{if(n==1)print 
 # a different analyser on a different day (go-luks2 #21).
 GOLANGCI_LINT_VERSION := v2.14.0
 GOSEC_VERSION         := v2.29.0
+# x/tools in gosec v2.29.0's go.mod cannot read Go 1.27 export data; remove
+# this when the gosec pin names an x/tools that can.
+XTOOLS_VERSION        := v0.52.0
 GOVULNCHECK_VERSION   := v1.8.0
 ACTIONLINT_VERSION    := v1.7.12
 
@@ -648,7 +651,8 @@ install-tools:
 	@echo "$(CYAN)  gosec $(GOSEC_VERSION)$(RESET)"
 	@# -ldflags is not decoration: without it gosec reports "Version: dev" and no
 	@# log — here or in CI — can say which analyser produced a finding.
-	@$(GO) install -ldflags "-X main.Version=$(GOSEC_VERSION)" github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION)
+	@# Built in a throwaway module so it links XTOOLS_VERSION (handbook devcontainer form).
+	@d=$$(mktemp -d); (cd "$$d" && export GOWORK=off && $(GO) mod init gosec-build && $(GO) get github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION) golang.org/x/tools@$(XTOOLS_VERSION) && $(GO) install -ldflags "-X main.Version=$(GOSEC_VERSION)" github.com/securego/gosec/v2/cmd/gosec); rc=$$?; rm -rf "$$d"; exit $$rc
 	@echo "$(CYAN)  govulncheck $(GOVULNCHECK_VERSION)$(RESET)"
 	@$(GO) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 	@echo "$(CYAN)  actionlint $(ACTIONLINT_VERSION)$(RESET)"
