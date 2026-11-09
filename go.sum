@@ -6,7 +6,7 @@ github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc h1:U9qPSI2PIWSS1
 github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
-github.com/jeremyhahn/go-enclave v0.8.0-alpha h1:NCS8KM9S2wKvauLYOyblJQTFW+Tie+M75XxbJXjkx5c=
+github.com/jeremyhahn/go-enclave v0.8.0-alpha h1:Z2ArumW4O9DPkF54DdTT0w6JlcYaGqkF/S4SwEBEPsY=
 github.com/jeremyhahn/go-enclave v0.8.0-alpha/go.mod h1:EVeqp4qW6mUSpMWfDPsTjzTX4On/huPWUIZiaD5RsmE=
 github.com/jeremyhahn/go-luks2 v1.0.0-rc.2 h1:Hlqkx8F5NoieB5/UHxny0x9cZ9VFSXfDblKdgAg64MY=
 github.com/jeremyhahn/go-luks2 v1.0.0-rc.2/go.mod h1:NMNiDRGhqNS4f+lqr+5rdYzhWnbamancrGcgnIvAxpo=
