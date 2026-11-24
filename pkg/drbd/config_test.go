@@ -217,7 +217,7 @@ func TestNodeIDsAgreeAcrossThePair(t *testing.T) {
 	pairs := [][2]string{
 		{"node-a", "node-b"},
 		{"node-b", "node-a"},
-		{"ci-node-1", "ci-node-2"},
+		{"node-1", "node-2"},
 		{"zeta.storage.internal", "alpha.storage.internal"},
 	}
 
