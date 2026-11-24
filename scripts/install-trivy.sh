@@ -1,5 +1,41 @@
 #!/bin/sh
-# Installs a pinned, SHA-256-verified trivy (usage: scripts/install-trivy.sh <install-dir> [version]); version from .trivy-version.
+# Install a PINNED, checksum-verified trivy.
+#
+#   usage: scripts/install-trivy.sh <install-dir> [version]
+#
+# The ONE installer for trivy in this repo. Both `make install-tools` and the
+# Gitea path of .github/workflows/nightly.yml call it, so the scanner on a
+# developer's machine and the scanner in CI are the same binary — and neither
+# can drift from the other by editing one of them.
+#
+# WHY NOT `curl .../install.sh | sh`
+# ---------------------------------
+# That is what this replaces, in both call sites. It fetched a script from a
+# MUTABLE ref (contrib/install.sh on `main`) and executed it, unread and
+# unverified, as the build user. Anyone who could change that file — upstream
+# compromise, account takeover, a MITM on the fetch — would get arbitrary code
+# execution on the runner, and in nightly.yml that runner holds a token with
+# security-events: write. Pulling the security scanner itself through an
+# unverified channel inverts the point of running it.
+#
+# WHAT THIS GUARANTEES, AND WHAT IT DOES NOT
+# ------------------------------------------
+# Guarantees: the version is fixed (no silent upgrade to whatever shipped
+# today), the bytes are checked against the release's published SHA-256 before
+# anything is executed, and nothing from the download is ever run as a script.
+# A corrupted or tampered-in-transit tarball is refused.
+#
+# Does NOT guarantee: the checksums file is fetched from the same origin as the
+# tarball, so this is not a signature check and does not defend against a
+# compromised release where an attacker rewrites both. Upstream publishes a
+# sigstore bundle next to each artifact (trivy_<ver>_checksums.txt.sigstore.json);
+# verifying that with cosign is the next hardening step and needs cosign on the
+# runners first. Stated here rather than implied, so nobody reads "verified" as
+# more than it is.
+#
+# To bump trivy: edit .trivy-version, run this, and re-run `make security`. The
+# same file feeds the trivy-action `version:` input in nightly.yml, so the
+# GitHub and Gitea paths move together.
 
 set -eu
 
@@ -18,7 +54,14 @@ if [ -z "${VERSION}" ]; then
 		echo "error: no version given and ${REPO_ROOT}/.trivy-version is missing" >&2
 		exit 1
 	fi
-	# Read .trivy-version as exactly one token; anything else yields empty and is refused below.
+	# Read as ONE bare token, not scrubbed. `tr -d ' \t\n\r'` DELETED all
+	# whitespace, so a malformed `0.74 .0` (or a stray second line) was silently
+	# normalised to a plausible-looking version and then passed the semver check
+	# below — verify-not-normalise, at the source. awk emits the value only when
+	# the file holds exactly one whitespace-delimited token; anything else yields
+	# empty, caught by the "resolved to empty" guard immediately after. This keeps
+	# EVERY call site strict (Makefile, nightly.yml, a bare direct invocation),
+	# not just the one that passes $2.
 	VERSION=$(awk '{for(i=1;i<=NF;i++){n++;v=$i}} END{if(n==1)print v}' "${REPO_ROOT}/.trivy-version")
 fi
 if [ -z "${VERSION}" ]; then
@@ -54,7 +97,25 @@ case "${OS}:${ARCH}" in
 		;;
 esac
 
-# Always download and verify; an installed binary's self-reported version is not trusted.
+# NO version-based idempotency fast path — deliberately removed.
+#
+# It used to `exit 0` when an existing ${INSTALL_DIR}/trivy self-reported the
+# pinned version. That trusted the binary's own `--version` string, which any
+# corrupted or planted binary can print: the skip blessed a file it never
+# verified, so a security scanner could be silently swapped and this installer
+# would still report success. Self-reported version is not a trust anchor.
+#
+# A trustworthy skip would hash the on-disk binary against the pinned EXTRACTED
+# binary's SHA-256 (as scripts/install-shellcheck.sh now does). trivy cannot pin
+# that in-repo the same way: its checksums are FETCHED from the release origin,
+# not committed here, and its version is data-driven from .trivy-version — so a
+# per-version binary hash in this script would break the single-source
+# "bump = edit .trivy-version only" workflow and would not scale across the many
+# versions the fleet pins. The honest fix is therefore to ALWAYS run the
+# verified path below: download, check the tarball against the published SHA-256,
+# extract, install. The cost is one download per explicit invocation (this is an
+# explicitly-invoked install step, not a per-build hook), and correctness is
+# absolute — the installed binary is always one whose bytes were just verified.
 
 BASE_URL="https://github.com/aquasecurity/trivy/releases/download/v${VERSION}"
 TMP=$(mktemp -d)

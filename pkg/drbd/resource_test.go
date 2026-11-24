@@ -32,7 +32,12 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// renderToFile writes a volume's resource file and reads it back; no function returns the rendered secret as a value.
+// renderToFile writes a volume's resource file and reads it back.
+//
+// The production path renders straight to the descriptor, so a test that wants
+// the text reads the file. There is deliberately no function returning the
+// rendered resource as a value: the shared secret would be in it, on the heap,
+// outliving the enclave — which is the whole reason the rendering was split.
 func renderToFile(t *testing.T, p *Provider, m *resourceMeta) ([]byte, error) {
 	t.Helper()
 	if err := p.writeResourceFile(context.Background(), m); err != nil {
@@ -261,7 +266,14 @@ func TestLoadMetaMissing(t *testing.T) {
 	}
 }
 
-// TestListMetaFailsClosedOnAnUnreadableRecord: an unreadable record stops allocation.
+// TestListMetaFailsClosedOnAnUnreadableRecord pins the direction this fails in.
+//
+// The only caller is minor and port allocation, and a record it cannot read is
+// a volume it cannot see — while the DRBD resource and logical volume that
+// record describes are still there. Skipping it would let the next Provision
+// hand a new volume a minor or a port a live resource is already using, and two
+// resources fighting over one minor does not announce itself. Refusing until
+// somebody looks at the state directory is the cheaper outcome.
 func TestListMetaFailsClosedOnAnUnreadableRecord(t *testing.T) {
 	p, _ := newTestProvider(t)
 
@@ -304,7 +316,19 @@ func TestListMetaFailsClosedOnAnUnreadableRecord(t *testing.T) {
 	}
 }
 
-// TestRecordsFromAnotherVolumeGroupAreRefused: a record naming another volume group is refused.
+// TestRecordsFromAnotherVolumeGroupAreRefused covers the state directory that
+// outlives the configuration that wrote it — reused after volume_group changed,
+// or copied between deployments.
+//
+// Every path that acts on a record builds "<configured vg>/<lv>" from the
+// CURRENT configuration, so a record naming a different group stops describing
+// what the operation would touch: Delete's lvremove goes at a same-named volume
+// in the new group, destroying something this provider never created while
+// leaving the real one behind.
+//
+// The scenario is built the way it actually happens — one state directory, a
+// second provider configured for another group — rather than by forging a file,
+// so the test would still hold if the record's shape changed.
 func TestRecordsFromAnotherVolumeGroupAreRefused(t *testing.T) {
 	p, _ := newTestProvider(t)
 	if err := p.writeMeta(&resourceMeta{Name: "vol1", LV: "vol1", VG: testVG, Minor: 0, Port: 7789}); err != nil {
@@ -422,7 +446,14 @@ func fakeSyncDir(t *testing.T, fn func(dir string) error) {
 	syncDir = fn
 }
 
-// TestWriteFileAtomicSyncsTheDirectoryAfterTheRename: the destination exists when the directory sync runs.
+// TestWriteFileAtomicSyncsTheDirectoryAfterTheRename pins the ORDER, which is
+// the whole property. Syncing the directory before the rename persists the
+// state the entry was in beforehand, which is the state without it — the sync
+// has to follow the rename to make the new name durable.
+//
+// The check is that the destination already exists when the sync runs, rather
+// than a log of two calls this test itself sequences: existence is the rename
+// having actually completed.
 func TestWriteFileAtomicSyncsTheDirectoryAfterTheRename(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vol1.json")
@@ -563,7 +594,9 @@ func TestMetadataGrowsWithTheDevice(t *testing.T) {
 	}
 }
 
-// TestBackingBytesCheckedDetectsOverflow: the checked form reports the wrap near the top of int64.
+// TestBackingBytesCheckedDetectsOverflow pins the guard the resize and provision
+// paths lean on: backingBytes wraps NEGATIVE near the top of the int64 range,
+// and the checked form has to report that rather than pass the wrapped value on.
 func TestBackingBytesCheckedDetectsOverflow(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		t.Run(strconv.FormatBool(encrypted), func(t *testing.T) {
@@ -590,13 +623,29 @@ func TestBackingBytesCheckedDetectsOverflow(t *testing.T) {
 		})
 	}
 
-	// The header addition can wrap before the metadata step runs.
+	// The header addition is a step of its own that can wrap before the
+	// metadata step ever runs: a usable size within HeaderBytes of the ceiling
+	// has no representable data area at all on an encrypted provider, and the
+	// unchecked arithmetic would hand a NEGATIVE data area to metadataBytes.
 	if _, ok := backingBytesChecked(math.MaxInt64-luks.HeaderBytes+1, true); ok {
 		t.Errorf("backingBytesChecked(MaxInt64-HeaderBytes+1, encrypted) = ok, want the header addition's overflow detected")
 	}
 }
 
-// TestBackingBytesAllocatesTheLUKSHeaderOnTop: the header is added to the data area before the metadata reservation; expectations are hand-computed.
+// TestBackingBytesAllocatesTheLUKSHeaderOnTop pins the other half of the
+// sizing contract, the half #13 first got wrong. common.VolumeSpec.SizeBytes is
+// USABLE capacity, so on an encrypted provider the LUKS2 header is allocated
+// on top of the request exactly as DRBD's metadata is — the data area DRBD
+// exports is usable plus header, and the metadata reservation is computed
+// from THAT, since the bitmap covers the header's blocks too. pkg/local has
+// always done this; the two backends now agree.
+//
+// The expectations are literals worked out by hand from DRBD's formula, not a
+// restatement of the function under test, so the table fails if the header is
+// dropped (backing comes out 16 MiB short), doubled (16 MiB long), or added
+// after the metadata step (the 120 MiB row crosses a 128 MiB bitmap unit only
+// when the header is inside the data area, and comes out 4 KiB short
+// otherwise).
 func TestBackingBytesAllocatesTheLUKSHeaderOnTop(t *testing.T) {
 	const header = luks.HeaderBytes
 	if header != 16<<20 {
@@ -658,7 +707,10 @@ func TestBackingBytesAllocatesTheLUKSHeaderOnTop(t *testing.T) {
 	}
 }
 
-// TestMaxDataBytesIsTheOverflowBoundary: maxDataBytes is the last size with a representable backing.
+// TestMaxDataBytesIsTheOverflowBoundary checks maxDataBytes lands exactly on the
+// last representable size: the maximum itself has a representable backing (so the
+// providers must ATTEMPT it), and one past it does not (so they must refuse it).
+// The extent-aware bound only tightens as the extent grows, never loosens.
 func TestMaxDataBytesIsTheOverflowBoundary(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		for _, extent := range []int64{0, 1, 512, 4 << 20} {
@@ -691,7 +743,13 @@ func TestMaxDataBytesIsTheOverflowBoundary(t *testing.T) {
 	}
 }
 
-// TestResourceFileIsByteIdenticalToTheGoldens: the split rendering produces the golden files byte for byte.
+// TestResourceFileIsByteIdenticalToTheGoldens is the refactor's safety net.
+//
+// Splitting the template at the secret so the bytes could go straight to the
+// descriptor was a change to HOW the file is produced and must not be a change
+// to WHAT it contains: drbdadm parses this, and a stray newline or a dropped
+// indent is a config change nobody asked for. The goldens were captured from
+// the single-template implementation this replaced.
 func TestResourceFileIsByteIdenticalToTheGoldens(t *testing.T) {
 	meta := resourceMeta{
 		Name: testVolume, LV: testVolume, VG: testVG, Minor: 3, Port: 7792,
@@ -728,7 +786,17 @@ func TestResourceFileIsByteIdenticalToTheGoldens(t *testing.T) {
 	})
 }
 
-// TestNothingCarriesTheSecretAsAValue asserts no signature takes or returns the secret as a string or slice.
+// TestNothingCarriesTheSecretAsAValue is the structural guard.
+//
+// The finding this closes was not a bug in behavior — the old code produced the
+// right file — it was that the secret existed as an ordinary Go string, then as
+// a template's copy of it, then as the rendered slice: three GC-managed copies
+// outliving the enclave's destruction, reachable in a core dump or a swapped
+// page. The fix is that no function accepts or returns it as a string or a
+// slice this package owns, and only the type system can keep that true.
+//
+// So this asserts on the SIGNATURES. A future change that reintroduces a
+// render-to-bytes helper taking the secret will not compile against these.
 func TestNothingCarriesTheSecretAsAValue(t *testing.T) {
 	// Each of these is a compile-time assertion: the parameter type is the
 	// signature being asserted, so a change that reintroduces the secret as a
@@ -737,7 +805,13 @@ func TestNothingCarriesTheSecretAsAValue(t *testing.T) {
 	assertSecretStreamer((*Provider)(nil).writeSharedSecret)
 	assertSecretValidator(validateSharedSecret)
 
-	// The rendering input has no secret field; checked by field name.
+	// And the rendering input has nowhere to put a secret. A field added here
+	// would be a heap copy the template then duplicates into its output, which
+	// is precisely the shape that was removed.
+	//
+	// The check is on field NAMES rather than on a count: a count breaks the
+	// day somebody adds an unrelated field, which teaches people to update the
+	// number rather than to think about it.
 	fields := reflect.TypeOf(resourceParams{})
 	for i := range fields.NumField() {
 		name := fields.Field(i).Name

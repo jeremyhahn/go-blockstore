@@ -236,7 +236,9 @@ and open what go-luks2 writes. `v0.2.0-alpha` also rides out the transient
   mapping-ownership check is gone too, replaced by `stat(2)` and a sysfs read of
   `/sys/dev/block/<major>:<minor>/slaves`; the integration suite attaches its
   loop device with the loop ioctls instead of forking `losetup`. **A host
-  running this provider no longer needs `cryptsetup` installed.**
+  running this provider no longer needs `cryptsetup` installed.** Owner ruling
+  2026-08-29: everything is done in pure Go unless there is absolutely no other
+  way.
 
   The container layout is unchanged and was re-measured rather than assumed: the
   pinned FIPS parameters (PBKDF2-SHA-512, AES-256-XTS, 512-bit key, 512-byte

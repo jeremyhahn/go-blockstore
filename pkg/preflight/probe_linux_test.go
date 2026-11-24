@@ -63,7 +63,12 @@ func TestClassifyDeviceMapperOpen(t *testing.T) {
 	}
 }
 
-// TestClassifyDeviceMapperIoctl: EACCES is the handler's capability check, EPERM a seccomp denial.
+// TestClassifyDeviceMapperIoctl covers the ioctl half.
+//
+// EACCES and EPERM are the important rows and they mean different things: the
+// device-mapper handler's own capability check answers EACCES, a seccomp filter
+// denying ioctl answers EPERM before the handler runs. Collapsing them sends an
+// operator to grant a capability that is already held.
 func TestClassifyDeviceMapperIoctl(t *testing.T) {
 	cases := map[string]struct {
 		err  error
@@ -88,7 +93,13 @@ func TestClassifyDeviceMapperIoctl(t *testing.T) {
 	}
 }
 
-// TestClassifyDeviceMapperOpenEPERM: the witness distinguishes device cgroup from seccomp, naming both when it cannot.
+// TestClassifyDeviceMapperOpenEPERM is the refusal two opposite fixes produce.
+//
+// Codex blocked the first version of this for asserting the device cgroup
+// outright: a seccomp rule can refuse the openat instead, and telling an
+// operator to widen device access when the profile is the problem is a worse
+// answer than saying so. The witness narrows it by opening a file this process
+// created; where it cannot, the remedy names both.
 func TestClassifyDeviceMapperOpenEPERM(t *testing.T) {
 	cases := map[string]struct {
 		witness    func() openWitness
@@ -164,7 +175,16 @@ func TestOpenWitnessAt(t *testing.T) {
 	}
 }
 
-// TestLiveOpenWitness runs the open witness on the real kernel and checks its own directories are left empty.
+// TestLiveOpenWitness exercises the positive open test against the real kernel
+// and checks it leaves nothing behind.
+//
+// "Nothing behind" is measured on the witness's OWN directories, not on a
+// census of /tmp. Counting entries in a directory the whole machine writes to
+// measures every other process as well: this test failed intermittently on an
+// otherwise clean tree — measured on unmodified main, 3 runs in 10 — and one
+// failure reported "-1 entries", an entry that DISAPPEARED, which no leak by
+// this code could ever produce. A test whose subject is a shared resource
+// reports the neighbours' activity as the subject's defect.
 func TestLiveOpenWitness(t *testing.T) {
 	// The witness names its directories with a fixed prefix, so its own leavings
 	// are identifiable without counting anything else in the directory.
@@ -202,7 +222,11 @@ func TestLiveOpenWitness(t *testing.T) {
 	}
 }
 
-// TestClassifyMount: EINVAL from the remount probe is the pass.
+// TestClassifyMount is the three-way split the remount probe exists to produce.
+//
+// EINVAL is the PASS — the request reached the kernel's own validation, which
+// means it got past the security modules and the capability check. Reading it
+// as a failure would make the guard refuse every correctly configured host.
 func TestClassifyMount(t *testing.T) {
 	witnessing := func(concluded capabilityWitness) func() capabilityWitness {
 		return func() capabilityWitness { return concluded }
@@ -255,7 +279,12 @@ func TestClassifyMount(t *testing.T) {
 	}
 }
 
-// TestClassifyMountRemedyMatchesTheWitness: a held CAP_SYS_ADMIN with mount denied gets the seccomp remedy.
+// TestClassifyMountRemedyMatchesTheWitness is the point of the witness: the
+// operator must be told to fix the mechanism that is actually broken.
+//
+// Codex found this on review of the first draft — every EPERM was reported as a
+// missing capability, so a container that HELD CAP_SYS_ADMIN and had mount(2)
+// denied by seccomp was told to grant a capability it already had.
 func TestClassifyMountRemedyMatchesTheWitness(t *testing.T) {
 	held := classifyMount(unix.EPERM, func() capabilityWitness { return witnessHeld })
 	if strings.Contains(held.Remedy(), "--cap-add SYS_ADMIN") {
@@ -280,7 +309,15 @@ func TestClassifyMountRemedyMatchesTheWitness(t *testing.T) {
 	}
 }
 
-// TestDeviceMapperWitness covers the witness, including the answers that must not read as a missing capability.
+// TestDeviceMapperWitness covers the positive capability test, including every
+// answer that must NOT be read as "the capability is missing".
+//
+// The EACCES/EPERM split is the second finding Codex raised, and it is measured
+// rather than argued: with the control node passed into a container as uid 0,
+// removing CAP_SYS_ADMIN produces EACCES from the kernel's own check, while
+// removing ioctl from the seccomp profile produces EPERM before that check runs.
+// Treating EPERM as a missing capability would tell an operator who HOLDS
+// CAP_SYS_ADMIN to grant it.
 func TestDeviceMapperWitness(t *testing.T) {
 	cases := map[string]struct {
 		openErr    error
@@ -577,7 +614,10 @@ func TestKeyringProbeWithAnInjectedCheck(t *testing.T) {
 		if !strings.Contains(err.Error(), "seccomp") {
 			t.Errorf("the refusal does not mention seccomp, which is the remedy: %v", err)
 		}
-		// Asserted here too, since the live test reaches this branch only where the keyring is blocked.
+		// Asserted HERE as well as in the live test, because the live test can
+		// only reach this branch on a host where the keyring is actually
+		// blocked — and a property that is only checked on some machines is a
+		// property that goes red in CI and green on a desk.
 		requireNamesTheStorageComponent(t, err)
 	})
 
@@ -591,7 +631,15 @@ func TestKeyringProbeWithAnInjectedCheck(t *testing.T) {
 	})
 }
 
-// TestDeviceMapperVersionOnADescriptorThatIsNotTheControlNode issues the real ioctl on a regular file and expects ENOTTY.
+// TestDeviceMapperVersionOnADescriptorThatIsNotTheControlNode exercises the
+// real ioctl against a descriptor this test owns.
+//
+// It is how the syscall itself gets covered on a machine where the control node
+// cannot be opened: the dm_ioctl header is populated and the ioctl is issued for
+// real, and a regular file answers ENOTTY — "this descriptor does not take this
+// ioctl" — which is exactly the answer that must NOT be read as a capability
+// problem. The path where the ioctl succeeds needs the control node and is
+// covered by scripts/preflight-container-matrix.sh.
 func TestDeviceMapperVersionOnADescriptorThatIsNotTheControlNode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "not-a-device")
 	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
@@ -619,7 +667,13 @@ func TestDeviceMapperVersionOnADescriptorThatIsNotTheControlNode(t *testing.T) {
 // the live probes, against this kernel
 // -----------------------------------------------------------------------------
 
-// environment is an independent /proc-based measurement the live probes are checked against.
+// environment is what an INDEPENDENT measurement says this process can do.
+//
+// It is the oracle the live probes are judged against. Reading capability bits
+// is exactly what a guard must not do — but it is exactly what a test SHOULD do
+// to check the guard, because it is a second, unrelated source of truth for the
+// same fact. The probes attempt the operation; the oracle reads /proc; they have
+// to agree.
 type environment struct {
 	hasCapSysAdmin   bool
 	inUserNamespace  bool
@@ -648,7 +702,9 @@ func measureEnvironment(t *testing.T) environment {
 		}
 	}
 
-	// Under a user namespace CapEff does not describe the initial namespace; require the identity map.
+	// A user namespace makes CapEff a statement about THAT namespace, while the
+	// kernel checks device-mapper and mount against the initial one. The
+	// identity map is what says there is no such indirection.
 	uidMap, err := os.ReadFile("/proc/self/uid_map")
 	if err != nil {
 		t.Fatalf("reading /proc/self/uid_map: %v", err)
@@ -672,7 +728,12 @@ func measureEnvironment(t *testing.T) environment {
 	return env
 }
 
-// TestLiveDeviceMapperProbeAgreesWithTheEnvironment: the probe refuses exactly where the environment says it cannot work.
+// TestLiveDeviceMapperProbeAgreesWithTheEnvironment is the two-sided test on a
+// real kernel: the probe must refuse where an independent measurement says the
+// operation cannot work, and must NOT refuse where it says it can.
+//
+// The second half is the one that matters. A guard that refuses everything
+// passes every test that only checks refusals.
 func TestLiveDeviceMapperProbeAgreesWithTheEnvironment(t *testing.T) {
 	env := measureEnvironment(t)
 	err := deviceMapperProbe(liveDeviceMapperSteps())(context.Background())
@@ -748,7 +809,10 @@ func TestLiveMountProbeAgreesWithTheEnvironment(t *testing.T) {
 	case env.inUserNamespace:
 		requireClassified(t, err)
 	default:
-		// With the capability held, mount(2) is never reported as a missing capability.
+		// The capability is held in the initial namespace. mount(2) is then
+		// permitted, or denied by a security module, or denied by a seccomp
+		// filter — never reported as a MISSING capability, which is the
+		// misclassification the witness exists to prevent.
 		if errors.Is(err, ErrPrivilegeMissing) {
 			t.Fatalf("CAP_SYS_ADMIN is held and the probe reported it missing: %v", err)
 		}
@@ -797,7 +861,16 @@ func TestLiveKeyringProbeAgreesWithGoLuks2(t *testing.T) {
 	requireNamesTheStorageComponent(t, err)
 }
 
-// requireNamesTheStorageComponent checks, case-insensitively, that the refusal names the storage component.
+// requireNamesTheStorageComponent checks the refusal says WHOSE requirement this
+// is, which is the whole point of the privilege-separated deployment: the
+// workload container needs none of it.
+//
+// The comparison is case-insensitive on purpose. The first version of this was
+// a case-sensitive Contains for "storage component" against a remedy that says
+// "STORAGE component" for emphasis — so it asserted the message's typography
+// rather than its content, and it could only fail where the keyring is actually
+// blocked, which this developer's host cannot produce. It went green locally and
+// red in CI. The property is worth asserting; the casing is not.
 func requireNamesTheStorageComponent(t *testing.T, err error) {
 	t.Helper()
 	if !strings.Contains(strings.ToLower(err.Error()), "storage component") {
@@ -824,7 +897,21 @@ func TestLiveProbesLeaveNothingBehind(t *testing.T) {
 		return ours
 	}
 
-	// luksKeys counts live keyring entries this stack could create, ignoring revoked tombstones; zero where /proc/keys is unreadable.
+	// luksKeys counts LIVE keyring entries this stack could have created.
+	//
+	// The distinction between live and revoked is the whole measurement, and it
+	// was found by making it. /proc/keys keeps showing a revoked key as a
+	// tombstone — flags "IR-Q---", state "expd" — until the kernel's key
+	// garbage collector runs on its own timer, so a naive count reports a leak
+	// after every successful probe. Revoking a logon key frees its payload
+	// immediately (the kernel runs the key type's revoke method there, which
+	// releases the bytes), so a tombstone holds no key material and the entry
+	// is already unresolvable: go-luks2 confirms that by searching for it. What
+	// would be a real leak is an entry WITHOUT the revoked flag, which is what
+	// this counts.
+	//
+	// Where /proc/keys cannot be read the count is zero on both sides, so the
+	// comparison stays honest rather than turning into a hidden pass.
 	luksKeys := func() int {
 		raw, err := os.ReadFile("/proc/keys")
 		if err != nil {
@@ -909,7 +996,13 @@ func requireClassified(t *testing.T, err error) {
 // CAP_NET_ADMIN and the DRBD control interface
 // -----------------------------------------------------------------------------
 
-// TestTheNewProbesReturnATrueNilOnSuccess: probes return an untyped nil on success.
+// TestTheNewProbesReturnATrueNilOnSuccess is a regression test for a trap this
+// package has now hit twice: a probe that returns a *CapabilityError directly
+// hands back a non-nil error holding a nil pointer on the success path, which
+// is neither a pass nor renderable.
+//
+// The Checker has a backstop for it, but a probe called directly does not, and
+// these two were written with the bug. Their own tests found it.
 func TestTheNewProbesReturnATrueNilOnSuccess(t *testing.T) {
 	netAdmin := netAdminProbe(netAdminSteps{
 		privileged: func(string) error { return unix.EOPNOTSUPP },
@@ -925,7 +1018,14 @@ func TestTheNewProbesReturnATrueNilOnSuccess(t *testing.T) {
 	}
 }
 
-// TestClassifyNetAdmin: EPERM is decided by whether the unprivileged ethtool read got through.
+// TestClassifyNetAdmin is the three-way split the ethtool witness produces.
+//
+// EPERM is the answer BOTH a missing CAP_NET_ADMIN and a filtered ioctl give,
+// so it is decided by whether an UNPRIVILEGED read on the same path got
+// through — not by picking the likelier cause. Measured 2026-09-02: on
+// loopback the privileged read answers EOPNOTSUPP when the capability is held
+// and EPERM when it is not, while the unprivileged read answers EOPNOTSUPP in
+// both cases because it reaches the driver without the capability.
 func TestClassifyNetAdmin(t *testing.T) {
 	answering := func(err error) func() error { return func() error { return err } }
 
@@ -1098,7 +1198,9 @@ func TestClassifyDRBDControl(t *testing.T) {
 	}
 }
 
-// TestDRBDControlRemedyDoesNotSendAnOperatorAfterPrivileges: a missing module's remedy names modprobe, not privileges.
+// TestDRBDControlRemedyDoesNotSendAnOperatorAfterPrivileges is the whole reason
+// this is a separate capability: a module that is not loaded cannot be loaded
+// by any container configuration, and saying otherwise wastes the outage.
 func TestDRBDControlRemedyDoesNotSendAnOperatorAfterPrivileges(t *testing.T) {
 	remedy := classifyDRBDControl(unix.ENOENT).Remedy()
 
@@ -1145,7 +1247,15 @@ func TestDRBDControlProbeWithInjectedSteps(t *testing.T) {
 	})
 }
 
-// TestLiveGenlFamilyResolutionCanSayYes: the resolver must find nlctrl, registered on every generic-netlink kernel.
+// TestLiveGenlFamilyResolutionCanSayYes is the positive control this package
+// insists on everywhere else: before trusting that "drbd is absent" means the
+// module is not loaded, prove the query can report a family that IS present.
+//
+// nlctrl is the generic-netlink control family itself. It is registered on every
+// kernel with CONFIG_GENERIC_NETLINK, so a resolver that cannot find it is
+// broken rather than reporting an absent module — and without this assertion,
+// a resolver that returned ENOENT for everything would look exactly like a
+// correct one on a host with no DRBD.
 func TestLiveGenlFamilyResolutionCanSayYes(t *testing.T) {
 	// Short enough to be a legal family name: the kernel's GENL_NAMSIZ is 16,
 	// and an over-long name answers EINVAL, which would prove nothing about
@@ -1154,7 +1264,16 @@ func TestLiveGenlFamilyResolutionCanSayYes(t *testing.T) {
 
 	control := resolveGenlFamily("nlctrl")
 
-	// Where netlink is refused, assert it is reported as a blocked syscall, not an absent module.
+	// Where netlink itself is refused — a seccomp profile with no AF_NETLINK
+	// socket, which is a real deployment and was reproduced in review — the
+	// resolver cannot say yes about ANYTHING, and this test asserts the
+	// property that actually matters there instead.
+	//
+	// It is NOT skipped. A skip would report success for an environment in
+	// which the interesting question is live: does a BLOCKED netlink get
+	// reported as a blocked syscall, or misreported as an absent module? The
+	// second would send an operator to modprobe something already loaded, so it
+	// is worth more than the positive control here.
 	if errors.Is(control, unix.EPERM) || errors.Is(control, unix.EACCES) {
 		got := resolveGenlFamily(absent)
 		if errors.Is(got, unix.ENOENT) {
@@ -1167,7 +1286,12 @@ func TestLiveGenlFamilyResolutionCanSayYes(t *testing.T) {
 		return
 	}
 
-	// Netlink is reachable, so the resolver must find nlctrl.
+	// Netlink is reachable, so the positive control applies: nlctrl is the
+	// generic-netlink control family itself, registered on every kernel with
+	// CONFIG_GENERIC_NETLINK. A resolver that cannot find it is broken rather
+	// than reporting an absent module — and without this, a resolver that
+	// returned ENOENT for everything would look exactly like a correct one on a
+	// host with no DRBD.
 	if control != nil {
 		t.Fatalf("resolving nlctrl, which every kernel registers: %v — the resolver cannot say yes, so its noes mean nothing", control)
 	}
@@ -1200,7 +1324,10 @@ func TestLiveNetAdminProbeAgreesWithTheEnvironment(t *testing.T) {
 // capNetAdmin is bit 12 of the capability bitmask.
 const capNetAdmin = 12
 
-// hasCapability reads CapEff as an independent oracle for tests; the guard itself never does.
+// hasCapability reads the effective capability set as an INDEPENDENT oracle.
+// The guard itself must never do this — that is the whole doctrine — but a test
+// checking the guard should, because it is a second unrelated source of truth
+// for the same fact.
 func hasCapability(t *testing.T, bit uint) bool {
 	t.Helper()
 	status, err := os.ReadFile("/proc/self/status")

@@ -31,7 +31,15 @@ import (
 	"github.com/jeremyhahn/go-blockstore/internal/mountinfo"
 )
 
-// fakeRunner is a CommandRunner scripted by exact argv; an unscripted command fails the test.
+// fakeRunner is a CommandRunner scripted by exact argv.
+//
+// Matching on the whole argv rather than on the binary name is deliberate: a
+// test that scripts "drbdadm primary vol1" fails if the provider runs "drbdadm
+// primary --force vol1", which is the property the force-refusal test needs and
+// which a looser matcher would not give.
+//
+// An unscripted command fails the test rather than returning a zero value, so a
+// method that starts calling something new cannot pass on the old script.
 type fakeRunner struct {
 	t *testing.T
 
@@ -45,7 +53,12 @@ type fakeRunner struct {
 	deviceAliases map[string]string
 	overMounted   map[string]string
 	mountTableErr error
-	// absentDevices are paths with no device node; looking them up yields a *mountinfo.DeviceError wrapping ENOENT.
+	// absentDevices are paths with no device node behind them. Production
+	// resolves a device to its major:minor by stat(2) BEFORE reading the
+	// table, so a path that is not there is a *mountinfo.DeviceError wrapping
+	// ENOENT, not an empty answer — and a plaintext mapping that is closed is
+	// exactly such a path. A fake that answered "not mounted" for any string
+	// masked that (#69 review).
 	absentDevices map[string]bool
 	tableLookups  int
 	tableHook     func()
@@ -97,7 +110,13 @@ type fakeResponse struct {
 	hook       func()
 }
 
-// testMountPoint is a real directory for the lifetime of the test binary, because Mount checks its target with Lstat.
+// testMountPoint is a real directory that exists for the lifetime of the test
+// binary.
+//
+// Mount checks its target with Lstat immediately before mounting — a symlink
+// there would be followed by mount(8)'s canonicalization — so the scripted
+// tests need a target that is genuinely a directory rather than a plausible
+// string. Created once because it is read-only as far as the tests care.
 var testMountPoint string
 
 func TestMain(m *testing.M) {
@@ -179,9 +198,15 @@ func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) ([]by
 	return []byte(r.stdout), nil
 }
 
-// The mount-table seam: an unmounted device is an empty answer, an unreadable table is an error.
+// The mount-table seam. It answers as /proc/self/mountinfo would, which the
+// provider reads instead of asking findmnt: a device that is not mounted is an
+// empty answer and NOT an error, and a table that could not be read is an
+// error and NEVER an empty answer. Keeping those apart is the whole reason the
+// lookup moved off findmnt, whose single non-zero exit meant both.
 
-// scriptMountUnderAlias mounts a device at target under another of its names, as /dev/drbd/by-res/<res>/0 appears.
+// scriptMountUnderAlias mounts a device at target under one of its OTHER names,
+// the way a filesystem mounted through /dev/drbd/by-res/<res>/0 appears in the
+// table. The mount belongs to canonical all the same.
 func (f *fakeRunner) scriptMountUnderAlias(alias, canonical, target string) {
 	f.scriptMount(alias, target)
 	f.mu.Lock()
@@ -290,7 +315,14 @@ type propagationFixture struct {
 	shared   bool
 }
 
-// PropagationOf answers for this device at the path with the mount's kernel identity; an unscripted mount reads private.
+// PropagationOf answers about THIS DEVICE at the path, and hands back the
+// kernel's identity for the mount instance.
+//
+// The fake models the identity the way the kernel does: a mount gets an id when
+// it appears, and a mount made in its place gets a different one. restack is how
+// a test says "somebody replaced what is here" — the case (device, path) cannot
+// see. An unscripted mount reads private, which is the ordinary state of a mount
+// on a host.
 func (f *fakeRunner) PropagationOf(ctx context.Context, device, mountPoint string) (uint32, bool, string, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, false, "", err
@@ -301,7 +333,8 @@ func (f *fakeRunner) PropagationOf(ctx context.Context, device, mountPoint strin
 		return 0, false, "", f.mountTableErr
 	}
 
-	// What is visible at the path is what umount(2) would detach.
+	// What is VISIBLE at the path is what umount(2) would detach and whose
+	// propagation a reader would otherwise pick up.
 	if top, covered := f.overMounted[mountPoint]; covered && top != device {
 		return 0, false, "", &mountinfo.MountPointError{MountPoint: mountPoint, Err: mountinfo.ErrNotVisibleThere}
 	}
@@ -353,7 +386,9 @@ func (f *fakeRunner) withPropagation(target, spelling string) *fakeRunner {
 	return f
 }
 
-// restack replaces the mount at a path with another mount of the same device under a new identity.
+// restack replaces the mount at a path with another mount OF THE SAME DEVICE,
+// the way a second mount stacked on the same path does. Everything about it
+// matches except the kernel's identity for it, which is the whole point.
 func (f *fakeRunner) restack(device, target string) *fakeRunner {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -365,7 +400,9 @@ func (f *fakeRunner) restack(device, target string) *fakeRunner {
 	return f
 }
 
-// onPropagationLookup runs a function the next time the table is asked about a device's propagation at a path.
+// onPropagationLookup runs a function the NEXT time the mount table is asked
+// about a device's propagation at a path, which is how a test acts inside the
+// window between the guard's verdict and the rollback that follows it.
 func (f *fakeRunner) onPropagationLookup(hook func()) *fakeRunner {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -546,12 +583,27 @@ func testSettings(t *testing.T) map[string]string {
 		SettingPeerNode:    testPeer,
 		SettingPeerAddress: "10.10.0.2",
 
-		// Startup privilege checks are off in unit tests; preflight_test.go exercises them against the real kernel.
+		// The startup privilege checks are off across the unit suite because
+		// these tests are about CONFIGURATION, RESOURCE RENDERING and the
+		// scripted runner — not about whether the machine running them has a
+		// drbd module and CAP_NET_ADMIN. With them on, every one of these would
+		// pass or fail depending on the host.
+		//
+		// The checks themselves are exercised on their own, against the real
+		// kernel, in preflight_test.go — including the two-sided assertion that
+		// New refuses exactly when the checker refuses.
 		SettingPreflight: "off",
 	}
 }
 
-// newTestProvider builds a provider over a scripted runner and the shared fake mounter from internal/mount.
+// newTestProvider builds a provider over a scripted runner and the shared fake
+// mounter.
+//
+// Mounting does not go through the runner: a target has to be PINNED to a
+// descriptor before it is mounted on, which no exec'd binary can be made to do,
+// so it goes through internal/mount's seam instead. The fake there is the one
+// pkg/local's tests drive too — one recorder for one interface, so neither
+// provider's tests can pass against a fake the other has outgrown.
 func newTestProvider(t *testing.T) (*Provider, *fakeRunner) {
 	t.Helper()
 	p, r, _ := newTestProviderWithMounter(t)
