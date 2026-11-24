@@ -179,7 +179,7 @@ func (p *fakeProvider) demoteCount() int {
 	return p.demotes
 }
 
-// ReplicationState checks the context before the hook, modelling a read that completed.
+// ReplicationState checks the context before the hook, modeling a read that completed.
 func (p *fakeProvider) ReplicationState(ctx context.Context, volID string) (common.ReplState, error) {
 	if err := ctx.Err(); err != nil {
 		return common.ReplState{}, err
