@@ -11,29 +11,8 @@
 // 2. Commercial License
 //    Contact licensing@automatethethings.com for commercial licensing options.
 
-// Package mountguard verifies that a mount just made is visible outside the
-// mount namespace that made it, and unwinds one that is not.
-//
-// It is shared rather than per-provider for the reason internal/mount and
-// internal/mountinfo are: the question is about the kernel's mount table, not
-// about LVM or DRBD, and the answer has to be the same whichever provider
-// asked. It was pkg/local's alone until pkg/drbd needed it (#40), and the two
-// subtleties below are what made copying it the wrong move — both were review
-// findings on #34 rather than obvious first cuts, and a second copy is a second
-// chance to lose them:
-//
-//   - the rollback runs on a context of its own, because the most likely reason
-//     to be rolling back is that the caller's context died;
-//   - the rollback refuses a target that is no longer the mount this call made,
-//     because umount(2) takes a path and would detach whatever is visible there.
-//
-// Wrong mount propagation is the quietest failure in the deployment model this
-// library was built for. mount(2) succeeds, the provider reports success, and
-// the workload in its own namespace walks to the path and finds the directory
-// exactly as it was before anything was mounted on it. There is no error, no log
-// line and no non-zero exit anywhere; the first evidence is a workload writing
-// to its own filesystem, and the second is somebody wondering where the data
-// went.
+// Package mountguard verifies a new mount propagates out of its namespace and unwinds one that does not.
+// The rollback runs on its own context and refuses a target that is no longer this call's mount.
 package mountguard
 
 import (
@@ -53,13 +32,7 @@ import (
 var ErrTableCannotReport = errors.New(
 	"the configured mount table does not implement PropagationOf, so propagation cannot be established")
 
-// ErrTargetTakenOver reports a rollback that did not happen because the mount at
-// the target stopped being the one this call made.
-//
-// It covers both shapes, because umount(2) cannot tell them apart either:
-// another DEVICE mounted over the target, and a second mount of the SAME device
-// stacked on it. In both, the thing that would be detached is somebody else's,
-// and the refused mount stays underneath it.
+// ErrTargetTakenOver reports a rollback skipped because another mount now sits at the target.
 var ErrTargetTakenOver = errors.New(
 	"the refused mount was left in place: the mount visible at the target is no longer the one this call made, and unmounting the path would detach that one instead")
 
@@ -68,37 +41,14 @@ var ErrTargetTakenOver = errors.New(
 type Policy int
 
 const (
-	// Unchecked does not verify propagation after mounting.
-	//
-	// It is the zero value, and deliberately so: a mount is PRIVATE by default
-	// on an ordinary host, which is correct there and is what every
-	// non-containerized caller of this library has. Requiring propagation by
-	// default would refuse those deployments for a property they have no reason
-	// to want — the guard would be rejecting a correct environment, which is
-	// the failure mode a guard is least forgiven for.
+	// Unchecked does not verify propagation; it is the zero value, right for ordinary hosts.
 	Unchecked Policy = iota
 
-	// Shared requires each mount to be SHARED, and refuses with a typed error
-	// naming the required setting when it is not.
-	//
-	// This is the setting for the deployment this library was built for: a
-	// storage component that mounts on behalf of a workload living in another
-	// mount namespace. Declaring it is how the provider learns that a private
-	// mount is a failure rather than the normal state, which it cannot work out
-	// for itself — the consumer's namespace is precisely what this side cannot
-	// see.
+	// Shared requires each mount to be shared and refuses with a typed error when it is not.
 	Shared
 )
 
-// Valid reports whether the policy is one this package defines.
-//
-// It exists because the providers export this as an integer type: a caller
-// building options by hand can write MountPropagationPolicy(2), and every
-// comparison in this package is against Shared, so an unknown value would
-// behave exactly like "off". That is a fail-open response to malformed security
-// configuration — the guard silently absent because the value asking for it was
-// not one of the two. The settings path already refuses a misspelling; the
-// struct path has to refuse a wrong number.
+// Valid reports whether the policy is one this package defines, so an unknown number is refused rather than read as off.
 func (p Policy) Valid() bool {
 	return p == Unchecked || p == Shared
 }
@@ -140,11 +90,7 @@ func Spellings() []string {
 	return spellings
 }
 
-// Guard is a policy over one provider's mount table.
-//
-// It is a value built at the call site from the provider's two fields rather
-// than a thing a provider holds, so there is no second copy of the policy to
-// fall out of step with the one Posture reports.
+// Guard is a policy over one provider's mount table, built at the call site.
 type Guard struct {
 	// Policy is what this provider was configured to require.
 	Policy Policy
@@ -155,15 +101,7 @@ type Guard struct {
 	Table mountinfo.Table
 }
 
-// CanReport reports whether the table can answer the propagation question at
-// all.
-//
-// A provider told to require propagation, over a mount table that cannot report
-// it, is a configuration that cannot work — and discovering it after the first
-// mount is worse than useless: the mount has already happened, the guard cannot
-// judge it, and the rollback cannot identify it either, so Mount would return an
-// error over a filesystem it left mounted. Providers ask this at construction so
-// it is a startup refusal instead.
+// CanReport reports whether the table can answer the propagation question; providers ask at construction.
 func (g Guard) CanReport() bool {
 	if g.Table == nil {
 		return false
@@ -172,32 +110,13 @@ func (g Guard) CanReport() bool {
 	return ok
 }
 
-// Verify checks that the mount of device at target propagates, and is what turns
-// the silent failure into a refusal. It returns the kernel's identity for the
-// mount, which Unwind needs.
-//
-// It runs AFTER the mount rather than before, because propagation is a property
-// of the mount itself: it is inherited from the parent at the moment mount(2) is
-// called, and there is nothing to inspect until then. That is also why this
-// capability has no startup probe next to the privilege checks — at startup
-// there is no mount to ask about.
-//
-// It fails closed in both directions. A mount that is private is refused, and a
-// check that could not run — /proc unreadable, the table unparseable, nothing
-// mounted at the target at all — is ALSO refused, as CauseIndeterminate. A guard
-// that reports success when its own check breaks is worse than no guard: it
-// converts an unknown into a green light, and it does so exactly where somebody
-// is relying on it.
+// Verify checks after mounting that device at target propagates and returns the mount ID Unwind needs; a check that cannot run also refuses.
 func (g Guard) Verify(ctx context.Context, device, target string) (uint32, error) {
 	if g.Policy != Shared {
 		return 0, nil
 	}
 
-	// The seam's propagation half is optional, so a caller that injected its own
-	// mount table is not forced to implement a method for a guard it may never
-	// turn on. Having turned it on and injected a table that cannot answer is a
-	// different matter: it is refused rather than skipped, because a guard that
-	// passes when it cannot check is the thing this exists to remove.
+	// A table without propagation support is refused when the guard is on.
 	reader, ok := g.reader()
 	if !ok {
 		return 0, &preflight.CapabilityError{
@@ -208,22 +127,11 @@ func (g Guard) Verify(ctx context.Context, device, target string) (uint32, error
 		}
 	}
 
-	// The lookup runs on a context detached from the caller's, and the caller's
-	// is checked afterwards. Once mount(2) has returned, verifying and — if the
-	// verification refuses — unwinding are COMPLETION work: a caller whose
-	// deadline passed in that instant would otherwise leave a mount that was
-	// never verified and never cleaned up, because the read that would identify
-	// it fails first. So the read happens, and then the caller is told they gave
-	// up, which is the same order the providers' zeroing paths use for the same
-	// reason.
+	// Read on a detached context, then check the caller's, so a refused mount can still be unwound.
 	lookupCtx, cancel := UnwindContext(ctx)
 	defer cancel()
 
-	// Asked about THIS DEVICE at the path, not about whatever is at the path.
-	// Between mount(2) returning and this lookup, another process can mount over
-	// the target — and reading "the propagation at this path" would then read
-	// the interloper's. A SHARED thing landing on top of our private mount would
-	// make the guard pass, which is the fail-open it exists to prevent.
+	// Ask about this device at the path, so a mount landing on top cannot make the guard pass.
 	id, propagates, spelling, err := reader.PropagationOf(lookupCtx, device, target)
 	if err != nil {
 		return 0, &preflight.CapabilityError{
@@ -255,27 +163,7 @@ func (g Guard) Verify(ctx context.Context, device, target string) (uint32, error
 	return id, nil
 }
 
-// Unwind removes a mount the propagation guard refused.
-//
-// A Mount that returns an error must not leave a filesystem mounted: the caller
-// has been told the operation failed, and a mount it does not know about is one
-// nothing will ever unmount — the same orphan the providers' rollback paths
-// exist to avoid.
-//
-// It unmounts by PATH, which is the only thing umount(2) takes, so it first
-// confirms this volume is what is VISIBLE at that path. The gap between the
-// mount succeeding and the guard refusing it is small and it is not closed by a
-// provider's lock: anything on the host can mount over the target in it, and
-// umount(2) would then detach that filesystem instead — somebody else's, over a
-// rollback of our own. Unmount already refuses that case; a rollback that
-// reached past the same check would be the hazard reintroduced by the path that
-// exists to tidy up.
-//
-// The guard's finding is what the caller gets back either way. A failure to
-// unwind — the check, the unmount, or a target that is no longer ours — is
-// joined onto it rather than replacing it: the reason the mount is there is the
-// finding, and what happened to the cleanup is a second fact about the same
-// event, and an operator needs both.
+// Unwind unmounts a refused mount after confirming it is still the visible one; any unwind failure is joined to the guard's finding.
 func (g Guard) Unwind(ctx context.Context, device, target string, id uint32, finding error, umount func(context.Context, string) error) error {
 	ctx, cancel := UnwindContext(ctx)
 	defer cancel()
@@ -285,12 +173,7 @@ func (g Guard) Unwind(ctx context.Context, device, target string, id uint32, fin
 		return errors.Join(finding, ErrTableCannotReport)
 	}
 
-	// The mount is identified by the kernel's own identity for it, not by
-	// (device, path). Those are the same thing only until somebody stacks a
-	// SECOND mount of the same device on the same path, and then unmounting by
-	// path detaches theirs while the refused mount stays underneath. An id that
-	// still matches is the evidence that the mount here is the one this call
-	// made rather than a replacement made since.
+	// Identify the mount by its kernel ID, which tells this mount from a second mount of the same device at the path.
 	current, _, _, err := reader.PropagationOf(ctx, device, target)
 	if err != nil {
 		return errors.Join(finding, err)
@@ -313,23 +196,10 @@ func (g Guard) reader() (mountinfo.PropagationReader, bool) {
 	return reader, ok
 }
 
-// unwindTimeout bounds a rollback so a cleanup cannot hang forever either. It
-// covers a mount-table read and an unmount, both of which are fast when they
-// work at all.
-//
-// It is not a provider's own cleanup timeout and must not be conflated with one:
-// pkg/drbd's cleanupContext waits on drbdadm and lvremove, which are minutes;
-// this waits on a syscall.
+// unwindTimeout bounds a rollback's mount-table read and unmount.
 const unwindTimeout = 30 * time.Second
 
-// UnwindContext detaches from the caller's context for a compensating action.
-//
-// The most likely reason to be unwinding is that the caller's context died
-// partway through the operation being compensated — and the propagation guard
-// itself reports a canceled context as a refusal, which is precisely a path that
-// arrives here with ctx already dead. Reusing it makes the mount-table read fail
-// instantly and leaves behind exactly the mount this exists to remove, while the
-// code reads as though it had been removed.
+// UnwindContext detaches from the caller's context, which is often already dead when unwinding.
 func UnwindContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), unwindTimeout)
 }

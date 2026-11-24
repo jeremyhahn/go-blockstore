@@ -148,13 +148,7 @@ func TestRemedyForAnUnknownCauseSaysSoRatherThanGuessing(t *testing.T) {
 	}
 }
 
-// TestNoRemedyEverRecommendsPrivileged is the standing rule, enforced over
-// every remedy string rather than trusted to review.
-//
-// --privileged grants every capability, drops the seccomp profile AND the LSM
-// confinement, and exposes every host device. It is the answer an operator will
-// reach for on their own; nothing here may encourage it, and every mention must
-// be a warning against it.
+// TestNoRemedyEverRecommendsPrivileged: every mention of --privileged in a remedy is a warning against it.
 func TestNoRemedyEverRecommendsPrivileged(t *testing.T) {
 	check := func(t *testing.T, name, remedy string) {
 		t.Helper()
@@ -179,15 +173,7 @@ func TestNoRemedyEverRecommendsPrivileged(t *testing.T) {
 	}
 }
 
-// TestPlatformUnsupportedCarriesNoContainerAdvice is why a caller cannot assume
-// every refusal mentions --privileged.
-//
-// On darwin and windows the live probes refuse with CausePlatformUnsupported,
-// and there is no container there to make privileged — so the remedy correctly
-// says nothing about it. A test that asserted the warning on EVERY refusal
-// therefore passed on Linux and failed on a platform this repository supports
-// building on. Codex caught it in review; this asserts the underlying fact from
-// a test that runs everywhere, so the reason cannot be forgotten.
+// TestPlatformUnsupportedCarriesNoContainerAdvice: platform refusals do not mention --privileged.
 func TestPlatformUnsupportedCarriesNoContainerAdvice(t *testing.T) {
 	remedy := (&CapabilityError{
 		Capability: CapabilityDeviceMapper,
@@ -213,14 +199,7 @@ func TestEveryCauseHasARemedy(t *testing.T) {
 	}
 }
 
-// TestEveryPackageFailureReachesTheCatchAll is the contract the documentation
-// states: errors.Is(err, ErrUnavailable) is the catch-all branch, so every
-// refusal this package can produce has to match it.
-//
-// The two that did not were the fail-closed ones — an empty capability list and
-// an unregistered capability — which is the worst place to have a gap: a caller
-// that built its list dynamically and got an empty one is precisely the caller
-// whose only branch is the catch-all. Found by Codex on review.
+// TestEveryPackageFailureReachesTheCatchAll: every refusal matches ErrUnavailable, including an empty or unregistered capability.
 func TestEveryPackageFailureReachesTheCatchAll(t *testing.T) {
 	cases := map[string]error{
 		"an empty capability list": ErrNoCapabilities,

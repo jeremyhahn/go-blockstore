@@ -201,17 +201,7 @@ func TestKeyIsBorrowedOnlyForTheOperation(t *testing.T) {
 	}
 }
 
-// TestLUKSFormatBorrowsTheKeyAndKeepsItOffArgv is what is left of the old argv
-// assertion once there is no argv.
-//
-// The parameters used to be checkable by reading the cryptsetup command line;
-// they are now arguments to a function call inside this process, so what a fake
-// can still observe is the BORROW: the format operation is issued against the
-// right device with the passphrase handed to it as a slice, and that slice
-// never appears anywhere a command line would have exposed it. The parameters
-// themselves are pinned against the header they actually produce — see
-// TestNativeFormatPinsFIPSParameters, which formats a container and reads them
-// back rather than trusting a fake to have been asked for them.
+// TestLUKSFormatBorrowsTheKeyAndKeepsItOffArgv: the format borrows the passphrase as a slice; parameters are checked by TestNativeFormatPinsFIPSParameters.
 func TestLUKSFormatBorrowsTheKeyAndKeepsItOffArgv(t *testing.T) {
 	runner := newFakeRunner()
 	p := newTestProvider(t, runner, encrypted)
@@ -326,12 +316,7 @@ func TestLockedMemoryErrorIsLegible(t *testing.T) {
 	}
 }
 
-// TestLUKSIsOpenRefusesAForeignMapping is the fail-open this check exists for.
-// The mapping name is deterministic, which makes it findable and also makes it
-// claimable — a stale mapping from an earlier run, or one opened by hand, sits
-// under exactly the name this provider looks for. Trusting the name would have
-// Attach return that mapping as this volume's plaintext device, handing the
-// caller another volume's decrypted contents to mount.
+// TestLUKSIsOpenRefusesAForeignMapping: a mapping under our name over another device is refused.
 func TestLUKSIsOpenRefusesAForeignMapping(t *testing.T) {
 	runner := newFakeRunner().withMappingsBackedBy(map[string]string{
 		// Our name, someone else's volume.
@@ -368,15 +353,7 @@ func TestLUKSIsOpenAcceptsOurOwnMapping(t *testing.T) {
 	}
 }
 
-// TestLUKSIsOpenFailsClosedOnUnreadableIdentity covers a mapping that cannot be
-// tied to a device at all. The point of reading the backing device is to refuse
-// what cannot be established, so an unreadable answer is a failure, not a pass.
-//
-// The shapes that produce one are properties of sysfs rather than of this
-// package, so they are covered where they arise —
-// TestBackingDeviceRequiresExactlyOneSlave builds each of them out of a
-// directory a test owns. This checks that luksIsOpen propagates rather than
-// swallowing, which is the half that belongs here.
+// TestLUKSIsOpenFailsClosedOnUnreadableIdentity: luksIsOpen propagates an unreadable backing device.
 func TestLUKSIsOpenFailsClosedOnUnreadableIdentity(t *testing.T) {
 	sentinel := fmt.Errorf("%w: /sys/dev/block/253:3/slaves lists 2", luks.ErrNoBackingDevice)
 	runner := newFakeRunner().on(luksBinary, func(args []string, _ []byte) ([]byte, error) {

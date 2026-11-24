@@ -269,13 +269,7 @@ func TestExplicitNodeIDsAreKept(t *testing.T) {
 	}
 }
 
-// TestConfigIsNotAWindowIntoTheProvider covers a leak the struct copy hides.
-//
-// Config returns a value, which looks like a copy — but net.IP is a slice, so
-// the returned struct shares the provider's backing arrays. A caller that
-// inspects its configuration and then writes to the address it got back is
-// editing the provider's validated state, and every resource file generated
-// afterwards carries the change, having gone nowhere near ParseConfig.
+// TestConfigIsNotAWindowIntoTheProvider: Config must copy net.IP slices rather than share the provider's arrays.
 func TestConfigIsNotAWindowIntoTheProvider(t *testing.T) {
 	p, _ := newTestProvider(t)
 

@@ -20,52 +20,9 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// Backend is the seam between the storage providers and the LUKS2 implementation
-// underneath it.
-//
-// It exists for the same reason CommandRunner does — the unit tests drive the
-// whole provider without root, a block device or device-mapper — but it is a
-// separate seam rather than another binary behind CommandRunner, because there
-// is no binary any more. Every operation here is performed IN THIS PROCESS by
-// github.com/jeremyhahn/go-luks2: the header is parsed in Go, the key is
-// derived in Go, and the plaintext mapping is created with device-mapper ioctls
-// rather than by forking cryptsetup. Owner ruling 2026-08-29: everything is
-// done in pure Go unless there is absolutely no other way.
-//
-// EVERY key parameter is a *enclave.MemoryEnclave the caller lends for the
-// duration of one call and nothing longer. An implementation must not destroy
-// it, retain it or let it outlive the call — see Manager.withKey, which owns the
-// enclave and destroys it, and KeyProvider, which explains what the enclave is
-// protecting. No implementation reads the passphrase as a []byte itself: the
-// native one hands the enclave to go-luks2, which borrows it for the derivation.
-//
-// THERE IS NO RESIZE HERE, and its absence is load-bearing. Growing a dm-crypt
-// mapping in place means reloading the device-mapper table underneath the live
-// device, which needs the container's master key; go-luks2 exposes neither that
-// nor a resize of its own — measured against v0.2.0-alpha on 2026-09-17 and
-// still true of v1.0.0-rc.2: pkg/dmcrypt has Activate, Lookup and Deactivate, no
-// reload, no suspend/resume, and Activate computes a "dynamic" segment's length
-// once, from the backing device's size at that moment. The only mechanism reachable
-// through it is to remove the mapping and unlock again, which is a destructive
-// operation wearing a resize's name — the teardown is unconditional and the
-// rebuild can fail, and what the caller is left with is not an unresized volume
-// but no plaintext device. Rather than offer that behind a reassuring method
-// name, the seam does not offer it at all: pkg/local's Resize refuses an
-// attached encrypted volume with ErrResizeWhileAttached, pkg/drbd's refuses a
-// mapping that has fallen behind its device with ErrMappingStale, and no
-// implementation of this interface has an operation capable of tearing down a
-// mapping the caller is using. What the seam offers instead is the MEASUREMENT
-// — MappingInfo carries the mapping's length and its backing device's current
-// size — so a provider can tell a mapping that still covers its device from one
-// that no longer does, and refuse to grow a filesystem into the latter. See
-// growDetachedEncryptedFilesystem (pkg/local) for the path that grows one
-// safely, because it opens the mapping itself and owns it for the whole
-// operation, and pkg/drbd's Promote for the open that sizes a replicated
-// volume's mapping.
-//
-// ctx is passed to go-luks2, whose API takes one on every operation. What a
-// cancellation does halfway through a format or an unlock is go-luks2's to
-// define; this package adds nothing to it.
+// Backend is the seam between the providers and go-luks2, which does every operation in process.
+// Each key is an enclave lent for one call; an implementation must not destroy or retain it.
+// There is deliberately no resize: MappingInfo reports the mapping and backing sizes so a provider can refuse a stale mapping.
 type Backend interface {
 	// Format writes a LUKS2 header onto device with this package's pinned
 	// parameters. It destroys whatever was there.
@@ -78,8 +35,7 @@ type Backend interface {
 	// Close tears the plaintext mapping down.
 	Close(ctx context.Context, name string) error
 
-	// TestKey reports whether key opens the container on device WITHOUT
-	// unlocking it — no mapping is created and no plaintext device appears.
+	// TestKey reports whether key opens the container on device without unlocking it.
 	TestKey(ctx context.Context, device string, key *enclave.MemoryEnclave) error
 
 	// DataOffset reports where a container's data starts, which is what its
@@ -90,54 +46,25 @@ type Backend interface {
 	// no mapping under that name.
 	Mapping(ctx context.Context, name string) (MappingInfo, bool, error)
 
-	// Identity returns a device's major:minor, which is the same for every path
-	// that leads to it.
-	//
-	// It rides on this interface rather than standing alone because the one
-	// question it answers is a LUKS one — whether the mapping under this
-	// deterministic mapping name is over this volume — and because
-	// it reads the /dev and /sys trees, which a test that owns neither has to be
-	// able to answer for.
+	// Identity returns a device's major:minor, the same for every path to it.
 	Identity(ctx context.Context, path string) (string, error)
 }
 
 // MappingInfo describes an open device-mapper mapping.
 type MappingInfo struct {
-	// Backing is the most legible path to the device the mapping decrypts,
-	// for an error a human has to act on: the dm-canonical
-	// /dev/mapper/<vg>-<lv> where the backing device is itself device-mapper,
-	// and /dev/<kernel-name> where it is not.
+	// Backing is the most legible path to the backing device: /dev/mapper/<vg>-<lv> for device-mapper, else /dev/<kernel-name>.
 	Backing string
 
 	// BackingID is that device's major:minor, and it — not Backing — is what
 	// ownership is decided on. The same device answers to several paths.
 	BackingID string
 
-	// SizeBytes is the mapping's length: the plaintext capacity the kernel
-	// presents. It was FIXED when the mapping was loaded — go-luks2 computes
-	// it at Unlock from the backing device's size less the data offset — and
-	// nothing reachable through this seam changes it afterwards, which is
-	// exactly why it has to be reported: it is the one number that stops
-	// tracking the device.
+	// SizeBytes is the mapping's length, fixed when the mapping was loaded.
 	SizeBytes int64
 
-	// BackingSizeBytes is the backing device's size NOW. It is reported next
-	// to SizeBytes, from the same walk of sysfs, so that a caller comparing
-	// the two compares one instant: a mapping whose SizeBytes plus the
-	// container's data offset is less than this has fallen behind the device
-	// it decrypts, and a filesystem grown "to fit" it would grow to the old
-	// size and report success.
+	// BackingSizeBytes is the backing device's current size, read in the same sysfs walk as SizeBytes.
 	BackingSizeBytes int64
 }
 
-// ErrNoBackingDevice reports a mapping whose backing device could not be
-// established.
-//
-// It fails closed on purpose, and the shape of the failure is the reason: the
-// kernel lists what a device-mapper device is stacked on in
-// /sys/dev/block/<major>:<minor>/slaves, a dm-crypt target has exactly one
-// entry there, and a mapping reporting none or several is not a dm-crypt target
-// over one volume. The whole point of looking is to refuse a mapping whose
-// identity cannot be established, so an unreadable answer is a refusal rather
-// than a pass.
+// ErrNoBackingDevice reports a mapping without exactly one backing device; it fails closed.
 var ErrNoBackingDevice = errors.New("the mapping reports no single backing device")

@@ -23,19 +23,12 @@ import (
 // ProviderNameDRBD is the registered name of the DRBD 9 provider.
 const ProviderNameDRBD = "drbd"
 
-// Registering here rather than from an init inside pkg/drbd keeps the
-// dependency pointing one way — factory imports providers, never the reverse —
-// and means a caller gets the provider by importing this package with -tags
-// drbd, with no blank import to remember. Without the tag this file does not
-// compile, pkg/drbd is an empty package, and nothing DRBD-related is linked in.
+// Registered here under the drbd tag, so factory imports providers and not the reverse.
 func init() {
 	RegisterProvider(ProviderNameDRBD, func(settings map[string]string) (common.VolumeProvider, error) {
 		provider, err := drbd.New(settings)
 		if err != nil {
-			// Returning New's results directly would hand back a nil
-			// *drbd.Provider boxed in a non-nil common.VolumeProvider, so a
-			// caller's `if provider != nil` would be true for a construction
-			// that failed. The explicit nil keeps the interface value nil.
+			// Return an explicit nil so a failed construction is not a non-nil interface.
 			return nil, err
 		}
 		return provider, nil

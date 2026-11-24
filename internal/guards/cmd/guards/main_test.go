@@ -22,13 +22,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/internal/guards"
 )
 
-// TestRunOverThisRepositoryIsClean is the gate itself, invoked the way the
-// Makefile and the CI Lint step invoke it.
-//
-// It asserts the EXAMINED counts appear in the output as well as the exit
-// status, because that output is the only thing distinguishing this run from
-// one where the scanners read nothing — which is the defect the command exists
-// to make impossible.
+// TestRunOverThisRepositoryIsClean runs the gate as make guards does and checks the examined counts are printed.
 func TestRunOverThisRepositoryIsClean(t *testing.T) {
 	var out, errOut strings.Builder
 
@@ -47,13 +41,7 @@ func TestRunOverThisRepositoryIsClean(t *testing.T) {
 	t.Logf("%s", text)
 }
 
-// TestRunReportsAnUnscannableTree covers the other exit status: a starting
-// directory with no module above it, which is what a wrong working directory
-// looks like.
-//
-// The distinction matters. Exit 2 says the command could not scan; exit 1 says
-// it scanned and the tree is dirty. Collapsing them would let a mis-invoked
-// gate be read as a code problem, or worse, be "fixed" by editing the tree.
+// TestRunReportsAnUnscannableTree: exit 2 means the tree could not be scanned, exit 1 means it is dirty.
 func TestRunReportsAnUnscannableTree(t *testing.T) {
 	// t.TempDir() is under the system temp directory, which has no go.mod at or
 	// above it — unless the temp directory is inside a module, so this asserts
@@ -79,13 +67,7 @@ func TestRunReportsAnUnscannableTree(t *testing.T) {
 	}
 }
 
-// TestRunExitsNonZeroOnADirtyTree covers the status the repository itself can
-// never produce while it is clean — and an exit status no test has produced is
-// one nobody knows is wired to anything.
-//
-// The finding is planted through the scanner list rather than by writing a
-// violation into the tree, because a test that dirtied the repository to check
-// the gate would be a test that can leave it dirty.
+// TestRunExitsNonZeroOnADirtyTree plants a finding through the scanner list, leaving the tree untouched.
 func TestRunExitsNonZeroOnADirtyTree(t *testing.T) {
 	alwaysFires := guards.Scanner{
 		Name: "always-fires",

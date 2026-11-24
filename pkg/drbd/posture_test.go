@@ -35,14 +35,7 @@ func guardNamed(t *testing.T, p Posture, name string) GuardStatus {
 	return GuardStatus{}
 }
 
-// TestPostureReportsTheGuardThatIsOff is the reason #40 was not just a
-// configuration flag.
-//
-// An off-by-default guard whose absence is invisible is a guard that is silently
-// missing, which is the defect the guard was written to remove one level up. So
-// the unchecked state has to be SAYABLE: the line is present, it reads NOT
-// CHECKED, and it names the setting that would turn it on — because the operator
-// who most needs to read it is the one who did not know the guard existed.
+// TestPostureReportsTheGuardThatIsOff: the line reads NOT CHECKED and names the setting.
 func TestPostureReportsTheGuardThatIsOff(t *testing.T) {
 	p, _, _ := newTestProviderWith(t, nil)
 
@@ -63,9 +56,7 @@ func TestPostureReportsTheGuardThatIsOff(t *testing.T) {
 	}
 }
 
-// TestPostureReportsTheGuardThatIsOn is the other half: the line changes with
-// the configuration, so NOT CHECKED above is evidence about this provider rather
-// than a constant.
+// TestPostureReportsTheGuardThatIsOn: the line follows the configuration.
 func TestPostureReportsTheGuardThatIsOn(t *testing.T) {
 	p, _, _ := newTestProviderWith(t, requirePropagation)
 
@@ -111,13 +102,7 @@ func TestPostureNamesEveryGuardWhicheverWayItIsSet(t *testing.T) {
 	}
 }
 
-// TestPostureDoesNotClaimAPreflightCheckThatDidNotRun keeps the report honest
-// about the one thing it could most easily lie about.
-//
-// The capability half is derived by the same function New runs, so a provider
-// built with preflight off must not report its capabilities as verified — a
-// posture that claimed a check nobody made would be worse than no posture, since
-// it is read precisely by somebody deciding whether to trust the deployment.
+// TestPostureDoesNotClaimAPreflightCheckThatDidNotRun: preflight off reports capabilities unchecked.
 func TestPostureDoesNotClaimAPreflightCheckThatDidNotRun(t *testing.T) {
 	p, _, _ := newTestProviderWith(t, func(s map[string]string) { s[SettingPreflight] = "off" })
 
@@ -144,15 +129,7 @@ func TestPostureDoesNotClaimAPreflightCheckThatDidNotRun(t *testing.T) {
 	}
 }
 
-// TestPostureReportsAPreflightCheckThatDidRun is the counterpart: the
-// capability lines follow the mode, so "NOT CHECKED" above is a fact about the
-// provider rather than a constant this report always prints.
-//
-// The mode is set on the built provider rather than through settings, because
-// PreflightAll at construction would run the real probes and refuse on any host
-// without the DRBD module loaded — which is every host this suite runs on. What
-// is under test is the REPORT, and it derives its answer from the same function
-// New passes to runPreflight.
+// TestPostureReportsAPreflightCheckThatDidRun: the mode is set on the built provider so no real probes run.
 func TestPostureReportsAPreflightCheckThatDidRun(t *testing.T) {
 	p, _, _ := newTestProviderWith(t, nil)
 	p.cfg.Preflight = PreflightAll
@@ -199,28 +176,7 @@ func TestPostureReportsThePeerAuthenticationTheProviderActuallyHas(t *testing.T)
 	}
 }
 
-// TestPostureReportsTheKeyringCheckOnlyWhenItIsActuallyDerived is this report's
-// own rule applied to the capability #13 added.
-//
-// The kernel keyring is the one capability whose requirement depends on the
-// CONFIGURATION rather than only on which seams were injected: New checks it
-// when the provider is set to encrypt AND is using the real LUKS backend. Both
-// inputs are asserted here, because the first version of this test asserted
-// neither properly and two separate things were learned from it:
-//
-//   - Asserting that the guard is NAMED proves nothing. The name comes from
-//     guardNames and is printed whether the guard is on or off, so a mutation
-//     hardcoding `false` into Posture's derivation survived it. Measured.
-//   - Preflight is OFF across the unit suite, so with no checks derived at all
-//     every capability guard reads inactive whatever the configuration says.
-//     That is what made the mutation invisible. The mode is therefore set on
-//     the BUILT provider rather than through New, which exercises Posture's
-//     derivation without running the host-dependent startup checks.
-//
-// The injected-backend case is not padding. Every fixture in this suite injects
-// a fake LUKS backend, and a fake derives no key and creates no mapping — so a
-// test that assumed "encrypted implies keyring" would have been asserting
-// something New does not do, and would have failed against correct code. It did.
+// TestPostureReportsTheKeyringCheckOnlyWhenItIsActuallyDerived: checked only when encrypting with the real LUKS backend.
 func TestPostureReportsTheKeyringCheckOnlyWhenItIsActuallyDerived(t *testing.T) {
 	const guard = "kernel keyring"
 

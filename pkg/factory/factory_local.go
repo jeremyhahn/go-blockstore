@@ -11,11 +11,7 @@
 // 2. Commercial License
 //    Contact licensing@automatethethings.com for commercial licensing options.
 
-// This file carries NO build tag. The local provider is the fundamental
-// backend — tagging it would leave a binary built with no tags with no
-// providers at all — and it pulls in nothing beyond the standard library, so
-// there is nothing to gate. Backends that link kernel tooling or network
-// libraries get a tag; this one does not. See the package documentation.
+// No build tag: the local provider is the always-present backend and needs only the standard library.
 
 package factory
 
@@ -28,10 +24,7 @@ func init() {
 	RegisterProvider("local", func(settings map[string]string) (common.VolumeProvider, error) {
 		provider, err := local.NewFromSettings(settings)
 		if err != nil {
-			// Returning NewFromSettings' results directly would hand back a nil
-			// *local.Provider boxed in a non-nil common.VolumeProvider, so a
-			// caller's `if provider != nil` would be true for a construction
-			// that failed. The explicit nil keeps the interface value nil.
+			// Return an explicit nil so a failed construction is not a non-nil interface.
 			return nil, err
 		}
 		return provider, nil

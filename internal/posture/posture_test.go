@@ -18,9 +18,7 @@ import (
 	"testing"
 )
 
-// TestStringSaysTheThirdState is the whole reason this type exists: an
-// unchecked guard is a LINE, not an omission. An operator reading a list of
-// three guards cannot tell it from a list of four.
+// TestStringSaysTheThirdState: an unchecked guard is a line, not an omission.
 func TestStringSaysTheThirdState(t *testing.T) {
 	rendered := Posture{
 		Component: "drbd",
@@ -42,8 +40,7 @@ func TestStringSaysTheThirdState(t *testing.T) {
 		}
 	}
 
-	// NOT CHECKED is upper case and checked is not, so the eye finds the gaps in
-	// a list of a dozen lines. A rendering that shouted both would lose that.
+	// NOT CHECKED is upper case and checked is not.
 	if strings.Contains(rendered, "NOT CHECKED — verified") {
 		t.Error("a checked guard rendered as NOT CHECKED")
 	}

@@ -34,14 +34,7 @@ func requirePropagation(settings map[string]string) {
 	settings[SettingMountPropagation] = "shared"
 }
 
-// mountedProvider builds a provider whose volume is provisioned, Primary and
-// carrying a filesystem, with the mount table scripted to agree that the device
-// is at testMountPoint once mounted.
-//
-// The mount itself goes through internal/mount's fake, which records rather than
-// mounts; the mount TABLE is this package's fake, which is what the guard reads.
-// They are separate seams and a test has to set both, exactly as the kernel sets
-// both for a real mount.
+// mountedProvider builds a Primary provisioned volume with a filesystem; the mount and the mount table are separate fakes.
 func mountedProvider(t *testing.T, tweak func(map[string]string)) (*Provider, *fakeRunner) {
 	t.Helper()
 	p, r, _ := newTestProviderWith(t, tweak)
@@ -54,13 +47,7 @@ func mountedProvider(t *testing.T, tweak func(map[string]string)) (*Provider, *f
 	return p, r
 }
 
-// TestMountDoesNotCheckPropagationByDefault is the owner's ruling on #40 in one
-// assertion: the guard exists here and it is OFF unless the deployment asks.
-//
-// The mount below is PRIVATE — the fake reports what an ordinary host mount
-// reports — and it succeeds. A replicated cluster whose mounts nobody consumes
-// from another namespace is not broken, and a default-on refusal would have
-// converted every such cluster into a failing one on upgrade.
+// TestMountDoesNotCheckPropagationByDefault: a private mount succeeds with the guard off.
 func TestMountDoesNotCheckPropagationByDefault(t *testing.T) {
 	p, r := mountedProvider(t, nil)
 
@@ -124,15 +111,7 @@ func TestMountUnwindsAMountItRefuses(t *testing.T) {
 	}
 }
 
-// TestMountRefusesRatherThanPassesWhenPropagationCannotBeRead is the crux of the
-// design and the case a copied guard is most likely to get wrong.
-//
-// A mount table that cannot answer the propagation question is an ERROR, not a
-// pass. A guard that reports success when its own check breaks converts an
-// unknown into a green light, and does it exactly where somebody is relying on
-// it — so this asserts on the CAUSE, not merely on "an error came back": a
-// CauseIndeterminate is what a broken instrument produces, and it must not read
-// like the nil a passing guard produces.
+// TestMountRefusesRatherThanPassesWhenPropagationCannotBeRead: the cause is CauseIndeterminate.
 func TestMountRefusesRatherThanPassesWhenPropagationCannotBeRead(t *testing.T) {
 	unreadable := errors.New("opening /proc/self/mountinfo: permission denied")
 
@@ -152,10 +131,7 @@ func TestMountRefusesRatherThanPassesWhenPropagationCannotBeRead(t *testing.T) {
 			arrange: func(r *fakeRunner) { r.scriptMount("/dev/drbd0", "") },
 			wantErr: mountinfo.ErrNotMounted,
 		},
-		// Something else is mounted over the target. The guard asks about THIS
-		// device rather than about the path, so an interloper does not get to
-		// answer for us — least of all a shared one, which would make a private
-		// mount pass.
+		// Something else is mounted over the target; the guard asks about this device.
 		"another device covers the target": {
 			arrange: func(r *fakeRunner) { r.overMount(testMountPoint, "/dev/other") },
 			wantErr: mountinfo.ErrNotVisibleThere,
@@ -181,15 +157,7 @@ func TestMountRefusesRatherThanPassesWhenPropagationCannotBeRead(t *testing.T) {
 	}
 }
 
-// TestMountRefusesWhenTheInjectedTableCannotReportPropagation covers the seam
-// rather than the kernel: a caller who injected a mount table without the
-// optional propagation half, having asked for the guard.
-//
-// New refuses that pairing, which is why this is a construction test and not a
-// Mount test. Discovering it at the first Mount would be worse than useless —
-// the mount has already happened, the guard cannot judge it, and the rollback
-// cannot identify it either, so Mount would return an error over a filesystem it
-// left mounted.
+// TestMountRefusesWhenTheInjectedTableCannotReportPropagation: New refuses the pairing.
 func TestMountRefusesWhenTheInjectedTableCannotReportPropagation(t *testing.T) {
 	settings := testSettings(t)
 	requirePropagation(settings)
@@ -234,14 +202,7 @@ func (tableWithoutPropagation) VisibleMountPointsFor(context.Context, string) ([
 	return nil, nil
 }
 
-// TestUnwindLeavesAMountThatIsNoLongerOurs is the second review finding from #34
-// carried across rather than rediscovered.
-//
-// umount(2) takes a path, so a rollback that unmounted the target blindly would
-// detach whatever is visible there — and in the window between the guard's
-// verdict and the rollback, that can be a SECOND mount of the same device
-// stacked on the same path. (device, path) cannot tell the two apart; the
-// kernel's mount id can, and that is the whole reason the guard hands one back.
+// TestUnwindLeavesAMountThatIsNoLongerOurs: the mount ID tells a second mount of the same device apart.
 func TestUnwindLeavesAMountThatIsNoLongerOurs(t *testing.T) {
 	p, r, m := newTestProviderWith(t, requirePropagation)
 	provision(t, p, r, defaultSpec())
@@ -269,15 +230,7 @@ func TestUnwindLeavesAMountThatIsNoLongerOurs(t *testing.T) {
 	}
 }
 
-// TestUnwindRunsOnItsOwnContext is the first review finding from #34 carried
-// across.
-//
-// The most likely reason to be unwinding is that the caller's context died
-// partway through the operation being compensated — the guard reports a canceled
-// context as a refusal, which is exactly a path that arrives at the rollback
-// with ctx already dead. A rollback reusing it would fail its mount-table read
-// instantly and leave behind the mount it exists to remove, while reading as
-// though it had removed it.
+// TestUnwindRunsOnItsOwnContext: the rollback works with ctx already dead.
 func TestUnwindRunsOnItsOwnContext(t *testing.T) {
 	p, r, m := newTestProviderWith(t, requirePropagation)
 	provision(t, p, r, defaultSpec())

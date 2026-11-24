@@ -33,21 +33,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/internal/luks/luktest"
 )
 
-// These tests format REAL LUKS2 containers and read the headers back, and they
-// need neither root nor a block device to do it: go-luks2 formats a regular
-// file, so a sparse file in t.TempDir() carries a container this package would
-// otherwise only see on a logical volume.
-//
-// That is the whole reason they exist. Everything about the container this
-// provider creates — the FIPS parameters, and the 16 MiB data offset the sizing
-// contract is built on — used to be checkable only by reading a cryptsetup
-// command line, which asserted what was ASKED FOR rather than what was written,
-// or by the integration suite, which needs root and does not run on every
-// change. Formatting in-process asserts the header itself, on every `go test`.
-//
-// What they cannot cover is unlocking: a plaintext mapping is a device-mapper
-// device, which needs root and /dev/mapper/control. Those paths stay in the
-// integration suite.
+// These tests format real LUKS2 containers in sparse files without root; unlocking stays in the integration suite.
 
 // luksTestPassphrase seals a passphrase for these tests. It clears go-luks2's
 // 8-byte floor, which the fake-backed tests never exercise because the fake does
@@ -97,15 +83,7 @@ func newContainerFile(t *testing.T, size int64) string {
 	return path
 }
 
-// TestNativeFormatPinsFIPSParameters asserts the parameters of the header that
-// is actually WRITTEN, which is the assertion the old argv check was standing in
-// for.
-//
-// go-luks2's defaults are not FIPS-approved — an empty KDFType formats with
-// argon2id and an empty HashAlgo derives with SHA-256 — so a container formatted
-// by this provider must state every parameter rather than inherit one. Dropping
-// any of these silently produces a container that is weaker, or non-compliant,
-// or both, and nothing about the resulting volume says so.
+// TestNativeFormatPinsFIPSParameters asserts the written header's parameters; go-luks2's defaults are not FIPS-approved.
 func TestNativeFormatPinsFIPSParameters(t *testing.T) {
 	device := newContainerFile(t, 32<<20)
 	metadata := luktest.Read(t, device)
@@ -124,8 +102,7 @@ func TestNativeFormatPinsFIPSParameters(t *testing.T) {
 	if keyslot.AF.Hash != hashAlgo {
 		t.Errorf("anti-forensic hash = %q, want %q; one hash across the header", keyslot.AF.Hash, hashAlgo)
 	}
-	// The header carries the master key size in BYTES; the option is in bits,
-	// and XTS splits it in two — so 64 bytes here is AES-256-XTS.
+	// The header stores the key size in bytes; 64 bytes is AES-256-XTS.
 	if want := keySizeBits / 8; keyslot.KeySize != want {
 		t.Errorf("key size = %d bytes, want %d (AES-256-XTS)", keyslot.KeySize, want)
 	}
@@ -158,18 +135,7 @@ func TestNativeFormatPinsFIPSParameters(t *testing.T) {
 	}
 }
 
-// TestNativeFormatProducesTheHeaderTheSizingConstantAssumes is the assertion the
-// whole #11 sizing contract rests on, checked against the formatter that
-// actually writes the header rather than against the one it was measured on.
-//
-// HeaderBytes was measured on cryptsetup 2.7.0 in 2026-08-27 and is used to
-// size every encrypted volume this provider creates: the logical volume is made
-// that much larger than the requested usable capacity. If go-luks2 laid the
-// header out differently, every encrypted volume would come out the wrong size
-// and Status would report a usable capacity the caller cannot use.
-//
-// It does not, and the sizes are the same five the cryptsetup measurement used,
-// so the two are directly comparable. The offset does not scale with the device.
+// TestNativeFormatProducesTheHeaderTheSizingConstantAssumes checks the data offset HeaderBytes sizes every encrypted volume by.
 func TestNativeFormatProducesTheHeaderTheSizingConstantAssumes(t *testing.T) {
 	sizes := map[string]int64{
 		"32 MiB":   32 << 20,
@@ -197,22 +163,7 @@ func TestNativeFormatProducesTheHeaderTheSizingConstantAssumes(t *testing.T) {
 	}
 }
 
-// TestNativeFormatClearsTheIterationFloor records the one parameter deliberately
-// left to the library, and the floor it must not fall below.
-//
-// NIST SP 800-132 asks for at least 1000 PBKDF2 iterations. Measured on
-// go-luks2 v0.1.7-alpha (2026-08-29) the answer was 100000 every time: its
-// benchmark timed 1000 iterations at millisecond resolution, PBKDF2-SHA-512
-// finishes that in under a millisecond, and it fell through to a hard-coded
-// figure — so it did not adapt to hardware the way cryptsetup's did, where the
-// same parameters produced 3,344,740.
-//
-// The improvement arrived: go-luks2 v0.2.0-alpha calibrates, and on 2026-09-03
-// the same parameters produced 3,988,449. This test did not have to change,
-// which is the point of it — the floor is what compliance needs, the count is
-// not load-bearing for the high-entropy material this provider stretches, and
-// pinning the measured value would have turned that improvement into a test
-// failure. It is left unpinned for the next one.
+// TestNativeFormatClearsTheIterationFloor requires at least the NIST SP 800-132 minimum of 1000 PBKDF2 iterations.
 func TestNativeFormatClearsTheIterationFloor(t *testing.T) {
 	device := newContainerFile(t, 32<<20)
 
@@ -286,18 +237,7 @@ func TestNativeDataOffsetRefusesWhatIsNotAContainer(t *testing.T) {
 	}
 }
 
-// TestNativeDataOffsetRefusesAnUnusableSegmentTable covers the fail-closed
-// branches of the read that every capacity answer is built on.
-//
-// None of these shapes can be produced by formatting: they are what a container
-// that is MID-REENCRYPTION, or one whose header has been corrupted or written by
-// something else, looks like. Each is built by rewriting the header of a real
-// container — rewriteMetadata re-checksums both copies, so what comes back is
-// a header this package genuinely has to cope with rather than a mangled file.
-//
-// Guessing at any of them would be worse than failing. Two segments have no
-// single usable capacity; a zero offset would say the container costs nothing
-// and hand the caller its own header as usable space.
+// TestNativeDataOffsetRefusesAnUnusableSegmentTable covers rewritten headers with segment tables that have no single usable capacity.
 func TestNativeDataOffsetRefusesAnUnusableSegmentTable(t *testing.T) {
 	rewrites := map[string]func(map[string]any) error{
 		"two segments": func(m map[string]any) error {
@@ -359,12 +299,7 @@ func TestNativeDataOffsetReadsAForeignHeader(t *testing.T) {
 	}
 }
 
-// TestNativeMappingOperationsFailRatherThanSucceedQuietly covers the paths that
-// need device-mapper, without needing it: the operations are issued against a
-// device and a mapping that do not exist, and every one of them has to come back
-// with an error. The success paths are the integration suite's — see
-// TestIntegrationEncryptedVolumeRoundTrip — but a silent success here would mean
-// Attach reporting a plaintext device that was never created.
+// TestNativeMappingOperationsFailRatherThanSucceedQuietly issues mapping operations on absent devices and requires errors.
 func TestNativeMappingOperationsFailRatherThanSucceedQuietly(t *testing.T) {
 	backend := Native{}
 	ctx := context.Background()
@@ -415,13 +350,7 @@ func TestNativeOperationsHonorACancelledContext(t *testing.T) {
 	}
 }
 
-// TestBackingDeviceRequiresExactlyOneSlave covers the fail-closed rule on the
-// lookup that decides whether a mapping is ours.
-//
-// A dm-crypt target is stacked on exactly one device, so none and several are
-// both "this is not the mapping we are looking for" rather than something to
-// pick a winner out of. Neither shape can be produced on a real /sys on demand,
-// which is why sysfsRoot is a parameter.
+// TestBackingDeviceRequiresExactlyOneSlave requires a dm-crypt mapping to have exactly one backing device.
 func TestBackingDeviceRequiresExactlyOneSlave(t *testing.T) {
 	// One arbitrary device number, used for every case; the directory it names
 	// is what varies.
@@ -501,15 +430,7 @@ func TestBackingDeviceRequiresExactlyOneSlave(t *testing.T) {
 	})
 }
 
-// TestDeviceSizeReadsSysfsSectorsAndRefusesWhatItCannotParse covers the
-// number a stale-mapping check is decided on. sysfs publishes a block device's
-// size in 512-byte sectors regardless of its logical sector size — that unit
-// is the kernel's, fixed in the block layer, not a property of the device — so
-// the reading is scaled once here and nowhere else. Every unreadable shape is
-// a refusal: the whole point of measuring is to refuse a mapping whose size
-// cannot be established, and a 0 read as "zero bytes" would make every
-// mapping look stale, while one read as "unknown, assume fine" would make none
-// of them.
+// TestDeviceSizeReadsSysfsSectorsAndRefusesWhatItCannotParse reads sysfs size in 512-byte sectors and refuses unparseable values.
 func TestDeviceSizeReadsSysfsSectorsAndRefusesWhatItCannotParse(t *testing.T) {
 	const major, minor = 253, 7
 	rdev := uint64(major<<8 | minor)
@@ -603,22 +524,7 @@ func TestIdentityFollowsSymlinksAndRefusesNonDevices(t *testing.T) {
 	}
 }
 
-// --- Upstream conformance ---------------------------------------------------
-//
-// THE TESTS BELOW FAIL AGAINST go-luks2 v0.1.7-alpha, AND THAT FAILURE IS THE
-// POINT. They are not aspirational and they are not to be made green by
-// changing what they assert; each one pins a property of the on-disk container
-// that a storage product cannot ship without, and each one is red because
-// go-luks2 does not hold it yet. They go green when the upstream defects they
-// name are fixed, and that is the signal this repo needs.
-//
-// None of them can be caught by round-tripping through go-luks2. Its Format and
-// its Unlock make the SAME wrong assumption, so they agree with each other
-// perfectly: format-then-unlock passes while a container written by anything
-// else — including every volume this package provisioned before 2026-08-29 —
-// does not open, and a container written here cannot be read by the tools an
-// operator recovers with. Self-consistency is exactly what these tests refuse
-// to accept as evidence. See TestNativeRoundTripIsNotEvidenceOfConformance.
+// Upstream conformance: these tests pin on-disk properties go-luks2 must hold; do not change their assertions to make them pass.
 
 // hashOutputBytes is the digest size of each hash a LUKS2 header may declare.
 var hashOutputBytes = map[string]int{
@@ -628,34 +534,7 @@ var hashOutputBytes = map[string]int{
 	"sha512": 64,
 }
 
-// TestNativeFormatWritesASpecLengthDigest is the migration gate, expressed as
-// the invariant that makes migration possible.
-//
-// A LUKS2 pbkdf2 digest is the master key run through PBKDF2 to the output
-// length of the hash the digest DECLARES. Declare sha512 and the stored digest
-// is 64 bytes. go-luks2 hardcodes 32 (format.go:243 and unlock.go:485, both
-// `DeriveKey(..., 32)`), so it writes a 32-byte digest under a sha512 label and
-// verifies by deriving 32 bytes and comparing.
-//
-// This package pins hashAlgo = "sha512". The consequence, measured 2026-08-29
-// on this host against cryptsetup 2.7.0 rather than reasoned about:
-//
-//   - A container formatted by cryptsetup with this package's exact parameters
-//     stores a 64-byte digest. `luks2.TestKey` on it, WITH THE CORRECT
-//     PASSPHRASE, returns "incorrect passphrase" — subtle.ConstantTimeCompare
-//     of a 32-byte derivation against a 64-byte stored value can only be 0.
-//     Every encrypted volume this package provisioned before the go-luks2
-//     migration is therefore unopenable. That is a data-availability incident,
-//     not a test failure.
-//   - The reverse direction is NOT broken: cryptsetup derives its comparison to
-//     the length actually stored, so it accepts a 32-byte digest. That is worth
-//     knowing because it means fixing this defect alone does not restore
-//     cryptsetup interop — see TestNativeFormatWritesACryptsetupReadableHeader,
-//     which covers the separate defects that do.
-//
-// Upstream: go-luks2 #73. Do not work around it here by moving hashAlgo to
-// sha256: that would silently downgrade a deliberate FIPS 180-4 choice and
-// still would not open a single existing sha512 volume.
+// TestNativeFormatWritesASpecLengthDigest requires a pbkdf2 digest of the declared hash's length (64 bytes for sha512); keep hashAlgo sha512.
 func TestNativeFormatWritesASpecLengthDigest(t *testing.T) {
 	device := newContainerFile(t, 32<<20)
 
@@ -687,24 +566,7 @@ func TestNativeFormatWritesASpecLengthDigest(t *testing.T) {
 	}
 }
 
-// TestNativeFormatWritesACryptsetupReadableHeader is the disaster-recovery gate.
-//
-// An encrypted volume outlives the program that made it. When a host will not
-// boot, or this library has a bug, or a volume has to be opened from a rescue
-// image, the operator reaches for cryptsetup — luksDump, luksHeaderBackup,
-// luksChangeKey, luksOpen. A container only this library can read has no
-// recovery path at all, which is not a property a storage product may ship.
-//
-// Measured 2026-08-29 against cryptsetup 2.7.0: it rejects a go-luks2 container
-// outright — `cryptsetup isLuks` exits 1 and luksDump answers "is not a valid
-// LUKS device", so not one of those commands is available. This is NOT the
-// digest defect above; the digest length is something cryptsetup tolerates.
-// Three separate header-conformance defects cause it, and each subtest below
-// pins one. Patching all three into a go-luks2 container by hand and re-asking
-// cryptsetup: isLuks exits 0, luksDump renders it, and `luksOpen
-// --test-passphrase` accepts the passphrase. So these three are the whole gap.
-//
-// Upstream: not yet filed as of 2026-08-29; report them alongside #73.
+// TestNativeFormatWritesACryptsetupReadableHeader requires a header cryptsetup accepts, so volumes stay recoverable.
 func TestNativeFormatWritesACryptsetupReadableHeader(t *testing.T) {
 	device := newContainerFile(t, 32<<20)
 
@@ -713,11 +575,7 @@ func TestNativeFormatWritesACryptsetupReadableHeader(t *testing.T) {
 		t.Fatalf("reading the container back: %v", err)
 	}
 
-	// "tokens" must be PRESENT, as an empty object, not omitted. go-luks2 tags
-	// it `json:"tokens,omitempty"` (types.go:67), so a container with no tokens
-	// — which is every container this package formats — omits the key. Measured:
-	// cryptsetup answers `JSON area "" is missing "tokens" (object)
-	// specification` and fails validation before it looks at anything else.
+	// "tokens" must be present as an empty object; cryptsetup rejects a header without it.
 	t.Run("json area declares tokens", func(t *testing.T) {
 		jsonArea, jsonErr := luktest.JSONArea(raw, 0)
 		if jsonErr != nil {
@@ -734,11 +592,7 @@ func TestNativeFormatWritesACryptsetupReadableHeader(t *testing.T) {
 		}
 	})
 
-	// keyslots_size is the size of the keyslots AREA, and cryptsetup requires
-	// keyslots_offset + keyslots_size <= data_offset. go-luks2 stores the offset
-	// PLUS the area (format.go:207), which overshoots by the 32768 the two
-	// metadata copies occupy. Measured: `keyslots_size is too large 16777216
-	// (bytes). Data offset: 16777216, keyslots offset: 32768`.
+	// keyslots_size is the keyslots area size; cryptsetup requires keyslots_offset + keyslots_size <= data_offset.
 	t.Run("keyslots area fits in front of the data", func(t *testing.T) {
 		metadata := luktest.Read(t, device)
 		keyslotsSize, err := strconv.ParseInt(metadata.Config.KeyslotsSize, 10, 64)
@@ -761,13 +615,7 @@ func TestNativeFormatWritesACryptsetupReadableHeader(t *testing.T) {
 		}
 	})
 
-	// The secondary header at 0x4000 carries its own magic, "SKUL\xba\xbe" —
-	// LUKS2_MAGIC_2ND. go-luks2 writes the PRIMARY magic there
-	// (header.go:writeHeaderInternal copies the header and changes only
-	// HeaderOffset). Measured: cryptsetup reports `LUKS2 header read failed
-	// (-22)` for the backup copy, so a container whose primary header is damaged
-	// cannot be repaired from its own backup — which is the entire reason LUKS2
-	// writes two.
+	// The secondary header at 0x4000 carries LUKS2_MAGIC_2ND, "SKUL\xba\xbe".
 	t.Run("secondary header carries the secondary magic", func(t *testing.T) {
 		const secondaryOffset = 0x4000
 		if len(raw) < secondaryOffset+6 {
@@ -781,15 +629,7 @@ func TestNativeFormatWritesACryptsetupReadableHeader(t *testing.T) {
 	})
 }
 
-// TestNativeRoundTripIsNotEvidenceOfConformance is here to stop the wrong
-// conclusion being drawn from a green suite.
-//
-// go-luks2's Format and its Unlock share the digest-length assumption, so they
-// agree with each other exactly. This test PASSES, and it passes for a reason
-// that says nothing about whether a volume written elsewhere can be opened or a
-// volume written here can be recovered. It exists so that the next person to
-// see a passing round-trip reads this instead of concluding the container is
-// interoperable.
+// TestNativeRoundTripIsNotEvidenceOfConformance passes because Format and Unlock share one assumption; it proves no interoperability.
 func TestNativeRoundTripIsNotEvidenceOfConformance(t *testing.T) {
 	device := newContainerFile(t, 32<<20)
 

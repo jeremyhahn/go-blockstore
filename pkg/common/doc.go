@@ -11,16 +11,5 @@
 // 2. Commercial License
 //    Contact licensing@automatethethings.com for commercial licensing options.
 
-// Package common defines the core types, interfaces, and errors shared across
-// go-blockstore.
-//
-// It declares the VolumeProvider and ReplicatedProvider interfaces that
-// block-storage backends implement, the Coordinator and Lease interfaces the
-// library depends on for distributed coordination (defined here so the library
-// never imports a concrete consensus store — callers inject an implementation),
-// the LivenessOracle a deployment supplies to say whether an attachment still
-// has a live owner (declared here for the same reason: whether an attachment
-// has an owner at all is a property of the DEPLOYMENT, not of a block
-// provider), the value types describing volumes, snapshots, replication and
-// mount options, and the canonical error sentinels.
+// Package common defines the provider interfaces, the injected Coordinator, Lease and LivenessOracle seams, the value types and the error sentinels shared across go-blockstore.
 package common

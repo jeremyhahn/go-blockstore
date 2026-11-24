@@ -50,10 +50,7 @@ func TestTranslateIoctlError(t *testing.T) {
 	}
 }
 
-// TestCopyReportsAFailedFlush covers conv=fsync's failure, which is the branch
-// that decides whether a copy that reached the page cache and no further is
-// reported as done. A FIFO accepts the write and refuses the fsync, so the
-// branch is reachable without a block device.
+// TestCopyReportsAFailedFlush: a FIFO accepts the write and refuses the fsync.
 func TestCopyReportsAFailedFlush(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")
@@ -64,11 +61,7 @@ func TestCopyReportsAFailedFlush(t *testing.T) {
 		t.Fatalf("Mkfifo: %v", err)
 	}
 
-	// Both ends of a FIFO block until the other arrives, so the reader is
-	// started and then joined rather than waited for first — waiting would
-	// deadlock, since the open for reading does not return until Copy opens the
-	// write end. The reader drains what is written, so the copy itself cannot
-	// be what fails.
+	// Both FIFO ends block until the other opens, so the reader is started first and joined after.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -95,18 +88,7 @@ func TestCopyReportsAFailedFlush(t *testing.T) {
 	}
 }
 
-// TestCopyReportsACancellationOnceTheTransferIsUnderWay covers giving up on a
-// copy that has already moved bytes, which is the case the callers actually
-// meet: a restore of a large volume runs for minutes.
-//
-// The copy stops and reports it. What it must NOT do is finish quietly and let
-// a restore go on to tag the volume and report it ready under a context whose
-// caller gave up — which is also why the flush and close at the end are
-// followed by a second check of the context, since on a block device those are
-// the writeback and can block for a long time with no way to interrupt them.
-// Which of the two checks catches a cancellation depends on where the copy had
-// got to; both return the same thing to the caller, and only a device slow
-// enough to block in the writeback can be made to take the second one.
+// TestCopyReportsACancellationOnceTheTransferIsUnderWay: a copy canceled mid-transfer stops and reports it.
 func TestCopyReportsACancellationOnceTheTransferIsUnderWay(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "fifo")

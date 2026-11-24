@@ -45,23 +45,7 @@ const (
 // operates on the descriptor.
 type systemMounter struct{}
 
-// pinDirectory resolves an absolute path to a descriptor, refusing to traverse a
-// symlink anywhere along the way.
-//
-// RESOLVE_NO_SYMLINKS is the whole point: it makes the kernel fail rather than
-// follow, so a symlink planted at the final component OR at any parent is an
-// error instead of a redirection. RESOLVE_NO_MAGICLINKS is belt to that brace,
-// refusing the /proc entries that resolve to arbitrary files — a target under
-// /proc/self/fd would otherwise reach anything the process has open.
-// RESOLVE_BENEATH is deliberately NOT set: it constrains resolution to a subtree
-// below a starting descriptor, and these targets are absolute paths that a
-// caller is entitled to place anywhere, so there is no subtree to confine them
-// to. O_PATH because the descriptor is a handle rather than something to read,
-// and O_DIRECTORY because a mount target must be one.
-//
-// The descriptor is what makes this safe rather than merely careful: everything
-// afterwards addresses the directory itself, so a path swapped after resolution
-// changes nothing about where the mount lands.
+// pinDirectory resolves an absolute directory path to an O_PATH descriptor with openat2, refusing symlinks and magic links.
 func pinDirectory(path string) (int, error) {
 	how := &unix.OpenHow{
 		Flags:   uint64(unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC),
@@ -86,20 +70,7 @@ func pinDirectory(path string) (int, error) {
 	}
 }
 
-// Check reports whether a target can be pinned, using exactly the resolution a
-// Mount would — the same openat2 call, the same refusals — and then lets it go.
-//
-// It exists so a caller can find out that a target is unusable BEFORE doing
-// something it cannot take back. A provider that formats a raw volume on its
-// first mount needs to fail a doomed request before the mkfs, and a check that
-// merely resembled the real one would pass for a path the mount then refuses:
-// an Lstat, for instance, says nothing about a symlink at a PARENT, which the
-// pin rejects. Sharing the call is what keeps the two from ever disagreeing.
-//
-// A target that passes here can still fail at Mount — the path may be swapped
-// in between, which is the race the pin exists to survive. That is not a
-// weakness of this function: Mount resolves again, from scratch, and mounts
-// against what IT pinned.
+// Check reports whether a target can be pinned using the same resolution as Mount, then releases it.
 func Check(target string) error {
 	fd, err := pinDirectory(target)
 	if err != nil {
@@ -116,25 +87,14 @@ func (systemMounter) Mount(_ context.Context, source, target, fsType string, fla
 	}
 	defer func() { _ = unix.Close(fd) }()
 
-	// Addressing the descriptor rather than the path. RESOLVE_NO_MAGICLINKS
-	// refused magic links while RESOLVING the caller's path; using one here is
-	// the opposite operation — this one names a directory already pinned, and
-	// is how a descriptor is handed to a syscall that takes a path.
+	// Address the pinned descriptor through its /proc/self/fd path.
 	if err := unix.Mount(source, fdPath(fd), fsType, flags, data); err != nil {
 		return fmt.Errorf("go-blockstore/mount: mounting %s at %s: %w", source, target, err)
 	}
 	return nil
 }
 
-// Unmount detaches whatever is mounted at target.
-//
-// The PARENT is pinned here, not the target. A descriptor on the target resolves
-// to the root of the mounted filesystem and holds it open, so the unmount that
-// follows fails with EBUSY — measured. Pinning the parent fixes every directory
-// above the mount point, and UMOUNT_NOFOLLOW covers the one component left:
-// the kernel refuses rather than following a symlink in the final position, so
-// a swapped final component cannot redirect the unmount onto somebody else's
-// mount.
+// Unmount detaches what is mounted at target, pinning the parent and using UMOUNT_NOFOLLOW for the final component.
 func (systemMounter) Unmount(_ context.Context, target string) error {
 	parent, name := filepath.Dir(target), filepath.Base(target)
 

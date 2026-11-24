@@ -186,7 +186,7 @@ this library reports.
 
 Capabilities, seccomp and LSM confinement are enforced by different subsystems,
 granting one does not lift another, and all three surface as a bare "operation
-not permitted". Measured 2026-09-01 in a container with `--cap-add SYS_ADMIN` and
+not permitted". In a container with `--cap-add SYS_ADMIN` and
 `--device /dev/mapper/control` under Docker's **default** profiles:
 
 | | verdict |
@@ -508,11 +508,8 @@ its own tag, because the suite above advertises that it needs no such binary:
 sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 make integration-test-cryptsetup
 ```
 
-It previously sat in the local suite behind a **runtime skip**, so on any host
-without `cryptsetup` — CI included — the migration gate for every encrypted
-volume in the fleet reported success without running. Selecting the tag is an
-operator declaring the binary is present, so its absence is now a hard failure
-rather than a quiet pass. `make guards` is what found it.
+Selecting the tag declares that `cryptsetup` is present, so its absence is a
+hard failure rather than a skip.
 
 ### Whole-tree guards
 
@@ -575,8 +572,6 @@ make test-kernel-mountinfo
 Three tests re-execute themselves inside an unprivileged user + mount namespace
 and check this package's answers against the kernel running now, rather than
 against tables frozen from an older one. They are behind the `kernel_mountinfo`
-tag because a host that will not create such a namespace cannot run them —
-including the container CI runs in, where all three previously **skipped** and
-the package printed `ok` in 0.002s. Selecting the tag states that the host
-provides the capability, so a refusal is now a hard failure. `make guards` is
-what found it.
+tag because a host that will not create such a namespace cannot run them.
+Selecting the tag states that the host provides the capability, so a refusal
+is a hard failure.

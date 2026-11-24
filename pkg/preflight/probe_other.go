@@ -22,15 +22,7 @@ import "context"
 // everywhere, not because anything on this platform can open it.
 const DeviceMapperControl = "/dev/mapper/control"
 
-// platformProbes returns probes that REFUSE on every platform without
-// device-mapper and kernel keyrings.
-//
-// The package compiles everywhere so that the tree can be built and vetted on a
-// developer's machine, matching pkg/local. What it must not do is answer "the
-// capability is available" where it plainly is not: every capability here is a
-// Linux kernel facility, so the honest answer is a typed refusal naming the
-// platform, and a preflight that passed on darwin would be a preflight that
-// lies in the one direction that costs something.
+// platformProbes returns probes that refuse on platforms without device-mapper and kernel keyrings.
 func platformProbes() map[Capability]Probe {
 	probes := map[Capability]Probe{
 		CapabilityDeviceMapper:  unsupportedProbe(CapabilityDeviceMapper, "device-mapper exists only in the Linux kernel"),
@@ -54,10 +46,7 @@ func unsupportedProbe(capability Capability, why string) Probe {
 	}
 }
 
-// The replicated backend's capabilities refuse here for the same reason the
-// rest do: DRBD is a Linux kernel module reached over generic netlink, and
-// CAP_NET_ADMIN is a Linux capability. Neither exists on this platform, so the
-// honest answer is a typed refusal naming it.
+// The replicated backend's capabilities are Linux-only and refuse here too.
 func init() {
 	platformExtras = map[Capability]string{
 		CapabilityNetAdmin:    "CAP_NET_ADMIN is a Linux capability",

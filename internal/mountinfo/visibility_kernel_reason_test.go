@@ -18,13 +18,7 @@ import (
 	"testing"
 )
 
-// unsupportedReason picks out the child failures that mean "this host does not
-// allow it" from the ones that mean "the code is wrong", and returns the
-// child's own message so the skip names the step that was refused.
-//
-// The child marks the first kind itself with an UNSUPPORTED prefix. A child
-// that could not start at all produces no output to mark, and clone(2) refusing
-// CLONE_NEWUSER is reported by the runtime rather than by the test.
+// unsupportedReason separates UNSUPPORTED child failures from wrong answers and returns the child's message.
 func unsupportedReason(output string) string {
 	for _, line := range strings.Split(output, "\n") {
 		if i := strings.Index(line, "UNSUPPORTED: "); i >= 0 {
@@ -41,16 +35,7 @@ func unsupportedReason(output string) string {
 	return ""
 }
 
-// TestUnsupportedReasonNamesTheRefusedStep checks the classification path,
-// because that path never runs on a host where the kernel check works — and a
-// refused namespace misread as a wrong answer, or a wrong answer misread as a
-// refusal, would each blame the wrong thing. The inputs are the child's actual
-// output shapes.
-//
-// It lives here, untagged, ON PURPOSE: the kernel tests it serves are behind
-// kernel_mountinfo and do not compile without it, but this is pure string
-// classification with no kernel requirement at all. Tagging it too would have
-// removed the one part of that file every host can check.
+// TestUnsupportedReasonNamesTheRefusedStep checks the classification on the child's real output shapes; untagged because it needs no kernel.
 func TestUnsupportedReasonNamesTheRefusedStep(t *testing.T) {
 	cases := map[string]struct {
 		output string

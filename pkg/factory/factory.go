@@ -27,17 +27,7 @@ var (
 	providerRegistry = make(map[string]ProviderCreator)
 )
 
-// RegisterProvider registers a volume provider creator under the given name.
-// It is typically called from a provider's init function.
-//
-// It panics if creator is nil, or if name is already registered, following the
-// convention of database/sql.Register. Registration happens at init time from
-// build-tag-gated files, so either is a build-configuration mistake — two files
-// claiming one name, or a provider wired up without a constructor — and it is
-// discovered on the first line of main rather than as a nil-call panic inside
-// NewProvider, or a silently mis-wired backend, much later. Overwriting a
-// duplicate instead would make which provider wins depend on package
-// initialization order.
+// RegisterProvider registers a provider creator under name, usually from init; it panics on a nil creator or a duplicate name, like database/sql.Register.
 func RegisterProvider(name string, creator ProviderCreator) {
 	if creator == nil {
 		panic("go-blockstore/factory: provider creator is nil: " + name)

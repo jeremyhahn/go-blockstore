@@ -24,16 +24,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// deviceSize reads a block device's size with BLKGETSIZE64.
-//
-// Seeking to the end would appear to do the same thing and does not: on a block
-// device the seek reports the size the kernel has cached for the partition,
-// which is stale after an LVM resize until the device is reopened. The ioctl
-// asks the driver.
-// The buffer is a uint64 and the call is the raw ioctl, which matters on 32-bit
-// Linux: BLKGETSIZE64 writes eight bytes whatever the architecture, while a Go
-// int is four bytes there — so the obvious unix.IoctlGetInt hands the kernel a
-// pointer to a buffer half the size of what it is about to write.
+// deviceSize reads a block device's size with BLKGETSIZE64 into a uint64, which the kernel writes on every architecture.
 func deviceSize(f *os.File) (int64, error) {
 	var size uint64
 
@@ -56,11 +47,7 @@ func deviceSize(f *os.File) (int64, error) {
 	return int64(size), nil
 }
 
-// zeroRange runs BLKZEROOUT over [start, start+length).
-//
-// The argument is a two-element array of unsigned 64-bit values, which is why
-// this goes through the raw ioctl rather than one of the typed helpers: there is
-// no helper for a struct-shaped argument.
+// zeroRange runs BLKZEROOUT over [start, start+length) through the raw ioctl.
 func zeroRange(f *os.File, start, length uint64) error {
 	rng := [2]uint64{start, length}
 
@@ -78,13 +65,7 @@ func zeroRange(f *os.File, start, length uint64) error {
 	return nil
 }
 
-// translateIoctlError turns a bare errno into something that says what it means
-// here.
-//
-// This is the whole reason the conversion needs care. A binary printed a
-// diagnosed message and exited; a syscall returns ENOTTY or EOPNOTSUPP, which on
-// their own send a reader looking for a terminal or a filesystem. The mapping is
-// a table rather than a chain of ifs so that adding a case is adding a row.
+// translateIoctlError maps a bare errno to a message that says what it means for a block device.
 func translateIoctlError(err error) error {
 	for errno, mapped := range ioctlErrors {
 		if errors.Is(err, errno) {

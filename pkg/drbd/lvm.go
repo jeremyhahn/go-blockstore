@@ -38,11 +38,7 @@ const (
 	binLVChange = "lvchange"
 )
 
-// snapSeparator joins a volume name and a snapshot name into one LV name.
-//
-// The dot is excluded from the name allowlist precisely so that this
-// decomposition is unambiguous: neither half can contain the separator, so
-// splitting on it recovers exactly the two names that went in.
+// snapSeparator joins a volume and snapshot name into one LV name; names cannot contain it.
 const snapSeparator = ".snap."
 
 // snapshotLV builds the backing LV name for a snapshot.
@@ -66,10 +62,7 @@ func splitSnapshotLV(lv string) (volLV, snapName string, ok bool) {
 	return volLV, snapName, true
 }
 
-// snapshotID renders the caller-facing snapshot identifier. It carries the
-// volume group so the identifier says which pool it belongs to and a provider
-// pointed at a different group can reject it instead of acting on a name that
-// happens to exist locally.
+// snapshotID renders the caller-facing snapshot ID, including the volume group.
 func (p *Provider) snapshotID(volLV, snapName string) string {
 	return p.cfg.VG + "/" + snapshotLV(volLV, snapName)
 }
@@ -121,41 +114,10 @@ type lvEntry struct {
 // byte count.
 func (e *lvEntry) sizeBytes() int64 { return parseLVMInt(e.Size) }
 
-// originSizeBytes parses origin_size: for a snapshot, the size of the volume it
-// was taken from, which is the size a restore has to accommodate. It is empty
-// for a non-snapshot LV.
-//
-// It is a BACKING size, DRBD's internal metadata included, because the volume
-// it measures is one this provider created at backingBytes(...) and LVM then
-// rounded up. That is what makes it comparable against a restore's own
-// backingBytes figure and NOT against a caller's common.VolumeSpec.SizeBytes,
-// which is usable capacity.
+// originSizeBytes parses origin_size, a backing size (DRBD metadata included); empty for a non-snapshot LV.
 func (e *lvEntry) originSizeBytes() int64 { return parseLVMInt(e.OriginSize) }
 
-// usedBytes is the space a copy-on-write snapshot currently OCCUPIES: its CoW
-// area scaled by how much of that area has been written.
-//
-// That is what SnapshotInfo.SizeBytes is defined as, and it is not lv_size.
-// lv_size is the CoW area this provider allocated — a fixed share of the origin
-// — and reporting it would tell a caller that a snapshot taken a second ago
-// already occupies twenty percent of its origin.
-//
-// It is 0 for an INACTIVE snapshot, which is what this provider leaves them as.
-// LVM reports occupancy only while the kernel has the device mapped, and the
-// figure is not worth activating a snapshot to obtain — activating one activates
-// its origin too, which would move a volume the caller is using. Measured on
-// LVM 2.03.16 by the local lane: an inactive snapshot reports data_percent
-// empty as its ordinary state, so an empty field there is a real answer and not
-// a missing one. pkg/local reports the same 0 for the same reason, and the two
-// providers implement one contract; a snapshot listing that failed here and
-// succeeded there for identical volumes would make SnapshotInfo.SizeBytes mean
-// something different depending on which provider produced it.
-//
-// Empty on an ACTIVE snapshot is a different matter and is an error: the kernel
-// has a figure and lvs failed to render it. So is a value that is malformed,
-// negative, or above 100 — those are not measurements this provider can pass
-// off as one. Returning 0 for them would put a plausible-looking number where an
-// unreadable one was, and callers size restores and report occupancy from it.
+// usedBytes is the space a CoW snapshot occupies: its CoW area times data_percent; 0 for an inactive snapshot, an error for an unreadable active one.
 func (e *lvEntry) usedBytes() (int64, error) {
 	raw := strings.TrimSpace(e.DataPercent)
 	if raw == "" {
@@ -178,14 +140,7 @@ func (e *lvEntry) active() bool { return len(e.Attr) >= 5 && e.Attr[4] == 'a' }
 // isSnapshot reports whether the logical volume is a snapshot of another.
 func (e *lvEntry) isSnapshot() bool { return e.Origin != "" }
 
-// parseLVMPercent reads the data_percent column, refusing anything that is not
-// a finite percentage between 0 and 100.
-//
-// Unlike the byte counts the fraction here is the point, so this cannot reuse
-// parseLVMInt's tolerance for trailing formatting. It refuses rather than
-// coercing, for the reason pkg/local's parseLVNumber gives: the zero value on a
-// parse failure puts a plausible-looking number where an unreadable one was, and
-// occupancy is reported to callers as a measurement rather than a hint.
+// parseLVMPercent reads data_percent, refusing anything but a finite percentage from 0 to 100.
 func parseLVMPercent(s string) (float64, error) {
 	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
 	if err != nil {
@@ -203,10 +158,7 @@ func parseLVMPercent(s string) (float64, error) {
 	return v, nil
 }
 
-// extentSizeBytes parses vg_extent_size: the allocation unit of the volume
-// group, which every logical volume's size is a whole multiple of. It is
-// reported alongside each LV rather than fetched separately, so no extra
-// command is needed to know what a size will be rounded to.
+// extentSizeBytes parses vg_extent_size, the volume group's allocation unit.
 func (e *lvEntry) extentSizeBytes() int64 { return parseLVMInt(e.ExtentSize) }
 
 // roundUpTo rounds n up to the next multiple of unit. A unit of zero or less
@@ -218,18 +170,7 @@ func roundUpTo(n, unit int64) int64 {
 	return (n + unit - 1) / unit * unit
 }
 
-// parseLVMInt reads a byte count out of an lvs report field.
-//
-// "--units b --nosuffix" is asked for, but what comes back is not reliably a
-// bare integer: LVM formats report sizes to two decimal places by default, so
-// the same column reads "1073741824" on one build and "1073741824.00" on
-// another, and some configurations still pad the field with spaces. A byte
-// count has no meaningful fraction, so the part before the decimal point is the
-// answer and the rest is formatting.
-//
-// The fraction is dropped rather than rounded, and the integer part is parsed
-// exactly rather than through a float, which would start losing byte precision
-// at 8 PiB.
+// parseLVMInt reads a byte count from an lvs field, dropping any decimal fraction and parsing the integer exactly.
 func parseLVMInt(s string) int64 {
 	s = strings.TrimSpace(s)
 	// A stray unit suffix, if --nosuffix was not honored.
@@ -245,10 +186,7 @@ func parseLVMInt(s string) int64 {
 	return n
 }
 
-// lvmTimeLayouts are the shapes lv_time takes. LVM formats it with the local
-// zone offset by default and with a named zone under some locales; a value that
-// matches neither yields the zero time rather than an error, because a
-// snapshot's timestamp is reporting detail and not worth failing a list over.
+// lvmTimeLayouts are the shapes lv_time takes; an unmatched value yields the zero time.
 var lvmTimeLayouts = []string{
 	"2006-01-02 15:04:05 -0700",
 	"2006-01-02 15:04:05 MST",
@@ -301,11 +239,7 @@ func findLV(lvs []lvEntry, name string) (lvEntry, bool) {
 	return lvEntry{}, false
 }
 
-// lvActivate gives a logical volume a device node.
-//
-// --yes answers the confirmation lvchange raises in the cases that prompt; it
-// matches pkg/local's invocation, since both providers are activating the same
-// kind of volume for the same reason.
+// lvActivate gives a logical volume a device node; --yes answers lvchange's prompt.
 func (p *Provider) lvActivate(ctx context.Context, lv string) error {
 	if _, err := p.runner.Run(ctx, binLVChange, "--activate", "y", "--yes", p.lvRef(lv)); err != nil {
 		return fmt.Errorf("activating %s: %w", p.lvRef(lv), err)

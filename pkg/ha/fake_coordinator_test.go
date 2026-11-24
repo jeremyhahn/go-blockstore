@@ -25,38 +25,8 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// fakeCoordinator is an in-memory common.Coordinator written to the contract in
-// pkg/common/coordinator.go, not to what these tests happen to need.
-//
-// A fixture that can emit an outcome the real contract cannot produce is a
-// defect in the fixture, so every rule the contract states is implemented here
-// rather than approximated:
-//
-//   - AcquireLease is exclusive and FAIL-FAST. A contended key is refused with
-//     common.ErrLeaseHeld wrapped around a typed error carrying the key, so
-//     errors.Is and errors.As both work — the shape both real implementations
-//     produce (*sdk.LeaseHeldError clustered, coordination.LeaseHeldError
-//     standalone).
-//   - ttl is rounded UP to whole seconds with a one-second floor.
-//   - The acknowledged deadline is HARD: expiry closes Done and deletes the
-//     bound key.
-//   - Renew after the lease is over returns a lease-lost error and NEVER nil,
-//     and does not resurrect the lease.
-//   - Release is idempotent only once it has SUCCEEDED. A release the backend
-//     refuses leaves Done open and the key bound.
-//   - CompareAndSwap's nil expect is create-only; a non-nil expect — an empty
-//     slice included — requires the key to EXIST.
-//   - Get returns (nil, nil) for an absent key and a non-nil zero-length slice
-//     for a present empty value.
-//   - Delete of an absent key is nil, and deleting a leased key removes the
-//     ownership signal without ending the lease.
-//   - A Watch channel's close is the only end-of-watch signal.
-//
-// Expiry has two entry points and ONE implementation. A real TTL elapse fires
-// expireLocked through a timer; expireNow fires the same function directly, so
-// a test can put a lease past its deadline without waiting out a second. The
-// deterministic hook cannot therefore produce a state the timer path could not:
-// there is only one path.
+// fakeCoordinator is an in-memory common.Coordinator implementing every rule of the contract in pkg/common/coordinator.go.
+// Expiry has one implementation, fired by a timer or by expireNow.
 type fakeCoordinator struct {
 	mu       sync.Mutex
 	store    map[string][]byte
@@ -77,10 +47,7 @@ type fakeCoordinator struct {
 	// error would only ever exercise the give-up branch.
 	releaseErrRemaining int
 
-	// acquireHook and renewHook run inside their calls, with the coordinator
-	// lock NOT held. They are the barriers tests use to interleave an
-	// acquisition or a renewal with something else — advancing the clock to
-	// model a slow round trip, or holding the call open across a fence.
+	// acquireHook and renewHook run inside their calls without the coordinator lock, to interleave work.
 	acquireHook func(key string)
 	renewHook   func(key string)
 }
@@ -365,9 +332,7 @@ func cloneValue(val []byte) []byte {
 	return out
 }
 
-// fakeLease is a held lease. Its state is guarded by the coordinator's lock, so
-// a renewal and an expiry racing each other resolve in the same single order
-// that decides whether a contender may acquire the key.
+// fakeLease is a held lease, guarded by the coordinator's lock.
 type fakeLease struct {
 	coord *fakeCoordinator
 	key   string
@@ -399,8 +364,7 @@ func (l *fakeLease) Renew(ctx context.Context) error {
 		hook(l.key)
 	}
 
-	// The state is read AFTER the hook, not before: the hook may be what ends
-	// the lease, and a renewal must answer for the world it returns into.
+	// Read the state after the hook, which may have ended the lease.
 	l.coord.mu.Lock()
 	defer l.coord.mu.Unlock()
 	if l.over {
@@ -478,8 +442,7 @@ func (l *fakeLease) releaseKeyLocked() {
 	l.coord.deleteLocked(l.key)
 }
 
-// fakeWatcher is one registered Watch. Events are queued under its own lock and
-// delivered by pump, so the coordinator's lock is never held across a send.
+// fakeWatcher is one registered Watch, delivered by pump without the coordinator lock.
 type fakeWatcher struct {
 	prefix string
 	out    chan common.Event

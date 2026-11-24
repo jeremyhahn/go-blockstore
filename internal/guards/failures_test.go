@@ -20,25 +20,9 @@ import (
 	"testing"
 )
 
-// The paths in this file are the ones that decide whether a BROKEN scan reports
-// as a clean one. They are the point of the package, and they are also the
-// paths no ordinary run exercises, so they are driven here against trees this
-// test builds and owns.
+// Paths that decide whether a broken scan reports as clean, driven against trees the test builds.
 
-// TestAScanThatCannotReadIsNotAScanThatPassed covers every scanner against a
-// file it cannot read.
-//
-// A scanner that swallowed the error would report zero findings for that file
-// and the sweep would go green over material nobody looked at — the exact shape
-// of the `|| true` bug one of these scanners exists to find.
-//
-// The unreadable file is a DANGLING SYMLINK rather than a mode-0000 file, and
-// that is the whole reason this test is worth anything. Mode 0000 does not stop
-// uid 0, so the first version returned early under root and asserted nothing —
-// and `make test-container`, where this suite runs in CI, runs as root. It
-// would have been a skip wearing a uid check, in the package whose subject is
-// tests that report success without running. A dangling link fails the read for
-// every uid.
+// TestAScanThatCannotReadIsNotAScanThatPassed uses a dangling symlink, which fails the read even for root.
 func TestAScanThatCannotReadIsNotAScanThatPassed(t *testing.T) {
 	cases := map[string]struct {
 		name    string

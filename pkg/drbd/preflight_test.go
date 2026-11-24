@@ -93,12 +93,7 @@ func TestRequiredCapabilitiesFollowsTheConfiguration(t *testing.T) {
 	}
 }
 
-// TestTheCapabilitySetIsNotTheLocalProvidersIsTheWholePoint pins the two
-// differences that a copied list would have got wrong in both directions.
-//
-// This is the assertion the issue asked for. A guard assembled by copying
-// pkg/local's capability set would pass its own tests and be wrong twice: it
-// would omit the capability DRBD actually needs, and demand one it never uses.
+// TestTheCapabilitySetIsNotTheLocalProvidersIsTheWholePoint pins NetAdmin required and KernelKeyring not required unencrypted.
 func TestTheCapabilitySetIsNotTheLocalProvidersIsTheWholePoint(t *testing.T) {
 	got := requiredCapabilities(injectedSeams{}, false, PreflightConfigured)
 
@@ -111,9 +106,7 @@ func TestTheCapabilitySetIsNotTheLocalProvidersIsTheWholePoint(t *testing.T) {
 		return false
 	}
 
-	// Required HERE and not by the local provider. DRBD's control path is
-	// generic netlink to the drbd module, gated on CAP_NET_ADMIN — a different
-	// bit from CAP_SYS_ADMIN, conferred by neither.
+	// Required here: DRBD's netlink control path is gated on CAP_NET_ADMIN.
 	if !has(preflight.CapabilityNetAdmin) {
 		t.Error("net-admin is absent; a container with only the device-mapper privilege drives LVM and fails at the first resource up")
 	}
@@ -121,15 +114,7 @@ func TestTheCapabilitySetIsNotTheLocalProvidersIsTheWholePoint(t *testing.T) {
 		t.Error("drbd-control is absent; a node without the module loaded would get no refusal until the first Provision")
 	}
 
-	// NOT required by an UNENCRYPTED deployment, which is what this case is,
-	// though pkg/local needs it whenever it handles encrypted volumes. The DRBD
-	// peer-authentication secret never enters the kernel keyring, so demanding
-	// it here would make a correctly configured node refuse to start.
-	//
-	// The condition is the whole of the difference now: LUKS-above-DRBD does
-	// derive keys and does create dm-crypt mappings, and the encrypted case
-	// above asserts the capability appears there. What must not come back is
-	// the unconditional demand.
+	// Not required without encryption; the encrypted case above requires it.
 	if has(preflight.CapabilityKernelKeyring) {
 		t.Error("kernel-keyring is required of an unencrypted provider, which performs no LUKS operation, so a correct node would be refused")
 	}
@@ -149,13 +134,7 @@ func TestRunPreflightChecksNothingWhenThereIsNothingToCheck(t *testing.T) {
 	}
 }
 
-// TestRunPreflightAgreesWithTheChecker ties the wiring to the package that owns
-// the probes: for the derived capabilities, this must reach the checker's own
-// verdict on whatever machine the test runs.
-//
-// Two-sided by construction. On a node with DRBD and the capabilities it
-// requires a PASS, so a guard that refused everything would fail it; on a node
-// without, the refusal.
+// TestRunPreflightAgreesWithTheChecker requires runPreflight to reach the checker's verdict on this machine.
 func TestRunPreflightAgreesWithTheChecker(t *testing.T) {
 	capabilities := requiredCapabilities(injectedSeams{}, false, PreflightConfigured)
 	if len(capabilities) == 0 {

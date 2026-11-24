@@ -96,15 +96,7 @@ func TestReaperLeavesThisBootsMappingAlone(t *testing.T) {
 	assertNothingClosed(t, runner)
 }
 
-// TestReaperLeavesAnotherNodesMappingAlone is the conjunct that turns a
-// catastrophe into a no-op, and it is the reason the record carries a node at
-// all.
-//
-// On shared storage the volume group is visible to every node. Another node's
-// LIVE mapping was made on that node's boot, which never matches this node's —
-// so a criterion resting on the boot alone would call it orphaned and tear down
-// a volume somebody else's workload is using. Requiring the record to name THIS
-// node first makes that unreachable.
+// TestReaperLeavesAnotherNodesMappingAlone: the record must name this node.
 func TestReaperLeavesAnotherNodesMappingAlone(t *testing.T) {
 	p, runner := mappedProvider(t, []string{unlockedBy(otherNode, priorBoot)})
 
@@ -277,9 +269,7 @@ func TestRunReaperStopsWhenTheTickerIsClosed(t *testing.T) {
 	}
 }
 
-// TestAttachRecordsWhoUnlockedIt is the write half of the record, and the
-// ORDER is the property: the record has to exist before the mapping does, or it
-// is missing for exactly the mappings that outlive their owner.
+// TestAttachRecordsWhoUnlockedIt: the record is written before the mapping.
 func TestAttachRecordsWhoUnlockedIt(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
@@ -352,10 +342,7 @@ func TestARecordIsReplacedRatherThanJoined(t *testing.T) {
 		" --addtag "+unlockedBy(thisNode, thisBoot)+" vg0/data")
 }
 
-// TestARecordWithAnExtraSeparatorIsNotARecord is the parse that would make a
-// LIVE mapping look reapable. strings.Cut splits at the first separator, so
-// "node:boot:x" would yield a Boot of "boot:x" — matching no real boot, which
-// reads as a boot that has ended.
+// TestARecordWithAnExtraSeparatorIsNotARecord: "node:boot:x" is rejected.
 func TestARecordWithAnExtraSeparatorIsNotARecord(t *testing.T) {
 	malformed := unlockedByTagPrefix + thisNode + unlockedByTagSeparator +
 		thisBoot + unlockedByTagSeparator + "x"
@@ -368,14 +355,7 @@ func TestARecordWithAnExtraSeparatorIsNotARecord(t *testing.T) {
 	assertNothingClosed(t, runner)
 }
 
-// TestAttachRefreshesTheRecordWhenItAdoptsAnOpenMapping closes the hole the
-// locked recheck alone leaves.
-//
-// The recheck reads the RECORD. An Attach that finds a mapping already open and
-// hands it to a workload without refreshing that record makes the mapping live
-// while the volume still says it was unlocked on a boot that ended — and the
-// reaper, reading the record, closes it. The attach is what makes a mapping
-// live, so the attach is what has to say so.
+// TestAttachRefreshesTheRecordWhenItAdoptsAnOpenMapping: adopting an open mapping refreshes the record.
 func TestAttachRefreshesTheRecordWhenItAdoptsAnOpenMapping(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{
@@ -416,13 +396,7 @@ func TestAttachSurvivesAFailedFirstRecord(t *testing.T) {
 	}
 }
 
-// TestDetachClearsTheOwnershipRecord covers the ORDINARY teardown path, which
-// is where the record is cleared almost every time it is cleared at all.
-//
-// The reaper's own teardown clears it too, and that path had a test while this
-// one did not — so a regression here would have been invisible until it
-// mattered: a clean detach leaving a stale record makes the reaper misclassify
-// that volume's next mapping — reporting a live one as an orphan.
+// TestDetachClearsTheOwnershipRecord: a clean detach clears the record.
 func TestDetachClearsTheOwnershipRecord(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{

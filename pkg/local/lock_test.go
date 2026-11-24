@@ -69,14 +69,7 @@ func blockedOn(done <-chan struct{}) bool {
 	}
 }
 
-// TestResizeAndAttachDoNotInterleave is the reported race, reproduced and then
-// held closed.
-//
-// Resize on a DETACHED volume activates it, grows the filesystem, and
-// deactivates it again on the way out. Without a lock, an Attach that completes
-// inside that window hands its caller a device that Resize's deferred
-// deactivation then pulls out from under them. The test holds Resize open at its
-// filesystem grow, runs Attach, and requires that Attach could not have got in.
+// TestResizeAndAttachDoNotInterleave holds Resize at its filesystem grow and requires Attach to wait.
 func TestResizeAndAttachDoNotInterleave(t *testing.T) {
 	g := newGate()
 	runner := newFakeRunner().
@@ -120,8 +113,7 @@ func TestResizeAndAttachDoNotInterleave(t *testing.T) {
 		t.Fatalf("Attach: %v", attachErr)
 	}
 
-	// The ordering that matters: Attach's activation is the LAST one, so the
-	// device it returned survives rather than being deactivated behind it.
+	// Attach's activation is the last one, so its device survives.
 	lines := runner.lines()
 	lastActivate, lastDeactivate := -1, -1
 	for i, line := range lines {
@@ -151,12 +143,7 @@ func TestOverlappingAttachesDoNotStealEachOthersRollback(t *testing.T) {
 	var opens int
 	var mu sync.Mutex
 	runner.on(luksBinary, func(args []string, stdin []byte) ([]byte, error) {
-		// Everything this test does not specifically stage goes to the fake's
-		// own LUKS backend, so the operations Attach issues around the unlock —
-		// the mapping lookup, and the header read that records the volume's
-		// encryption — behave the way they do everywhere else. Answering them
-		// ad hoc here silently changed what this test exercises the moment
-		// Attach grew another LUKS call.
+		// Unstaged LUKS calls go to the fake's own backend.
 		if len(args) == 0 || args[0] != "open" {
 			return runner.luks(args, stdin)
 		}
@@ -363,7 +350,7 @@ func TestRestoreLocksBothVolumes(t *testing.T) {
 	}()
 	g.awaitReached(t)
 
-	// The ORIGIN is locked too, because reading its snapshot moves it.
+	// The origin is locked too, because reading its snapshot activates it.
 	originDone := make(chan struct{})
 	go func() {
 		defer close(originDone)

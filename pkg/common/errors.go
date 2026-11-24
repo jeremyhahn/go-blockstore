@@ -23,98 +23,32 @@ var (
 	// under a name, that already exists.
 	ErrAlreadyExists = errors.New("already exists")
 
-	// ErrSnapshotNotFound is returned when an operation names a snapshot that
-	// does not exist — deleting one, or provisioning from a VolumeSpec whose
-	// SourceSnapshotID names no snapshot. It is distinct from ErrNotFound so a
-	// caller can tell a missing snapshot from a missing volume.
+	// ErrSnapshotNotFound is returned when an operation names a snapshot that does not exist.
 	ErrSnapshotNotFound = errors.New("snapshot not found")
 
-	// ErrNotAttached is returned when an operation requires the volume to be
-	// attached on the local node and it is not, such as mounting a volume that
-	// was never attached. It marks a sequencing mistake rather than a failure
-	// of the operation itself: the caller attaches first and retries.
+	// ErrNotAttached is returned when an operation needs the volume attached on the local node and it is not.
 	ErrNotAttached = errors.New("not attached")
 
-	// ErrUnsupported is returned when a provider does not implement an
-	// optional operation — shrinking on Resize, or snapshots on a backend that
-	// has none. The request is well-formed; this backend simply cannot serve
-	// it, so retrying or reconfiguring is pointless without choosing another
-	// provider.
+	// ErrUnsupported is returned when a provider does not implement an optional operation.
 	ErrUnsupported = errors.New("operation not supported by provider")
 
-	// ErrInvalidArgument is the portable sentinel for hostile or malformed input
-	// rejected by a provider's own validation — a volume or snapshot name
-	// outside the character set a backend will accept, a filesystem type it will
-	// not create, a mount flag not on its allowlist, a mount target that is not
-	// a clean absolute path, a node that appears nowhere in the backend's
-	// configuration.
-	//
-	// It is the counterpart to ErrUnsupported rather than a variant of it.
-	// ErrUnsupported answers a well-formed request this backend cannot serve;
-	// this one says the request never became well-formed, so no other provider
-	// would take it either and the fix belongs to whoever supplied the value.
-	// The VolumeProvider doc makes validation the provider's job; this is what
-	// providers report it with, so a caller writes one branch instead of one per
-	// backend.
-	//
-	// Providers WRAP it with the detail that identifies the offending value:
-	//
-	//	return fmt.Errorf("%w: volume name %q contains %q", common.ErrInvalidArgument, name, string(c))
-	//
-	// Returning the bare sentinel passes the caller a rejection with nothing to
-	// act on — which value, and why — and validation errors are read by whoever
-	// has to correct the input.
+	// ErrInvalidArgument reports input a provider's validation rejected; providers wrap it with the offending value, e.g. fmt.Errorf("%w: volume name %q", ErrInvalidArgument, name).
 	ErrInvalidArgument = errors.New("invalid argument")
 
 	// ErrNotReplicated is returned when a replication operation is requested for
 	// a volume that is not replicated.
 	ErrNotReplicated = errors.New("not replicated")
 
-	// ErrNotPrimary is returned when an operation needs the local node to hold
-	// the primary role for a replicated volume and it does not.
-	//
-	// It is the portable "promote first, then retry" branch. A replicated
-	// backend denies every write to a secondary — DRBD will not even open the
-	// device — so mounting, formatting and snapshotting a secondary all fail
-	// for one reason, and one that a Promote fixes.
-	//
-	// It is deliberately not ErrUnsupported. That sentinel tells a caller the
-	// backend cannot serve the request at all and retrying is pointless; this
-	// one says the request is fine and the volume is simply in the wrong role
-	// at the moment. A controller holding the volume's primary lease acts on
-	// the difference.
+	// ErrNotPrimary is returned when an operation needs the local node to be primary for a replicated volume; promote, then retry.
 	ErrNotPrimary = errors.New("not primary on this node")
 
-	// ErrHasSnapshots is returned by Delete when snapshots of the volume still
-	// exist.
-	//
-	// Deletion does not cascade. Removing a volume takes its snapshots with it
-	// — they are copy-on-write areas over an origin that is going away — and
-	// destroying a restore point is not something to do as a side effect of
-	// destroying something else. Callers that mean it delete the snapshots
-	// first, which is one more call and an explicit one.
+	// ErrHasSnapshots is returned by Delete while snapshots of the volume exist; deletion does not cascade.
 	ErrHasSnapshots = errors.New("volume has snapshots")
 
 	// ErrProviderNotRegistered is returned when a provider is requested by a
 	// name that has not been registered.
 	ErrProviderNotRegistered = errors.New("provider not registered")
 
-	// ErrLeaseHeld is returned by Coordinator.AcquireLease when the key is
-	// already held by another live lease. It is the expected, non-fatal outcome
-	// of losing a contended acquisition (e.g. another node is the current
-	// leader) and is distinct from an operational failure, so callers can back
-	// off rather than treat it as an error. A Coordinator implementation maps
-	// its backend-specific "lease held" condition to this sentinel so callers
-	// remain backend-agnostic.
-	//
-	// Implementations WRAP the backend error rather than returning the bare
-	// sentinel, so that both survive:
-	//
-	//	return fmt.Errorf("%w: %w", common.ErrLeaseHeld, heldErr)
-	//
-	// errors.Is(err, ErrLeaseHeld) then matches for the portable branch, while
-	// errors.As still recovers the backend error and the detail it carries —
-	// the contended key, in the case of go-qrdb's *sdk.LeaseHeldError. Return
-	// the bare sentinel and that key is lost to logs and diagnostics.
+	// ErrLeaseHeld is returned by Coordinator.AcquireLease when another live lease holds the key; implementations wrap the backend error with it.
 	ErrLeaseHeld = errors.New("lease already held")
 )

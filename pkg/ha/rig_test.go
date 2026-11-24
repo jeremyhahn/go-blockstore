@@ -25,17 +25,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// logRecorder captures the controller's structured log so a test can wait on a
-// message the controller emits.
-//
-// It exists for one narrow purpose: some branches of the shutdown's renewal
-// loop have no other observable effect — they simply return — so a test that
-// wanted to prove one was taken had to guess at scheduling. A log line the
-// branch already deserves turns that guess into a barrier.
-//
-// It is a locked io.Writer behind slog's own text handler rather than a
-// hand-written slog.Handler, because the handler interface takes slog.Record by
-// value and this only ever needs the rendered text.
+// logRecorder captures the controller's log text so a test can wait on a message as a barrier.
 type logRecorder struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -82,9 +72,7 @@ func (o *observerLog) phases() []Phase {
 	return out
 }
 
-// last returns the most recently recorded status. The manager unregisters the
-// volume when it returns, so Controller.Status can no longer answer for it and
-// the observer's record is what a shutdown test reads.
+// last returns the most recently observed status, which outlives the manager's registration.
 func (o *observerLog) last(t *testing.T) Status {
 	t.Helper()
 	o.mu.Lock()
@@ -95,12 +83,7 @@ func (o *observerLog) last(t *testing.T) Status {
 	return o.seen[len(o.seen)-1]
 }
 
-// everPrimary reports whether the controller EVER announced the primary role.
-//
-// It is the assertion a fencing test wants. Reading Status after the fact only
-// says what is true now, and "we claimed primary for a moment and then took it
-// back" is precisely the bug: an orchestrator watching the observer would have
-// mounted on that announcement.
+// everPrimary reports whether the controller ever announced the primary role.
 func (o *observerLog) everPrimary() bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -200,14 +183,7 @@ func (r *rig) stop() {
 	r.cancel = nil
 }
 
-// stopPumpingTheClock cancels the manager and drains it while advancing the
-// clock in the background.
-//
-// The shutdown path has timed waits of its own — the release retry spaces its
-// attempts on the injected clock — so a manual clock that nobody advances would
-// leave the manager parked forever and turn the test into a timeout. The pump
-// starts only AFTER cancellation, so it cannot fire a renewal the test did not
-// ask for.
+// stopPumpingTheClock cancels the manager and advances the clock in the background until it drains.
 func (r *rig) stopPumpingTheClock() {
 	r.t.Helper()
 	r.cancel()

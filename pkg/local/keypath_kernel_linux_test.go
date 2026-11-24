@@ -26,41 +26,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The whole key-path guard rests on one claim about the kernel: A MOUNT
-// SUBSTITUTES, so a path's meaning before mount(2) is not evidence about its
-// meaning after. Everywhere else in this package that claim is asserted against
-// a fake whose Mount is a recording — which is exactly the instrument that
-// cannot tell a check running before the mount apart from one running after it.
-//
-// This file makes the mount, here, now, on the kernel the test is running on,
-// and asks the SHIPPED containment check the same question on either side of
-// it. If a future kernel resolves these paths differently, this goes red rather
-// than the design quietly resting on a snapshot of an older one.
-//
-// It needs a mount namespace, which needs privilege. Rather than requiring
-// root, the test re-executes itself inside a user namespace where it is root;
-// tmpfs is one of the filesystems a user namespace may mount, which is why the
-// volume below is a tmpfs and not something block-backed.
-//
-// IT IS BEHIND THE kernel_keypath BUILD TAG, AND IT DOES NOT SKIP. Selecting
-// the tag is a statement that this host provides unprivileged user + mount
-// namespaces, so a host that refuses is a FAILURE — a broken claim, not an
-// excuse (conventions/testing-guidelines.md §No Skip Guards; internal/guards
-// refuses a runtime skip anywhere in the tree).
-//
-// A runtime skip was the first answer here and it was the wrong one, for a
-// reason worth keeping: measured 2026-09-04, `go test` WITHOUT -v prints
-// nothing at all for a passing package — not Skipf, not stderr, not stdout —
-// and the CI Test job runs without -v. So a skip in that job is not quiet, it
-// is INVISIBLE, and the measurement would have gone missing in exactly the
-// environment that gates merges. main reached the same conclusion for
-// internal/mountinfo's kernel checks, from the same measurement, in #56.
-//
-// The verdict logic lives in keypath_kernel_verdict_linux_test.go, UNTAGGED,
-// so the decision this file depends on is exercised on every ordinary run.
-//
-// It never touches the caller's mounts: the child makes / recursively private
-// before mounting anything, and every mount it makes dies with the namespace.
+// Checks on the live kernel, in a user and mount namespace, that a mount changes what the key path resolves to; tag kernel_keypath, refusals fail.
 
 // keypathNamespaceEnv marks the re-executed child. Its presence is the only
 // difference between the two halves of this test.
@@ -71,17 +37,7 @@ const keypathNamespaceEnv = "GO_BLOCKSTORE_KEYPATH_KERNEL_CHILD"
 // own T.
 const keypathBaseEnv = "GO_BLOCKSTORE_KEYPATH_KERNEL_BASE"
 
-// TestAgainstARunningKernelAMountSubstitutesWhatTheKeyPathResolvesTo is the
-// measurement the design rests on, taken rather than assumed.
-//
-// The fixture is the case no correction to a pre-mount predicate reaches:
-// /etc/keys is a symlink to <target>/keys, and <target> is an empty mount
-// point, so the link's destination does not exist and the key path cannot be
-// resolved through it. The check therefore reports the key OUTSIDE the volume,
-// and at that instant it is right.
-//
-// Then a filesystem carrying keys/vol.key is mounted at the target, by mount(2),
-// and the same configured path is asked again.
+// TestAgainstARunningKernelAMountSubstitutesWhatTheKeyPathResolvesTo: a dangling symlink into the target resolves into the volume after mount.
 func TestAgainstARunningKernelAMountSubstitutesWhatTheKeyPathResolvesTo(t *testing.T) {
 	if os.Getenv(keypathNamespaceEnv) != "" {
 		runKeyPathSubstitutionChild(t)
@@ -90,9 +46,7 @@ func TestAgainstARunningKernelAMountSubstitutesWhatTheKeyPathResolvesTo(t *testi
 	relaunchKeyPathTestInMountNamespace(t, "mnt", "etc")
 }
 
-// relaunchKeyPathTestInMountNamespace runs this same test again, by name,
-// inside a user + mount namespace where the child is root — and reports a host
-// that will not create one as a SKIP naming the refused step, never as a pass.
+// relaunchKeyPathTestInMountNamespace reruns this test inside a user and mount namespace.
 func relaunchKeyPathTestInMountNamespace(t *testing.T, dirs ...string) {
 	t.Helper()
 
@@ -180,22 +134,13 @@ func runKeyPathSubstitutionChild(t *testing.T) {
 		t.Fatalf("writing the volume's own key file: %v", writeErr)
 	}
 
-	// ---- after the mount ----
-	//
-	// That a FILESYSTEM was substituted, and not merely some directories
-	// created, is asserted from the kernel's own device number for the target.
-	// Without this the whole file passes against a fixture that never calls
-	// mount(2) — an instrument that cannot tell the thing it is named for from
-	// an imitation of it, which is the failure this file exists to not repeat.
+	// After the mount: assert from the target's device number that a filesystem was mounted.
 	devMounted := deviceOfPath(t, target)
 	if devMounted == devBefore {
 		t.Fatalf("target is still on device %d:%d after mount(2): nothing was substituted",
 			unix.Major(devBefore), unix.Minor(devBefore))
 	}
-	//
-	// The kernel first, independently of anything this package computes: the
-	// configured path now reads the VOLUME's bytes. That is the exposure, and
-	// it is what the check has to be able to see.
+	// The configured path now reads the volume's bytes.
 	body, readErr := os.ReadFile(keyFile)
 	if readErr != nil {
 		t.Fatalf("after the mount reading %s: %v", keyFile, readErr)

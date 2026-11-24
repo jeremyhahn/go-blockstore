@@ -21,15 +21,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// volume is one managed volume's state.
-//
-// The mutators below are called by ONE goroutine at a time. Almost always that
-// is the volume's own manager goroutine; the single exception is a fence
-// recorded while a shutdown demote blocks, where the manager is parked inside
-// the provider and writes nothing until the goroutine that noticed the lease
-// end has returned. The mutex is therefore not protecting the state machine
-// from itself — the one-writer-at-a-time rule already does that — but from
-// [Controller.Status], which any caller may invoke at any moment.
+// volume is one managed volume's state; one writer at a time, with the mutex guarding reads by Controller.Status.
 type volume struct {
 	ctrl  *Controller
 	volID string
@@ -60,12 +52,7 @@ func (v *volume) deadline() time.Time {
 	return v.status.LeaseDeadline
 }
 
-// update applies fn to the status and notifies the observer if the transition
-// is one an observer acts on.
-//
-// The observer is called with the lock released, and from the manager
-// goroutine, which is what makes the notifications ordered without making them
-// re-entrant: an observer may call Status without deadlocking.
+// update applies fn and notifies the observer of a relevant transition, with the lock released.
 func (v *volume) update(fn func(*Status)) {
 	v.mu.Lock()
 	before := v.status
@@ -80,15 +67,7 @@ func (v *volume) update(fn func(*Status)) {
 	v.ctrl.cfg.Observer(after)
 }
 
-// transition reports whether the change from before to after is one worth
-// waking an observer for.
-//
-// Phase, the primary claim and the reason are the three facts an orchestrator
-// mounts and unmounts on. A renewal that only moves the deadline is not one of
-// them, and neither is the same refusal restated at the next reconcile, so
-// errors are compared by their text rather than by identity — otherwise a
-// volume parked on one unchanging refusal would notify on every cadence tick
-// forever.
+// transition reports whether phase, the primary claim or the error text changed.
 func transition(before, after *Status) bool {
 	return before.Phase != after.Phase ||
 		before.Primary != after.Primary ||
@@ -103,22 +82,7 @@ func errText(err error) string {
 	return err.Error()
 }
 
-// campaigning records that this controller does not hold the lease. err says
-// why — a contended key, or a Coordinator that could not answer — and the
-// announcement is dropped either way, because both mean the same thing about
-// what this node may write.
-//
-// It does NOT overwrite an unresolved fence. A fence whose demote failed says
-// this node may still be writable with no lease behind it, and going back to
-// campaigning does not fix that — it is the same hazard, now with a contender's
-// error on top of it. Replacing it would make the status stop reporting the
-// unsafe condition the moment the controller got on with its retry loop, which
-// is exactly when nobody is looking. The phase and the log carry the campaign
-// outcome; Err carries the thing that still needs a human.
-//
-// A fence whose demote SUCCEEDED carries no such hazard — the role is back — so
-// this reports the campaign error normally. [ErrRoleNotYielded] is what marks
-// the difference.
+// campaigning records that the lease is not held and drops the announcement; an unresolved fence keeps its error.
 func (v *volume) campaigning(err error) {
 	v.update(func(s *Status) {
 		s.Phase = PhaseCampaigning
@@ -142,15 +106,7 @@ func (v *volume) leading(deadline time.Time, key string) {
 	})
 }
 
-// acknowledged moves the deadline after a renewal the backend confirmed. Only
-// an acknowledged renewal moves it: that is the whole point of tracking it.
-//
-// It clears ONLY a renewal error. A renewal succeeding says the Coordinator is
-// reachable; it says nothing about the volume, so a refusal standing from the
-// last reconcile keeps applying until a reconcile finds otherwise. Clearing it
-// here would publish a healthy status for a volume that is still refused — and
-// would do it on every cadence tick, producing exactly the clear/re-set churn
-// that comparing errors by text in transition exists to avoid.
+// acknowledged moves the deadline after a confirmed renewal and clears only a renewal error.
 func (v *volume) acknowledged(deadline time.Time) {
 	v.update(func(s *Status) {
 		s.LeaseDeadline = deadline
@@ -160,10 +116,7 @@ func (v *volume) acknowledged(deadline time.Time) {
 	})
 }
 
-// renewFailed records a renewal error WITHOUT moving the deadline and without
-// fencing. Done decides whether the lease still exists; this is a warning that
-// it might not, and the one thing a later successful renewal is allowed to
-// clear.
+// renewFailed records a renewal error without moving the deadline or fencing.
 func (v *volume) renewFailed(err error) {
 	v.update(func(s *Status) { s.Err = err })
 }
@@ -173,13 +126,7 @@ func (v *volume) observed(repl common.ReplState) {
 	v.update(func(s *Status) { s.Repl = repl })
 }
 
-// promoted records that the local copy holds primary under the current epoch.
-//
-// The recorded replication role moves with it. Either the provider just made
-// this node primary and said so, or the read that got us here already found it
-// primary; leaving Repl.Role at the value read BEFORE a promotion would have
-// Status announce Primary alongside a role of secondary, and a caller reading
-// the two together would have to guess which one to believe.
+// promoted records primary under the current epoch and sets Repl.Role to match.
 func (v *volume) promoted() {
 	v.update(func(s *Status) {
 		s.Primary = true
@@ -188,24 +135,7 @@ func (v *volume) promoted() {
 	})
 }
 
-// demoted records that the local copy no longer holds the primary role, because
-// this controller just gave it back and the provider said so.
-//
-// It is the mirror of promoted's role update, and it exists for the same
-// reason: Status.Repl.Role is documented as the device's actual role, so a
-// controller that moves the role and does not move the field turns that
-// documentation into a lie in the one direction that matters — reporting
-// primary for a node it has just demoted.
-//
-// The announcement goes with it, and must. A demote that succeeded means the
-// provider has already made this node secondary, so continuing to advertise it
-// as the authorized primary would contradict the very role this call recorded —
-// and it would do so for as long as whatever follows takes, which on the
-// shutdown path is a release that may retry for the whole ActionTimeout.
-//
-// Only a demote that SUCCEEDED calls this. One that failed leaves both alone,
-// because it does not know where the role ended up and guessing would report as
-// safe the exact case that is not.
+// demoted records a successful demote: role secondary and announcement dropped.
 func (v *volume) demoted() {
 	v.update(func(s *Status) {
 		s.Primary = false
@@ -213,14 +143,7 @@ func (v *volume) demoted() {
 	})
 }
 
-// refused records something this controller declined to do — a promotion it
-// would not attempt, or an announcement it would not make for a copy that is
-// already primary. Both withdraw the announcement, which is the whole content
-// of a refusal here.
-//
-// The volume is intact and the lease is still held, so the phase does not
-// change; the next reconcile asks again, and a volume that finishes a resync
-// answers differently.
+// refused records a declined promotion or announcement and withdraws the announcement; the phase is unchanged.
 func (v *volume) refused(err error) {
 	v.update(func(s *Status) {
 		s.Primary = false
@@ -228,27 +151,12 @@ func (v *volume) refused(err error) {
 	})
 }
 
-// failed records an operation that errored while leading WITHOUT knowing what
-// the device's role now is.
-//
-// It deliberately does not touch the announcement. Its one caller is a failed
-// read of the replication state, which changes nothing about the device and
-// tells us nothing new about it either, so the last thing this controller
-// actually established stands and the error says it is now unverified.
-//
-// A failure that DOES establish something uses promotionFailed instead.
+// failed records a failed replication-state read without changing the announcement.
 func (v *volume) failed(err error) {
 	v.update(func(s *Status) { s.Err = err })
 }
 
-// promotionFailed records a promotion attempt that did not take, and withdraws
-// the announcement.
-//
-// Unlike failed, this outcome is informative: the reconcile had just read the
-// local role as NOT primary, and the call to make it primary failed. Whatever
-// this controller announced earlier is now known to be wrong, so leaving it
-// standing would keep an orchestrator mounted on an authorization that has been
-// disproven.
+// promotionFailed records a failed promotion and withdraws the announcement.
 func (v *volume) promotionFailed(err error) {
 	v.update(func(s *Status) {
 		s.Primary = false
@@ -256,14 +164,7 @@ func (v *volume) promotionFailed(err error) {
 	})
 }
 
-// fenced records the loss of the lease. The primary claim goes first and
-// unconditionally: it expired with the lease, whether or not the device can be
-// demoted afterwards.
-//
-// A volume already fenced keeps the reason it has. The only way to reach this
-// while fenced is that a promotion was voided a moment earlier, and that reason
-// is the sharper of the two — it says a promotion was in flight, which the
-// generic one does not.
+// fenced records the lease loss and drops the primary claim; an existing fence keeps its reason.
 func (v *volume) fenced(err error) {
 	v.update(func(s *Status) {
 		if s.Phase == PhaseFenced {
@@ -275,12 +176,7 @@ func (v *volume) fenced(err error) {
 	})
 }
 
-// fencedWith fences the volume and takes err even if it is already fenced.
-//
-// It is the counterpart to fenced, which keeps whatever reason is standing. Its
-// two callers both hold the fuller account of the same event — a promotion that
-// was in flight when the lease died, or a shutdown that now also knows how the
-// demote went — so here the newer reason is the better one.
+// fencedWith fences the volume and replaces the reason even if already fenced.
 func (v *volume) fencedWith(err error) {
 	v.update(func(s *Status) {
 		s.Phase = PhaseFenced
@@ -289,39 +185,12 @@ func (v *volume) fencedWith(err error) {
 	})
 }
 
-// demoteFailed records that the demote following a fence did not take. The
-// phase stays where it was — this controller is still fenced and still
-// initiating nothing — but the error says the local copy may remain writable,
-// which is the difference between a fenced controller and a fenced node.
+// demoteFailed records that the demote after a fence did not take, so the copy may remain writable.
 func (v *volume) demoteFailed(err error) {
 	v.update(func(s *Status) { s.Err = err })
 }
 
-// stopped records the manager's exit.
-//
-// Two rules keep the final status honest, and both exist because it is the LAST
-// record: Manage unregisters the volume as it returns, so Controller.Status can
-// no longer answer for it and what the observer saw last is all that is left.
-//
-// The FIRST stop reason wins. A shutdown that failed to demote or release has
-// already said the useful thing, and the loop unwinding afterwards would
-// otherwise replace it with nil.
-//
-// A NIL stop reason keeps only what OUTLIVES the shutdown. Nil means the
-// shutdown itself had nothing to report, which is not the same as saying
-// everything before it is resolved — but most of what came before it is.
-//
-// Stopping resolves a refusal to promote and a renewal warning: the controller
-// is no longer trying, so neither is actionable and carrying them into the
-// final status would make a clean stop read like a failed one. It does not
-// resolve a fence, which says the lease was lost and — when the demote after it
-// failed — that this node may still be writable with no lease behind it. That
-// condition survives the manager, and [ErrFenced] is what marks it, so that is
-// the one reason a nil stop keeps.
-//
-// The distinction matters because this is the LAST record: Manage unregisters
-// the volume as it returns, so Controller.Status can no longer answer for it and
-// what the observer saw last is all that is left.
+// stopped records the manager's exit; the first stop reason wins, and a nil reason keeps only a fence.
 func (v *volume) stopped(err error) {
 	v.mu.Lock()
 	already := v.status.Phase == PhaseStopped

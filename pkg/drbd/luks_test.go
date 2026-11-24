@@ -73,10 +73,7 @@ func TestAPassphraseWithoutEncryptionIsRefused(t *testing.T) {
 	}
 }
 
-// TestTheTwoSecretsMustBeDifferentFiles is a configuration that reads as
-// defense in depth and is not: the replication secret is SHARED WITH THE PEER
-// so DRBD can authenticate it, so pointing both settings at one path gives the
-// peer-authentication secret the additional job of protecting the data.
+// TestTheTwoSecretsMustBeDifferentFiles: the replication secret is shared with the peer.
 func TestTheTwoSecretsMustBeDifferentFiles(t *testing.T) {
 	shared := "/etc/go-blockstore/secret"
 	settings := testSettings(t)
@@ -113,10 +110,7 @@ func TestMappingNamesAreNamespacedAgainstTheLocalProvider(t *testing.T) {
 			luks.MappingPrefix, luks.ReplicatedMappingPrefix)
 	}
 
-	// The separator has to be a character validateName rejects, or a volume
-	// group and a volume ID can trade one and spell the same mapping name as a
-	// different pair. DRBD resource names ACCEPT underscores, which is why this
-	// package cannot use pkg/local's separator.
+	// The separator must be one validateName rejects; DRBD names accept underscores.
 	if err := validateName("volume", "a.b"); err == nil {
 		t.Error("validateName accepts a dot, so the mapping namespace is ambiguous")
 	}
@@ -129,12 +123,7 @@ func TestMappingNamesAreNamespacedAgainstTheLocalProvider(t *testing.T) {
 // Promote — where the container is opened
 // -----------------------------------------------------------------------------
 
-// TestPromoteOpensTheContainerAfterTheRoleChange is the ruling this work
-// implements, asserted as an ORDER rather than as two facts.
-//
-// The unlock cannot come first: DRBD refuses every open of a Secondary's
-// device, read-only opens included, so a promotion is the earliest moment the
-// container over /dev/drbdN can be opened at all.
+// TestPromoteOpensTheContainerAfterTheRoleChange: a Secondary's device cannot be opened.
 func TestPromoteOpensTheContainerAfterTheRoleChange(t *testing.T) {
 	p, r, crypt := newEncryptedProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -159,13 +148,7 @@ func TestPromoteOpensTheContainerAfterTheRoleChange(t *testing.T) {
 	assertNotRun(t, r, "luks format /dev/drbd0")
 }
 
-// TestMountDoesNotTouchTheCryptLifecycle is the other half of the ruling, and
-// it is the half the measurement decided.
-//
-// Counted against pkg/local's fake, Attach performs the container probe and the
-// unlock and Mount performs NEITHER — the crypt lifecycle lives at the layer
-// that makes a device usable, not at the mount. Promote is this provider's
-// counterpart of that layer, so Mount here must open and close nothing.
+// TestMountDoesNotTouchTheCryptLifecycle: Promote owns the container, Mount opens and closes nothing.
 func TestMountDoesNotTouchTheCryptLifecycle(t *testing.T) {
 	p, r, crypt := newEncryptedProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -188,12 +171,7 @@ func TestMountDoesNotTouchTheCryptLifecycle(t *testing.T) {
 	}
 }
 
-// TestFirstPromoteFormatsAnEmptyDevice is where an encrypted volume's container
-// comes from. It cannot come from Provision: the resource comes up Secondary on
-// both nodes and DRBD will not let anything write to it.
-//
-// The guard is the one this package already applies to its mkfs — only a device
-// blkid reports as carrying NOTHING AT ALL is formatted.
+// TestFirstPromoteFormatsAnEmptyDevice: the container is formatted on the first Promote, only over a device blkid reports empty.
 func TestFirstPromoteFormatsAnEmptyDevice(t *testing.T) {
 	p, r, _ := newEncryptedProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -241,15 +219,7 @@ func TestPromoteRefusesToFormatOverAFilesystem(t *testing.T) {
 	assertOrder(t, r, "drbdadm primary vol1", "drbdadm secondary vol1")
 }
 
-// TestPromoteRollsBackTheRoleOnItsOwnContext is the finding that a compensating
-// action reusing the caller's context does nothing at all.
-//
-// The most likely reason to be unwinding is that ctx was canceled partway
-// through, and the production runner execs through exec.CommandContext — so a
-// rollback on the caller's context fails instantly and leaves behind exactly
-// the state it exists to undo, while the code reads as though it had restored
-// it. The test cancels ctx as the promotion returns and then requires the
-// demotion to have run anyway.
+// TestPromoteRollsBackTheRoleOnItsOwnContext: the demotion runs even when ctx is canceled as the promotion returns.
 func TestPromoteRollsBackTheRoleOnItsOwnContext(t *testing.T) {
 	p, r, _ := newEncryptedProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -278,12 +248,7 @@ func TestPromoteRollsBackTheRoleOnItsOwnContext(t *testing.T) {
 	assertOrder(t, r, "drbdadm primary vol1", "drbdadm secondary vol1")
 }
 
-// TestPromoteRollsBackTheRoleWhenTheUnlockFails is the same unwind reached
-// through an ordinary failure rather than a cancellation.
-//
-// A Primary with no plaintext device is a volume nothing can mount, holding the
-// pair's only writable copy away from the peer. The promotion this call
-// performed goes back.
+// TestPromoteRollsBackTheRoleWhenTheUnlockFails: a failed unlock undoes this call's promotion.
 func TestPromoteRollsBackTheRoleWhenTheUnlockFails(t *testing.T) {
 	p, r, crypt := newEncryptedProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -305,12 +270,7 @@ func TestPromoteRollsBackTheRoleWhenTheUnlockFails(t *testing.T) {
 	assertOrder(t, r, "drbdadm primary vol1", "drbdadm secondary vol1")
 }
 
-// TestPromoteKeepsARoleItDidNotTake mirrors pkg/local's Attach, which rolls its
-// activation back only when the volume was not already active.
-//
-// A promotion this call did not perform is not this call's to undo. Demoting it
-// would take the volume away from whoever promoted it first — and on a
-// replicated pair that is the node currently serving writes.
+// TestPromoteKeepsARoleItDidNotTake: a promotion this call did not perform is not undone.
 func TestPromoteKeepsARoleItDidNotTake(t *testing.T) {
 	p, r, crypt := newEncryptedProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -331,13 +291,7 @@ func TestPromoteKeepsARoleItDidNotTake(t *testing.T) {
 // Demote — where the container is closed
 // -----------------------------------------------------------------------------
 
-// TestDemoteClosesTheContainerBeforeTheRoleChange is the second half of the
-// ruling, and the ORDER is the operation rather than a detail of it.
-//
-// An open dm-crypt mapping holds /dev/drbdN open, and DRBD refuses to demote a
-// device somebody has open. Closing afterwards would make every demotion of an
-// encrypted volume fail on a busy device — and report it as though a workload
-// still held the volume.
+// TestDemoteClosesTheContainerBeforeTheRoleChange: an open mapping holds the device, so DRBD would refuse the demotion.
 func TestDemoteClosesTheContainerBeforeTheRoleChange(t *testing.T) {
 	p, r, crypt := newEncryptedProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -359,14 +313,7 @@ func TestDemoteClosesTheContainerBeforeTheRoleChange(t *testing.T) {
 	}
 }
 
-// TestDemoteStopsWhenTheContainerWillNotClose is the failure path, and it is the
-// half that proves the close is load-bearing rather than decorative.
-//
-// A close that fails must stop the demotion. Carrying on would run drbdadm
-// secondary against a device the mapping still holds open — which DRBD refuses,
-// so the caller would get a busy-device error naming the wrong problem — and if
-// it somehow succeeded, the node would be Secondary with a live plaintext
-// mapping over a device the replication stream is now writing underneath it.
+// TestDemoteStopsWhenTheContainerWillNotClose: a failed close stops the demotion.
 func TestDemoteStopsWhenTheContainerWillNotClose(t *testing.T) {
 	p, r, crypt := newEncryptedProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -505,14 +452,7 @@ func TestMountUsesThePlaintextDevice(t *testing.T) {
 	assertNotRun(t, r, "blkid -p -o export "+devicePath(0))
 }
 
-// TestMountRefusesAVolumeWhoseContainerIsNotOpen is the "error, not a pass"
-// rule: crypt state that cannot be established is reported as a failure rather
-// than assumed to be fine.
-//
-// Primary ordinarily implies an open container, because Promote opens one — but
-// ordinarily is not a guarantee, and reading the role as proof would hand
-// mount(2) a device node that does not exist and return an error saying nothing
-// about what is actually wrong.
+// TestMountRefusesAVolumeWhoseContainerIsNotOpen: unestablished crypt state is an error.
 func TestMountRefusesAVolumeWhoseContainerIsNotOpen(t *testing.T) {
 	p, r, _ := newEncryptedProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -591,11 +531,7 @@ func encryptedDeviceBytes(usable int64) int64 {
 	return backing - metadataBytes(dataBytes(usable, true))
 }
 
-// scriptEncryptedResize scripts the device half of a Resize from testSize to
-// newSize on an up resource in the given role: the lvs that finds the backing
-// volume at its current size, the lvextend to the new one, and the drbdadm
-// resize — which, through its hook, GROWS THE DEVICE the fake LUKS backend
-// sees, exactly when the real one would.
+// scriptEncryptedResize scripts the device half of a Resize; drbdadm resize grows the fake device as the real one would.
 func scriptEncryptedResize(r *fakeRunner, crypt *fakeLUKS, status string, newSize int64) {
 	r.scriptStatus(status)
 	r.scriptLVS(lvsJSON(lvEntry{
@@ -613,21 +549,7 @@ func scriptEncryptedResize(r *fakeRunner, crypt *fakeLUKS, status string, newSiz
 	}
 }
 
-// TestResizeRefusesToGrowTheFilesystemIntoAStaleMapping is the defect issue #62
-// is about, pinned from the side that reports success.
-//
-// The dm-crypt mapping over /dev/drbdN is sized from the replicated device at
-// the moment Promote opens it, and go-luks2 exposes no table reload. So after
-// the lvextend and the drbdadm resize the plaintext device is still the size it
-// was unlocked at, and a resize2fs against it would grow the filesystem to the
-// OLD size and exit 0 — after which the record would say the new size over a
-// filesystem that never reached it. The refusal has to come AFTER the device
-// half, which is idempotent and is not what is wrong, and BEFORE the grow tool
-// runs; and it has to name the remedy, because the caller's request is fine
-// and only the mapping is in the wrong state.
-//
-// Removing the freshness check in growFilesystem makes every case here pass
-// the resize and run resize2fs against the stale mapping.
+// TestResizeRefusesToGrowTheFilesystemIntoAStaleMapping: after the device half, the grow is refused naming the demote/promote remedy.
 func TestResizeRefusesToGrowTheFilesystemIntoAStaleMapping(t *testing.T) {
 	newSize := testSize * 2
 	cases := []struct {
@@ -652,7 +574,7 @@ func TestResizeRefusesToGrowTheFilesystemIntoAStaleMapping(t *testing.T) {
 			spec := defaultSpec()
 			spec.FSType = tc.fsType
 			provision(t, p, r, spec)
-			// Opened at the CURRENT device size, as Promote would have.
+			// Opened at the current device size, as Promote would have.
 			crypt.sized(devicePath(0), encryptedDeviceBytes(testSize))
 			crypt.unlocked(cryptName(testVolume), devicePath(0))
 			r.reset()
@@ -707,12 +629,7 @@ func TestResizeRefusesToGrowTheFilesystemIntoAStaleMapping(t *testing.T) {
 	}
 }
 
-// TestResizeCompletesWhenTheContainerIsClosed is the size-at-open path from
-// the side where nothing is stale. A Secondary's container is never open —
-// DRBD refuses every open of a Secondary's device — so the device grows, the
-// record follows it, and the filesystem is owed a grow that the next Promote
-// sizes the mapping for and the next Mount performs. That owed grow is
-// RECORDED, so that Mount knows to finish it; a raw volume owes nothing.
+// TestResizeCompletesWhenTheContainerIsClosed: on a Secondary the device grows and the filesystem grow is recorded as owed.
 func TestResizeCompletesWhenTheContainerIsClosed(t *testing.T) {
 	newSize := testSize * 2
 	for _, tc := range []struct {
@@ -762,11 +679,7 @@ func TestResizeCompletesWhenTheContainerIsClosed(t *testing.T) {
 	}
 }
 
-// TestResizeGrowsTheFilesystemThroughAFreshMapping is the repeat the refusal's
-// remedy ends in, and the ordinary online resize of a volume whose peer was
-// grown first. The mapping was opened AFTER the device reached its new size, so
-// it covers the whole data area and the filesystem is grown through it — to
-// the mapping's path, never to /dev/drbdN, which carries the ciphertext.
+// TestResizeGrowsTheFilesystemThroughAFreshMapping: grown through the mapping's path, never /dev/drbdN.
 func TestResizeGrowsTheFilesystemThroughAFreshMapping(t *testing.T) {
 	newSize := testSize * 2
 	p, r, crypt := newEncryptedProvider(t)
@@ -844,16 +757,7 @@ func TestFilesystemGrowRefusesAStaleMapping(t *testing.T) {
 	r.assertNotRan(t, "resize2fs")
 }
 
-// TestMountFinishesADeferredGrow is where an owed grow is paid. Promote sized
-// the mapping when it opened the container — over a device that had already
-// grown — and Mount is the first point at which both filesystems this package
-// manages can be grown ONLINE: resize2fs against a mounted ext4 needs no
-// check, and xfs_growfs has no other form at all. It is not done at Promote,
-// where the only ext4 route is a forced e2fsck of the whole filesystem in the
-// failover path, and where XFS cannot be grown at all; see Provider.Mount.
-//
-// The unencrypted case is here because the record means the same thing for
-// both: the volume was resized while it was Secondary.
+// TestMountFinishesADeferredGrow: Mount pays an owed grow online, for encrypted and plain volumes.
 func TestMountFinishesADeferredGrow(t *testing.T) {
 	newSize := testSize * 2
 
@@ -990,12 +894,7 @@ func TestMountFinishesADeferredGrow(t *testing.T) {
 	})
 }
 
-// TestMountUnwindsWhenTheDeferredGrowFails is the other half of paying the
-// debt: a Mount that returns an error has mounted nothing, the same promise
-// the propagation check keeps. Leaving the volume mounted behind an error
-// would report a mount that did not happen; leaving the grow silently undone
-// behind a success would report a size the filesystem never reached. The
-// record keeps owing the grow either way, so the next Mount tries again.
+// TestMountUnwindsWhenTheDeferredGrowFails: the volume is unmounted and the grow stays owed.
 func TestMountUnwindsWhenTheDeferredGrowFails(t *testing.T) {
 	newSize := testSize * 2
 
@@ -1041,8 +940,7 @@ func TestMountUnwindsWhenTheDeferredGrowFails(t *testing.T) {
 
 	t.Run("the mapping is stale", func(t *testing.T) {
 		p, r, crypt, m := deferred(t)
-		// Opened BEFORE the device reached its size — a Primary promoted in
-		// the middle of the pair's resize — and never reloaded.
+		// Opened before the device reached its size and never reloaded.
 		crypt.sized(devicePath(0), encryptedDeviceBytes(testSize))
 		crypt.unlocked(cryptName(testVolume), devicePath(0))
 		r.devicePresent(cryptPath(testVolume))
@@ -1061,20 +959,12 @@ func TestMountUnwindsWhenTheDeferredGrowFails(t *testing.T) {
 	})
 }
 
-// TestRestoreIntoALargerEncryptedVolumeGrowsAndDefersTheFilesystem closes the
-// other road to the same defect. A restore that asks for more than its source
-// held is finished by the same grow sequence Resize runs, and on an encrypted
-// provider that sequence now completes the way a Secondary's Resize does: the
-// device grows, the record follows, and the filesystem — the SOURCE's, copied
-// byte for byte into a container the first Promote will open at the new size
-// — is owed a grow that Mount pays. A restore at the source's own size involves
-// no grow and owes nothing.
+// TestRestoreIntoALargerEncryptedVolumeGrowsAndDefersTheFilesystem: a growing restore defers the filesystem grow to Mount.
 func TestRestoreIntoALargerEncryptedVolumeGrowsAndDefersTheFilesystem(t *testing.T) {
 	const snapLV = "vol1.snap.nightly"
 	snapshot := common.SnapshotID("vg0/" + snapLV)
 
-	// The snapshot is of an ENCRYPTED volume, so its origin is the encrypted
-	// backing size; a plain origin would already be a grow on this provider.
+	// The snapshot's origin is the encrypted backing size.
 	origin := roundUpTo(backingBytes(testSize, true), testExtentSize)
 	script := func(r *fakeRunner) {
 		r.scriptLVS(lvsJSON(
@@ -1155,10 +1045,7 @@ func TestRestoreIntoALargerEncryptedVolumeGrowsAndDefersTheFilesystem(t *testing
 // Sizing
 // -----------------------------------------------------------------------------
 
-// encryptedDeviceKiB is the size, in the KiB drbdsetup reports, of the DRBD
-// device an encrypted testSize volume presents: the backing volume as LVM
-// rounded it, less DRBD's metadata. The literal in the shared status fixtures
-// is the PLAIN volume's, and an encrypted one is larger by the header.
+// encryptedDeviceKiB is the DRBD device size in KiB for an encrypted testSize volume.
 func encryptedDeviceKiB() int64 {
 	backing := roundUpTo(backingBytes(testSize, true), testExtentSize)
 	return (backing - metadataBytes(dataBytes(testSize, true))) / statusSizeUnit
@@ -1170,12 +1057,7 @@ func encryptedStatus(role string) string {
 	return strings.Replace(doc, `"size": 1052600`, fmt.Sprintf(`"size": %d`, encryptedDeviceKiB()), 1)
 }
 
-// TestProvisionAllocatesTheLUKSHeaderOnTop is the sizing contract at the
-// command line: an encrypted volume's backing logical volume is created
-// backingBytes(size, encrypted) large, header included, so the filesystem
-// inside the container has the whole of what the caller asked for. The earlier
-// revision created it at the plain size and took the header out of the
-// request, 16 MiB short.
+// TestProvisionAllocatesTheLUKSHeaderOnTop: the backing LV is backingBytes(size, encrypted), header included.
 func TestProvisionAllocatesTheLUKSHeaderOnTop(t *testing.T) {
 	p, r, _ := newEncryptedProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -1195,12 +1077,7 @@ func TestProvisionAllocatesTheLUKSHeaderOnTop(t *testing.T) {
 	}
 }
 
-// TestStatusReportsUsableCapacityOnAnEncryptedVolume pins what Status says
-// about an encrypted volume in every state: USABLE capacity, per
-// VolumeStatus.SizeBytes, which above a LUKS container is the DRBD device
-// less the header — the device itself is ciphertext, header included, and is
-// not what the caller can write to. Down, the record is already usable and is
-// reported as it is. In no state is the figure below what was requested.
+// TestStatusReportsUsableCapacityOnAnEncryptedVolume: Status reports the device less the header, in every state.
 func TestStatusReportsUsableCapacityOnAnEncryptedVolume(t *testing.T) {
 	device := encryptedDeviceKiB() * statusSizeUnit
 	usable := device - luks.HeaderBytes
@@ -1244,22 +1121,7 @@ func TestStatusReportsUsableCapacityOnAnEncryptedVolume(t *testing.T) {
 	}
 }
 
-// TestStatusDoesNotLookForAMappingThatIsNotThere is the #69 review finding.
-//
-// On an encrypted provider the filesystem device is /dev/mapper/<name>, which
-// exists only while the container is open. Production's mount-table lookup
-// resolves a device by stat(2) BEFORE reading the table, so asking about a
-// closed container's mapping is a DeviceError, not "not mounted" — and Status
-// asked unconditionally. Every Secondary after a Demote, and every volume
-// resized Secondary-side with its container closed (which this branch
-// explicitly supports), therefore failed Status. The earlier fixture answered
-// an empty list for any path and hid it.
-//
-// The gate is the container's state, and it is the same ownership check
-// everything else uses: a closed container is not mounted and is not looked
-// up; an open one is looked up and answers mounted or not; a mapping under our
-// name over some OTHER device is an error, surfaced rather than read as
-// "closed".
+// TestStatusDoesNotLookForAMappingThatIsNotThere: a closed container is not looked up; a foreign mapping is an error.
 func TestStatusDoesNotLookForAMappingThatIsNotThere(t *testing.T) {
 	t.Run("secondary with the container closed", func(t *testing.T) {
 		p, r, _ := newEncryptedProvider(t)

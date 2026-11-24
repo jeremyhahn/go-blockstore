@@ -37,37 +37,16 @@ var (
 	// device number to match a mount against.
 	ErrNotBlockDevice = errors.New("mountinfo: path is not a block device")
 
-	// ErrNotMounted reports a path with nothing mounted at it, where the caller
-	// asked a question that only a mount can answer.
-	//
-	// Distinct from a false answer on purpose: "nothing is mounted here" and
-	// "what is mounted here does not propagate" are different findings with
-	// different fixes, and a guard that collapsed them would report the wrong
-	// one at the moment somebody is trying to fix a deployment.
+	// ErrNotMounted reports a path with nothing mounted at it.
 	ErrNotMounted = errors.New("mountinfo: nothing is mounted at that path")
 
-	// ErrNotVisibleThere reports a path where something IS mounted and it is not
-	// the device asked about.
-	//
-	// Distinct from ErrNotMounted because the fixes differ and so does the
-	// hazard: nothing mounted is a mount that failed or was removed, while
-	// something else mounted is another actor's filesystem on the same path —
-	// whose propagation must not be read as this device's, and which must never
-	// be unmounted on this device's behalf.
+	// ErrNotVisibleThere reports a path where a different device is mounted.
 	ErrNotVisibleThere = errors.New("mountinfo: another filesystem is visible at that path")
 
 	// ErrMalformedMountID reports a record whose mount id is not a number.
 	ErrMalformedMountID = errors.New("mountinfo: mount id is not a number")
 
-	// ErrMalformedParentID reports a record whose parent mount id is not a
-	// number.
-	//
-	// Refused rather than defaulted to zero: the parent id is the edge that
-	// makes the table a tree, and a record with no readable edge is one whose
-	// visibility cannot be decided. A zero would not read as "unknown", it
-	// would read as "no parent" — the shape treated as the top of the table and
-	// therefore always reachable, which is the answer a caller acts on by
-	// unmounting.
+	// ErrMalformedParentID reports a record whose parent mount id is not a number; it is refused, never read as zero.
 	ErrMalformedParentID = errors.New("mountinfo: parent mount id is not a number")
 
 	// ErrUnsupportedPlatform reports that device numbers cannot be read here.
@@ -86,11 +65,6 @@ var (
 )
 
 // ReadError reports that the mount table could not be read at all.
-//
-// Distinct from ParseError on purpose: this one means the table was never
-// obtained, which a caller must not confuse with a table that was read and did
-// not mention its device. That confusion is what asking findmnt made
-// unavoidable.
 type ReadError struct {
 	// Path is the file that could not be read.
 	Path string

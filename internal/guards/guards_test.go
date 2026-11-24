@@ -42,24 +42,7 @@ func fixture(t *testing.T, name string) string {
 	return path
 }
 
-// plantedViolations is the golden set: every violation the dirty fixture tree
-// contains, per scanner, located exactly.
-//
-// # Why exact locations and not "it found something"
-//
-// The first version of the test below asserted only len(Findings) > 0, and
-// mutation testing on 2026-09-04 killed it: deleting "Skip" from skipMethods,
-// and deleting "|| true" from failOpenPatterns, each left it GREEN. The
-// fixtures hold several violations apiece, so a scanner that lost the ability
-// to see one of them still fired on the rest and the count stayed non-zero.
-//
-// A positive control that any surviving detection satisfies is not a positive
-// control for the detection you removed. So the fixtures now carry one
-// violation per recognized SPELLING — each receiver, each method, each
-// exit-swallow form, each file type — and the assertion is set equality:
-// nothing missing, and nothing extra either, because a scanner that started
-// firing on a line the fixture calls clean is the false-positive failure that
-// gets a guard switched off.
+// plantedViolations is the exact set of violations the dirty fixture tree contains, one per recognized spelling, per scanner.
 var plantedViolations = map[string][]Finding{
 	"no-runtime-skip": {
 		{File: "skip_fixture.go", Line: 21}, // t.Skip
@@ -117,17 +100,7 @@ var plantedViolations = map[string][]Finding{
 	},
 }
 
-// TestGuardsEveryScannerCanSayYes is THE binding requirement, applied to every
-// scanner uniformly.
-//
-// A scanner that has never fired is a scanner nobody knows is wired up, and its
-// silence over the repository means nothing. Each one is therefore run against
-// a fixture tree that DOES contain the violation it looks for, and required to
-// report every planted instance — see plantedViolations for why "every" rather
-// than "at least one".
-//
-// It iterates All(), so a scanner added to the command line without a fixture
-// fails here rather than shipping unverified.
+// TestGuardsEveryScannerCanSayYes requires every scanner in All() to report every planted violation.
 func TestGuardsEveryScannerCanSayYes(t *testing.T) {
 	dirty := fixture(t, "dirty")
 
@@ -183,9 +156,7 @@ func TestGuardsEveryScannerCanSayYes(t *testing.T) {
 	}
 }
 
-// TestEveryScannerHasPlantedViolations keeps the golden table and All() in step
-// from the other direction: a stale entry for a scanner that was renamed or
-// removed would sit there looking like coverage of something.
+// TestEveryScannerHasPlantedViolations keeps the golden table and All() in step.
 func TestEveryScannerHasPlantedViolations(t *testing.T) {
 	live := map[string]bool{}
 	for _, scanner := range All() {
@@ -201,14 +172,7 @@ func TestEveryScannerHasPlantedViolations(t *testing.T) {
 	}
 }
 
-// TestGuardsEveryScannerIsSilentOnCleanCode is the other half. A scanner that
-// refuses everything passes the test above and is worse than none, because the
-// only way to ship work past it is to switch it off.
-//
-// The clean fixture is deliberately adversarial: it contains prose ABOUT each
-// violation, the constructions inside string literals, and the near-misses that
-// a textual scanner would report — t.Parallel, a decoder's Skip method, a
-// comment discussing `|| true`, and a properly phrased --privileged warning.
+// TestGuardsEveryScannerIsSilentOnCleanCode runs every scanner on an adversarial clean fixture of near-misses.
 func TestGuardsEveryScannerIsSilentOnCleanCode(t *testing.T) {
 	clean := fixture(t, "clean")
 
@@ -229,13 +193,7 @@ func TestGuardsEveryScannerIsSilentOnCleanCode(t *testing.T) {
 	}
 }
 
-// TestGuardsTheRepositoryIsClean is the scan that actually gates the build.
-//
-// It asserts the finding count AND the examined count, because those are
-// different claims: zero findings over zero files is what a broken scanner
-// reports, and it is indistinguishable from a clean tree unless the second
-// number is checked. That indistinguishability is the whole reason this package
-// exists.
+// TestGuardsTheRepositoryIsClean asserts both zero findings and a non-zero examined count over the repository.
 func TestGuardsTheRepositoryIsClean(t *testing.T) {
 	root := repoRoot(t)
 
@@ -295,17 +253,7 @@ func TestGuardsRunSurfacesAScanFailure(t *testing.T) {
 	}
 }
 
-// TestGuardsSkipTheirOwnFixtures pins the exclusion that keeps the repository
-// sweep green.
-//
-// The fixtures hold deliberate violations. If the sweep descended into them,
-// every scanner would report them forever and the suite would be permanently
-// red — the shape that gets a guard deleted.
-//
-// It also pins the NARROWNESS of the exclusion: only this package's fixture
-// root is skipped, by exact path. A blanket "skip anything called testdata"
-// would be the scanner blinding itself, which is the failure this package is
-// about.
+// TestGuardsSkipTheirOwnFixtures pins the exact-path exclusion of this package's fixture root.
 func TestGuardsSkipTheirOwnFixtures(t *testing.T) {
 	root := repoRoot(t)
 

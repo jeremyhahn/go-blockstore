@@ -27,25 +27,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// CommandRunner executes an external command and returns its standard output.
-//
-// It is the single seam through which this package touches the system: drbdadm,
-// drbdsetup, the LVM tools, mount and friends all go through it, so unit tests
-// substitute a scripted implementation and never require DRBD, LVM or root.
-//
-// Implementations MUST exec the named binary directly with args as separate
-// argv elements. Passing the call through a shell would defeat the validation
-// this package performs on caller-supplied strings.
-//
-// A command that exits non-zero must be reported as a *CommandError so callers
-// can branch on the exit code — several system tools use the exit code as a
-// primary result rather than as a failure signal (findmnt reports "not found"
-// with 1, blkid with 2).
-//
-// NOTE: this seam is duplicated. pkg/local defines an equivalent one for the
-// same reason, and neither can import the other without pkg/common growing a
-// dependency this package is not free to add. Unifying them in pkg/common is
-// left to the HA wave; see the report on issue #3.
+// CommandRunner executes a binary with separate argv elements, never a shell, and reports a non-zero exit as a *CommandError.
 type CommandRunner interface {
 	Run(ctx context.Context, name string, args ...string) ([]byte, error)
 }
@@ -105,18 +87,6 @@ func exitCode(err error) (int, bool) {
 const maxStderr = 4096
 
 // allowedBinaries is every program this package will exec.
-//
-// Taking the binary name as a parameter is what makes the runner a seam a test
-// can substitute, and also what makes it, read on its own, an arbitrary
-// subprocess launcher. It is not one: the name is checked against this set
-// before the exec, so a bug that let a caller-controlled string reach Run
-// could not turn it into a way to run something else. Arguments are separate
-// argv elements and never touch a shell.
-//
-// The mkfs entries are spelled out because the caller builds that name from a
-// filesystem type. That type is already allowlisted in validate.go; this is the
-// second lock on the same door, and the one that holds if the first is ever
-// widened without thinking about what the name is used for.
 var allowedBinaries = map[string]struct{}{
 	binDRBDAdm:   {},
 	binDRBDSetup: {},
@@ -142,16 +112,7 @@ type execRunner struct {
 	allow map[string]struct{}
 }
 
-// Run implements CommandRunner.
-//
-// The command inherits the process environment with LC_ALL and LANG forced to
-// C, matching the local provider's runner. lvs output is parsed here, and its
-// numeric fields are read as fixed ASCII: a localized build formats
-// data_percent with the locale's decimal separator, and "12,34" reads through
-// strconv.ParseFloat as zero rather than as an error, so every snapshot on such
-// a host would silently report as occupying nothing. The byte counts are
-// integers and would survive, which is exactly why this is worth pinning rather
-// than detecting downstream — the failure is partial and quiet.
+// Run implements CommandRunner with LC_ALL and LANG forced to C, so parsed lvs numbers are not localized.
 func (r execRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	allow := r.allow
 	if allow == nil {

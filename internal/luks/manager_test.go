@@ -44,17 +44,7 @@ func (s scriptedBackend) DataOffset(context.Context, string) (int64, error) {
 	return s.offset, s.offsetErr
 }
 
-// TestMeasureMappingDecidesFreshnessAndRefusesWhatItCannotSize is the
-// stale-mapping measurement, branch by branch.
-//
-// The two answers that matter are a mapping that still covers its device and
-// one that has fallen behind it; the fixture's sizes are the ones a 1 GiB
-// volume with a 16 MiB header produces. Every other shape is a refusal rather
-// than either answer, because the whole point of measuring is to refuse what
-// cannot be established: an unreadable offset, a mapping of no length, a device
-// no larger than its header, and — the shape nothing above should ever act on —
-// a mapping LONGER than the device's data area, which is a device that shrank
-// under a live mapping.
+// TestMeasureMappingDecidesFreshnessAndRefusesWhatItCannotSize covers fresh, stale and every refused shape.
 func TestMeasureMappingDecidesFreshnessAndRefusesWhatItCannotSize(t *testing.T) {
 	const (
 		header = int64(HeaderBytes)

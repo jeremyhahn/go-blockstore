@@ -11,12 +11,7 @@
 // 2. Commercial License
 //    Contact licensing@automatethethings.com for commercial licensing options.
 
-// Package blkdev performs the block-device operations this repository used to
-// reach for dd and blkdiscard to do.
-//
-// Neither binary was doing anything the process cannot do itself: dd is a read
-// loop with a flush, and blkdiscard --zeroout is one ioctl. What they added was
-// a fork, a PATH lookup, and an error surface consisting of an exit status.
+// Package blkdev copies, flushes and zeroes block devices directly, without dd or blkdiscard.
 package blkdev
 
 import (
@@ -30,17 +25,7 @@ import (
 // small enough to stay off the large-object heap path.
 const CopyBufferSize = 4 << 20
 
-// Copy writes the whole of src onto dst and flushes it to stable storage.
-//
-// This is what `dd if=src of=dst bs=4M conv=fsync,nocreat` did. nocreat is
-// structural here rather than a flag: dst is opened without O_CREATE, so a
-// destination that does not exist is an error instead of a new empty file
-// appearing where a device was expected. conv=fsync is the Sync at the end —
-// without it the copy is complete only as far as the page cache, and a caller
-// that goes on to detach the volume can lose the tail.
-//
-// The copy stops early if ctx is canceled. dd had no such property; a canceled
-// context simply left it running to completion.
+// Copy writes the whole of src onto dst (never created) and syncs it; it stops early if ctx is canceled.
 func Copy(ctx context.Context, src, dst string) error {
 	in, err := os.Open(src) // #nosec G304 -- caller-supplied device path, validated by the provider
 	if err != nil {
@@ -67,26 +52,14 @@ func Copy(ctx context.Context, src, dst string) error {
 		return &CopyError{Source: src, Destination: dst, Op: "closing the destination", Err: err}
 	}
 
-	// The transfer honors the context per buffer, but the flush and close after
-	// it do not: on a block device they are the writeback, and they can take
-	// substantial time with no way to interrupt them. A caller whose deadline
-	// expired in there would otherwise be told the copy succeeded and go on to
-	// the next step — for a restore, tagging the volume and reporting it ready
-	// — under a context that has been dead since before the copy finished.
-	//
-	// Same reasoning and same treatment as ZeroOut: what this reports is that
-	// the caller gave up, not that nothing was written.
+	// The flush and close are uninterruptible writeback, so the context is checked again after them.
 	if err := ctx.Err(); err != nil {
 		return &CopyError{Source: src, Destination: dst, Op: "copying", Err: err}
 	}
 	return nil
 }
 
-// contextReader stops a copy when its context is done.
-//
-// io.Copy takes no context, so cancellation has to enter through the reader. The
-// check is per buffer rather than per byte, which for a 4 MiB buffer means a
-// canceled copy stops within one transfer.
+// contextReader stops a copy within one buffer once its context is done.
 type contextReader struct {
 	ctx context.Context
 	r   io.Reader
@@ -99,18 +72,7 @@ func (c *contextReader) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
-// ZeroOut writes zeroes over a range of a block device, from offset to the end.
-//
-// This is `blkdiscard --zeroout --offset N`, which despite the command's name
-// is the BLKZEROOUT ioctl and not BLKDISCARD. The distinction is the whole
-// reason the callers use it: a discard tells the device it may forget a range,
-// and what a later read returns is up to the device — for some, the old
-// contents. BLKZEROOUT guarantees zeroes. Every caller here is destroying a
-// former tenant's data, so a guarantee is the point and the weaker ioctl would
-// quietly not provide it.
-//
-// The range runs to the end of the device, which is what the callers mean and
-// what blkdiscard did with no --length.
+// ZeroOut zeroes a block device from offset to the end with BLKZEROOUT, which guarantees zeroes where a discard does not.
 func ZeroOut(ctx context.Context, device string, offset int64) error {
 	if offset < 0 {
 		return &ZeroOutError{Device: device, Offset: offset, Err: ErrNegativeOffset}
@@ -142,31 +104,14 @@ func ZeroOut(ctx context.Context, device string, offset int64) error {
 		return &ZeroOutError{Device: device, Offset: offset, Size: size, Err: err}
 	}
 
-	// The ioctl cannot be interrupted, and on a large device it is the step that
-	// takes minutes: a caller that gave up did so while it was running, and the
-	// check before it was made long ago. So the context is checked again here.
-	//
-	// What this reports is that the CALLER gave up, not that the device is
-	// untouched — the zeroing above completed, and the volume is zeroed whatever
-	// this returns. Reporting it is still the right way round: every caller uses
-	// a failed wipe to stop short of the deletion that follows, and stopping
-	// leaves a zeroed volume to try again on. Reporting success would hand a
-	// dead context to the next step instead.
+	// The ioctl is uninterruptible; report a caller that gave up meanwhile, even though the range is zeroed.
 	if err := ctx.Err(); err != nil {
 		return &ZeroOutError{Device: device, Offset: offset, Size: size, Err: err}
 	}
 	return nil
 }
 
-// rangeToZero decides what ZeroOut asks the kernel for, given where the caller
-// wants zeroing to start and how large the device turned out to be.
-//
-// It is separate from ZeroOut because it is the part with the decisions in it —
-// an offset past the end is a caller error, an offset exactly at the end is
-// nothing to do, and everything else runs to the end of the device — while the
-// rest of ZeroOut is an open and an ioctl that need a real block device and
-// root to reach. Deciding here means the decisions are checked by the unit
-// tests rather than only by the integration suite.
+// rangeToZero decides the zeroing range for a device size, so the decisions are unit-testable.
 func rangeToZero(offset, size int64) (length uint64, zero bool, err error) {
 	// Checked by ZeroOut before the device is opened; repeated here so this
 	// function's own contract makes the conversion below provably in range.
@@ -199,11 +144,7 @@ func Size(device string) (int64, error) {
 	return size, nil
 }
 
-// Operator is the seam through which a provider reaches these operations.
-//
-// Same reason as the other seams in this repository: the work happens on a real
-// block device, and a test that cannot substitute it can only run as root
-// against hardware it had to build first.
+// Operator is the seam through which a provider reaches these operations, so tests need no real device.
 type Operator interface {
 	// Copy writes the whole of src onto dst and flushes it.
 	Copy(ctx context.Context, src, dst string) error

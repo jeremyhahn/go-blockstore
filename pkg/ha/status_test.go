@@ -108,10 +108,7 @@ func TestPromoteEligibility(t *testing.T) {
 	}
 }
 
-// Every state in the enum must be covered by the table above. A state added to
-// pkg/common without a decision here would otherwise fall into the default
-// branch silently, and "we refused it because we had never heard of it" is a
-// worse answer than a considered one.
+// Every state in the enum must be covered by the table above.
 func TestPromoteEligibilityCoversEveryDeclaredState(t *testing.T) {
 	declared := []common.ReplConnState{
 		common.ReplStateUnknown,
@@ -277,9 +274,7 @@ func TestAdoptEligibility(t *testing.T) {
 	}
 }
 
-// Whatever the adoption gate allows, the promotion gate must too — the reverse
-// is what makes them different, but a state safe to bring INTO service and not
-// safe to keep serving would be incoherent.
+// Every state the promotion gate allows, the adoption gate allows too.
 func TestAdoptionIsNoNarrowerThanPromotion(t *testing.T) {
 	for _, conn := range []common.ReplConnState{
 		common.ReplStateUnknown,

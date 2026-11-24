@@ -13,29 +13,7 @@
 
 //go:build local_integration
 
-// These tests drive the provider against real LVM, LUKS and filesystems. They
-// need root, a loop device, and the lvm2, e2fsprogs and util-linux tooling, so
-// they are selected by a build tag rather than skipped at run time,
-// and they additionally require GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 to
-// acknowledge that they create and destroy storage on the host:
-//
-//	sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 go test -tags local_integration -race ./pkg/local/
-//
-// or, equivalently:
-//
-//	sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 make integration-test-local
-//
-// Selecting them with a tag and failing when the environment is not there is
-// deliberate. A testing.Short guard, or a skip on "not root", turns a suite
-// that never runs into a suite that always passes, and the whole reason these
-// exist is to catch the things a fake CommandRunner cannot: an lvs column that
-// changed name, a device-mapper ioctl the kernel refuses, an option mount(8)
-// rejects.
-//
-// cryptsetup is NOT among the tooling. Nothing here shells out to it — the
-// containers are formatted, unlocked and inspected in-process by go-luks2, the
-// same way the provider does it — so this suite runs on a host that does not
-// have it installed.
+// Real LVM, LUKS and filesystem tests: sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 make integration-test-local (tag local_integration).
 
 package local
 
@@ -71,33 +49,13 @@ import (
 // It has to hold a volume, a grown volume and a snapshot's copy-on-write area.
 const backingSizeMB = 512
 
-// envDestructive is the explicit acknowledgement this suite requires before it
-// touches the host, mirroring GO_BLOCKSTORE_DRBD_ALLOW_DESTRUCTIVE in pkg/drbd.
-// The build tag already keeps this file out of an ordinary `go test`, but the
-// tag alone does not stop `sudo -E go test -tags local_integration ./...` run
-// by reflex on a box whose loop devices and volume groups are not disposable —
-// this suite creates and destroys both. Requiring the variable makes the intent
-// deliberate; the operator supplies it (the Makefile target does not, matching
-// pkg/drbd), e.g. `sudo -E GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE=1 make integration-test-local`.
+// envDestructive must be set to acknowledge that this suite creates and destroys loop devices and volume groups.
 const envDestructive = "GO_BLOCKSTORE_LOCAL_ALLOW_DESTRUCTIVE"
 
 // vgSeq numbers the volume groups within one run so each test gets its own.
 var vgSeq atomic.Uint64
 
-// testVG builds a throwaway volume group on a loopback file and returns its
-// name, tearing the whole thing down when the test ends.
-//
-// THE NAME IS UNIQUE PER TEST, and that is load-bearing rather than tidy. Every
-// test in this file calls this, and the name used to be derived from the pid
-// alone — so all 28 of them shared one volume group name. One test whose
-// teardown could not remove its volume group (a LUKS mapping still holding a
-// logical volume open, which is a standing flake in the close path) left that
-// name in place, and every later test in the same run died in vgcreate with
-// "already exists in filesystem". A run with one real failure reported
-// seventeen, and the first one was the only one worth reading.
-//
-// The pid still leads the name so that debris is attributable to a run, and the
-// sequence number makes one test's wreckage that test's own problem.
+// testVG builds a loopback volume group named per test and run, removed when the test ends.
 func testVG(t *testing.T) string {
 	t.Helper()
 	requireDestructiveEnv(t)
@@ -120,33 +78,14 @@ func testVG(t *testing.T) string {
 	run(t, "pvcreate", "--force", "--yes", loopDev.Path())
 	run(t, "vgcreate", vg, loopDev.Path())
 
-	// ORDER MATTERS, and t.Cleanup is LIFO: the LAST registered runs FIRST.
-	// vgremove cannot remove a volume group whose logical volume a dm-crypt
-	// mapping still holds open — which is exactly the state a failed test
-	// leaves — so the mapping close is registered second and therefore runs
-	// first. Written the other way round it still removes the mapping, just
-	// after the vgremove that needed it gone, and the volume group survives the
-	// run. Measured: with the registrations swapped, a deliberately abandoned
-	// mapping was cleaned up and its volume group still leaked.
+	// t.Cleanup is LIFO: the mapping close is registered second so it runs before vgremove.
 	t.Cleanup(func() { _ = exec.Command("vgremove", "--force", vg).Run() })
 	t.Cleanup(func() { closeMappingsOf(t, vg) })
 
 	return vg
 }
 
-// closeMappingsOf removes the plaintext mappings belonging to one volume group.
-//
-// Scoped by CONSTRUCTION rather than by pattern-matching something that looks
-// like ours: the provider names a mapping "bs-<vg>_<lv>", the volume group name
-// is unique to this test, so everything under that prefix was created by this
-// test and nothing else can be. go-luks2 #96 refuses cleanup that infers
-// ownership from a name; this infers nothing, because the namespace is one this
-// test made up moments ago.
-//
-// It runs BEFORE vgremove and it is best effort. A mapping that will not close
-// is reported rather than retried into a hang — the run has already failed by
-// the time this matters, and what an operator needs then is to know which
-// mapping is stuck.
+// closeMappingsOf closes this test's "bs-<vg>_" mappings before vgremove, best effort.
 func closeMappingsOf(t *testing.T, vg string) {
 	t.Helper()
 
@@ -227,16 +166,7 @@ func luksUUID(t *testing.T, device string) string {
 	return header.UUID()
 }
 
-// moveDataOffset rewrites a container's data segment to start at offset,
-// producing a container this package did not and could not have formatted.
-//
-// It exists because go-luks2 offers no offset option: every container it writes
-// puts its data at 16 MiB, so a test about a FOREIGN header has no way to ask
-// for one. The JSON area is rewritten on disk and both copies' checksums are
-// recomputed, so the result is a valid container rather than a corrupted one.
-// The keyslot area ends at 290816 bytes, far below any offset a caller of this
-// would choose, so nothing is overwritten and the container still opens with
-// its original passphrase.
+// moveDataOffset rewrites a container's data segment offset and both checksums, producing a foreign header.
 func moveDataOffset(t *testing.T, device string, offset int64) {
 	t.Helper()
 
@@ -268,15 +198,7 @@ const (
 // writes in front of the keyslots area.
 const luksHeaderCopyBytes = 16384
 
-// assertFIPSHeader reads a real LUKS2 header and checks the parameters that
-// make the container FIPS-deployable. The library's defaults are not approved —
-// an unset KDF is argon2id and an unset hash is SHA-256 — so these are pinned at
-// format time and verified here rather than trusted.
-//
-// The unit suite makes the same assertions against a container formatted onto a
-// file (TestNativeFormatPinsFIPSParameters); this one makes them against one
-// formatted onto a real logical volume, through the provider, which is the only
-// place a parameter can be lost between Options and the disk.
+// assertFIPSHeader checks the FIPS parameters of a real LUKS2 header formatted through the provider.
 func assertFIPSHeader(t *testing.T, device string) {
 	t.Helper()
 
@@ -330,12 +252,7 @@ func assertFIPSHeader(t *testing.T, device string) {
 	}
 }
 
-// requireDestructiveEnv gates every test through testVG: it fails unless the
-// operator has acknowledged the host cost and is running as root. The
-// acknowledgement is checked FIRST, so an invocation that never meant to touch
-// this host stops before the root check even reports. A missing environment is
-// a hard failure, not a skip — the build tag selected this file, so having been
-// compiled in, it was meant to run (same reasoning as pkg/drbd).
+// requireDestructiveEnv fails unless the acknowledgement is set and the test runs as root.
 func requireDestructiveEnv(t *testing.T) {
 	t.Helper()
 	if os.Getenv(envDestructive) != "1" {
@@ -466,12 +383,7 @@ func TestIntegrationVolumeLifecycle(t *testing.T) {
 	}
 }
 
-// TestIntegrationMountTargetWithASpace drives the findmnt path against a real
-// mountpoint whose name contains a space — the character whose spelling in
-// findmnt's column output depends on the flags and the util-linux version, and
-// which therefore decides whether Unmount can match the target it was given.
-// Reading the report as JSON takes that dependency away, and this is what says
-// so against the findmnt actually installed rather than against a fake.
+// TestIntegrationMountTargetWithASpace mounts and unmounts a real target whose name contains a space.
 func TestIntegrationMountTargetWithASpace(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -696,12 +608,7 @@ func TestIntegrationSnapshotAndRestore(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 
-	// Taking a snapshot must not attach anything. Measured on LVM 2.03.16,
-	// lvcreate --snapshot over a detached origin whose autoactivation is off
-	// leaves BOTH the origin and the new snapshot inactive, with no device
-	// nodes — so a caller that had detached the volume still has it detached.
-	// Asserted here rather than assumed, because the provider's whole
-	// attach/detach model rests on it and a future LVM could change it.
+	// Snapshotting a detached origin leaves origin and snapshot inactive.
 	originStatus, err := p.Status(ctx, vol.ID)
 	if err != nil {
 		t.Fatalf("Status of the origin: %v", err)
@@ -791,20 +698,7 @@ func TestIntegrationSnapshotAndRestore(t *testing.T) {
 	}
 }
 
-// TestIntegrationRestoreDoesNotDisturbAnAttachedOrigin is the coupling that
-// matters most in practice: LVM activates an origin and its snapshots as one
-// unit, so a restore that switched the snapshot off afterwards takes the
-// origin's device node with it.
-//
-// The origin here is attached but deliberately not mounted, which is the state
-// that actually breaks. A mounted origin is protected by LVM itself — lvchange
-// refuses to deactivate a logical volume with a filesystem open on it — so a
-// test that mounted the origin would pass against the bug and prove nothing.
-// TestIntegrationRestoreAfterGrowingTheOrigin drives the case where an origin's
-// current size and the size its snapshot presents have diverged. LVM permits
-// growing an origin that has snapshots while it is INACTIVE, which is the state
-// this provider leaves volumes in, so the divergence arises through this API
-// alone: Provision, Snapshot, Resize, restore.
+// TestIntegrationRestoreAfterGrowingTheOrigin restores a snapshot taken before its inactive origin was grown.
 func TestIntegrationRestoreAfterGrowingTheOrigin(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -847,7 +741,7 @@ func TestIntegrationRestoreAfterGrowingTheOrigin(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 
-	// Grow the origin AFTER snapshotting. From here the two sizes differ.
+	// Grow the origin after snapshotting.
 	if err := p.Resize(ctx, vol.ID, 192<<20); err != nil {
 		t.Fatalf("Resize the origin: %v", err)
 	}
@@ -894,6 +788,7 @@ func TestIntegrationRestoreAfterGrowingTheOrigin(t *testing.T) {
 	}
 }
 
+// TestIntegrationRestoreDoesNotDisturbAnAttachedOrigin restores beside an attached, unmounted origin and requires it to stay attached.
 func TestIntegrationRestoreDoesNotDisturbAnAttachedOrigin(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -951,19 +846,7 @@ func TestIntegrationRestoreDoesNotDisturbAnAttachedOrigin(t *testing.T) {
 	}
 }
 
-// TestIntegrationWipeOnDelete drives the wipe against a real logical volume:
-// that blkdiscard --zeroout accepts the flag and the device, that it clears the
-// volume, and that Delete still removes it afterwards.
-//
-// It deliberately does not try to demonstrate the exposure the wipe exists to
-// close — that a deleted volume's contents survive in the extents LVM hands to
-// the next volume. Whether they survive depends on the storage underneath: with
-// devices/issue_discards=1 and a backing device that supports discard (a
-// loopback file on a modern filesystem, which is what these tests build on),
-// lvremove discards the extents and they read back as zeroes regardless of this
-// option. The LVM default is issue_discards=0, and rotating disks do not
-// discard at all, which is where the option earns its keep. A test asserting
-// remanence here would pass for reasons that have nothing to do with the code.
+// TestIntegrationWipeOnDelete runs the blkdiscard --zeroout wipe on a real LV and checks Delete still removes it.
 func TestIntegrationWipeOnDelete(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -1105,9 +988,7 @@ func TestIntegrationEncryptedVolume(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	// An attached encrypted volume is REFUSED rather than resized, and the
-	// mapping the mount is sitting on is untouched by the refusal — which is
-	// checked below by continuing to use it.
+	// An attached encrypted volume is refused, and its mapping keeps working.
 	if err := p.Resize(ctx, vol.ID, 96<<20); !errors.Is(err, ErrResizeWhileAttached) {
 		t.Fatalf("Resize while attached = %v, want ErrResizeWhileAttached", err)
 	}
@@ -1159,13 +1040,7 @@ func TestIntegrationEncryptedVolume(t *testing.T) {
 	}
 }
 
-// TestIntegrationWrongKeyIsRejected checks that the passphrase is actually
-// protecting the container rather than being accepted decoratively.
-// TestIntegrationDetachedEncryptedResize proves the filesystem inside a locked
-// container really grows. The volume is resized while DETACHED — the state
-// where the provider has to unlock it itself, because Attach only opens a
-// container and never grows what is inside one — and then attached and mounted
-// so the filesystem's own idea of its size can be read back.
+// TestIntegrationDetachedEncryptedResize grows a detached encrypted volume and reads the filesystem size back after mounting.
 func TestIntegrationDetachedEncryptedResize(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -1255,10 +1130,7 @@ func mountedFSBytes(t *testing.T, ctx context.Context, p *Provider, volID, targe
 	return size
 }
 
-// TestIntegrationForeignMappingIsRefused builds the hazard for real: a mapping
-// opened by hand under this provider's deterministic name, over a DIFFERENT
-// volume. device-mapper reports it active under that name, so a provider
-// trusting the name would return somebody else's decrypted device from Attach.
+// TestIntegrationForeignMappingIsRefused opens a mapping under the provider's name over another volume; Attach must refuse it.
 func TestIntegrationForeignMappingIsRefused(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -1310,6 +1182,7 @@ func TestIntegrationForeignMappingIsRefused(t *testing.T) {
 	t.Logf("Attach correctly refused: %v", err)
 }
 
+// TestIntegrationWrongKeyIsRejected requires a wrong passphrase to be refused.
 func TestIntegrationWrongKeyIsRejected(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -1383,17 +1256,7 @@ func deviceSizeBytes(t *testing.T, device string) int64 {
 	return size
 }
 
-// TestIntegrationEncryptedVolumeDeliversTheRequestedCapacity is the assertion
-// behind the sizing rule: VolumeSpec.SizeBytes is what the CALLER CAN USE, so
-// the plaintext mapping an encrypted volume attaches as must be at least that
-// large. Before the rule it was a LUKS header SHORT of it, and nothing said so.
-//
-// It also pins the constant the sizing arithmetic is built on. luksHeaderBytes
-// is a measurement — 16 MiB, taken from cryptsetup 2.7.0 and re-taken from
-// go-luks2 with the parameters this provider formats with — and a measurement
-// in a comment rots. Here the
-// same figure is derived from a real container: the logical volume's size less
-// the mapping's, which is by definition what the header cost.
+// TestIntegrationEncryptedVolumeDeliversTheRequestedCapacity checks the mapping holds the requested size and the header is luksHeaderBytes.
 func TestIntegrationEncryptedVolumeDeliversTheRequestedCapacity(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -1471,16 +1334,7 @@ func TestIntegrationEncryptedVolumeDeliversTheRequestedCapacity(t *testing.T) {
 	}
 }
 
-// TestIntegrationReencryptingRestore is ruling #11b end to end: a snapshot of a
-// PLAINTEXT volume restored by a provider configured to encrypt produces an
-// encrypted volume holding the same data.
-//
-// The two assertions that matter pull in opposite directions and are both
-// required. The data has to survive — attach, mount, and the files read back
-// byte-identical — and the plaintext must NOT survive anywhere it could be
-// read: the logical volume is scanned for the marker, and finding it would mean
-// the copy went onto the extents instead of through the mapping, which is the
-// silent downgrade this path exists to avoid.
+// TestIntegrationReencryptingRestore restores a plaintext snapshot through an encrypting provider: data survives and no plaintext reaches the LV.
 func TestIntegrationReencryptingRestore(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -1525,8 +1379,7 @@ func TestIntegrationReencryptingRestore(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = plain.DeleteSnapshot(ctx, snapID) })
 
-	// An encrypting provider restores it. Before ruling #11b this returned
-	// ErrUnsupported.
+	// An encrypting provider restores it.
 	enc, err := New(Options{
 		VolumeGroup: vg,
 		NodeID:      "test-node",
@@ -1597,15 +1450,7 @@ func TestIntegrationReencryptingRestore(t *testing.T) {
 	}
 }
 
-// TestIntegrationEncryptedSourceRestorePreservesTheHeader is the other half of
-// ruling #11b. A snapshot of an ENCRYPTED volume is ciphertext at the logical
-// volume level, so it is copied verbatim and the restored volume keeps its
-// source's header — which is checked here by UUID, the one field that would
-// change if the container had been reformatted.
-//
-// Reformatting would be destructive rather than merely different: a fresh
-// header carries a fresh master key, and ciphertext copied over it decrypts to
-// nothing. The mount at the end is what proves that did not happen.
+// TestIntegrationEncryptedSourceRestorePreservesTheHeader: an encrypted snapshot is copied verbatim, keeping its header UUID, and still mounts.
 func TestIntegrationEncryptedSourceRestorePreservesTheHeader(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -1660,11 +1505,7 @@ func TestIntegrationEncryptedSourceRestorePreservesTheHeader(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = p.DeleteSnapshot(ctx, snapID) })
 
-	// Sized at the source's USABLE capacity, which under the sizing rule is
-	// simply the size the source was provisioned at: the header the source
-	// carries is subtracted from its image and added back to the restore, and
-	// the two cancel. That the same number works on both ends is the point of
-	// the rule.
+	// Sized at the source's usable capacity, its provisioned size.
 	restored, err := p.Provision(ctx, common.VolumeSpec{
 		Name:             "restored",
 		SizeBytes:        64 << 20,
@@ -1710,14 +1551,7 @@ func TestIntegrationEncryptedSourceRestorePreservesTheHeader(t *testing.T) {
 	_ = info
 }
 
-// TestIntegrationEncryptedRestoreRefusesAKeyThatWouldNotOpenIt drives the
-// key check against a real LUKS header rather than a fake error.
-//
-// The KeyProvider here holds a distinct key per volume, which the interface
-// explicitly allows — and which is exactly what makes a verbatim restore
-// dangerous, since the restored volume opens only with its SOURCE's passphrase.
-// Without the check this restore would succeed and the volume would be
-// unreadable forever.
+// TestIntegrationEncryptedRestoreRefusesAKeyThatWouldNotOpenIt checks the restore key against the real header.
 func TestIntegrationEncryptedRestoreRefusesAKeyThatWouldNotOpenIt(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -1772,14 +1606,7 @@ func lvTags(t *testing.T, vg, lv string) string {
 	return strings.TrimSpace(run(t, "lvs", "--noheadings", "-o", "lv_tags", vg+"/"+lv))
 }
 
-// TestIntegrationEncryptionIsRememberedAcrossDetach is the ruling that made the
-// tag exist, driven against real LVM.
-//
-// A detached encrypted volume has no device node — there is nothing to probe,
-// and Status holds no lock and will not activate one to look. Before the tag it
-// could only report its backing size, a LUKS header more than its usable
-// capacity. Here the same volume is asked while attached and while detached and
-// has to give the same answer both times.
+// TestIntegrationEncryptionIsRememberedAcrossDetach: Status reports the same usable size attached and detached.
 func TestIntegrationEncryptionIsRememberedAcrossDetach(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -1801,8 +1628,7 @@ func TestIntegrationEncryptionIsRememberedAcrossDetach(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = p.Delete(ctx, vol.ID) })
 
-	// Provision leaves the volume DETACHED, so this is the state the tag exists
-	// for — and it is the very first thing asked of the volume.
+	// Provision leaves the volume detached.
 	if tags := lvTags(t, vg, vol.ID); !strings.Contains(tags, encryptedTagPrefix) {
 		t.Fatalf("lv_tags = %q, want it to contain %q", tags, encryptedTagPrefix)
 	}
@@ -1840,12 +1666,7 @@ func TestIntegrationEncryptionIsRememberedAcrossDetach(t *testing.T) {
 	}
 }
 
-// TestIntegrationLegacyVolumeIsRetaggedOnAttach is the migration path. A volume
-// provisioned before the tag existed carries none; the fleet heals one attach at
-// a time rather than needing a migration pass.
-//
-// The legacy volume is built by provisioning normally and then stripping the
-// tag, which is exactly the on-disk state such a volume is in.
+// TestIntegrationLegacyVolumeIsRetaggedOnAttach: an untagged volume gets its tag on the next Attach.
 func TestIntegrationLegacyVolumeIsRetaggedOnAttach(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -1872,10 +1693,7 @@ func TestIntegrationLegacyVolumeIsRetaggedOnAttach(t *testing.T) {
 		t.Fatalf("the tag survived deltag: %q", tags)
 	}
 
-	// Untagged and detached: the documented legacy fallback. It reports the
-	// BACKING size, which OVER-states usable capacity by exactly one header —
-	// pinned here rather than merely described, because this is the deviation
-	// the ruling scoped down to legacy volumes and it should not drift.
+	// Untagged and detached reports the backing size, one header more than usable.
 	legacy, err := p.Status(ctx, vol.ID)
 	if err != nil {
 		t.Fatalf("Status: %v", err)
@@ -1928,25 +1746,7 @@ func deviceSizeBytesOfLV(t *testing.T, vg, lv string) int64 {
 	return size
 }
 
-// TestIntegrationDetachedForeignHeaderReportsCorrectly is Codex's finding driven
-// against real LVM and a real container: a volume restored VERBATIM from a
-// container whose header is not the size this package formats.
-//
-// The restore measures that header to size the volume, so the tag records the
-// measured number. Recording only "encrypted" and assuming 16 MiB would misstate
-// the detached capacity by the difference — and in the direction that matters,
-// since a header larger than the default makes Status over-state what the volume
-// can hold.
-//
-// The foreign container is made by formatting one with this package's own
-// parameters and then MOVING its data segment to a deliberately non-default
-// offset, and snapshotting it. Rewriting the header is how a foreign container
-// gets built without a foreign tool: go-luks2 has no offset option, and every
-// container it formats lands at 16 MiB, so there is no way to ask it for one
-// that differs. The rewrite is honest — the header is re-checksummed and the
-// container still opens with the same passphrase, since the keyslot area ends
-// well before 4 MiB — and it is what a container written by an older release,
-// or by an operator's own cryptsetup --offset, looks like to this provider.
+// TestIntegrationDetachedForeignHeaderReportsCorrectly restores a container with a moved data offset and checks the tag records the measured header.
 func TestIntegrationDetachedForeignHeaderReportsCorrectly(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -2011,14 +1811,13 @@ func TestIntegrationDetachedForeignHeaderReportsCorrectly(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = p.Delete(ctx, restored.ID) })
 
-	// The tag records what was MEASURED, not what this package would format.
+	// The tag records the measured header size.
 	tags := lvTags(t, vg, restored.ID)
 	if !strings.Contains(tags, encryptedTagFor(foreignHeader)) {
 		t.Fatalf("lv_tags = %q, want it to record the source's %d-byte header", tags, foreignHeader)
 	}
 
-	// And detached Status uses it. Assuming the default here would report
-	// 12 MiB MORE than the volume can hold.
+	// Detached Status uses the tag.
 	detached, err := p.Status(ctx, restored.ID)
 	if err != nil {
 		t.Fatalf("Status while detached: %v", err)
@@ -2041,14 +1840,7 @@ func TestIntegrationDetachedForeignHeaderReportsCorrectly(t *testing.T) {
 	}
 }
 
-// TestIntegrationWrongTagIsRefusedThenRepaired drives the whole tag-authority
-// loop against real LVM and a real container: a tag that disagrees with the
-// container is refused while the volume is up, and an Attach — the one
-// operation holding the lock — re-records it from the header and clears the
-// refusal.
-//
-// The wrong tag is produced the way a real one would go stale: by editing it out
-// of band with lvchange, which is exactly the situation the check exists for.
+// TestIntegrationWrongTagIsRefusedThenRepaired: a tag edited with lvchange is refused while active and re-recorded by Attach.
 func TestIntegrationWrongTagIsRefusedThenRepaired(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -2087,8 +1879,7 @@ func TestIntegrationWrongTagIsRefusedThenRepaired(t *testing.T) {
 		t.Fatalf("lv_tags = %q, want the drifted tag in place for this test to mean anything", tags)
 	}
 
-	// DETACHED, the lie is believed — there is no probe, and this is exactly
-	// why a wrong tag must not be allowed to survive an attach.
+	// Detached, the tag is believed.
 	drifted, err := p.Status(ctx, vol.ID)
 	if err != nil {
 		t.Fatalf("Status while detached with a drifted tag: %v", err)
@@ -2097,8 +1888,7 @@ func TestIntegrationWrongTagIsRefusedThenRepaired(t *testing.T) {
 		t.Errorf("the drifted tag changed nothing (%d); the fixture did not take", drifted.SizeBytes)
 	}
 
-	// ACTIVE, it is refused: the container's real header contradicts the tag,
-	// and this is the last moment anything can see that.
+	// Active, the header contradicts the tag and Status refuses.
 	run(t, "lvchange", "--activate", "y", "--yes", vg+"/"+vol.ID)
 	if _, err := p.Status(ctx, vol.ID); err == nil {
 		t.Error("Status accepted a tag that disagrees with the container's own header")
@@ -2128,27 +1918,7 @@ func TestIntegrationWrongTagIsRefusedThenRepaired(t *testing.T) {
 	}
 }
 
-// TestIntegrationResizeDoesNotDestroyTheMappingItCannotGrow is the scenario
-// that motivated ErrResizeWhileAttached, run against a real dm-crypt mapping.
-//
-// The hazard it rules out: a resize implemented as "remove the mapping, unlock
-// again" is fine until the second half fails, and then the caller — who asked
-// for a bigger volume and got an error — no longer has a plaintext device at
-// all. The volume is not corrupt, but nothing can read it until somebody
-// notices and re-attaches, and whatever was using the device is holding a
-// dangling path. That is strictly worse than the resize simply not happening,
-// and the cryptsetup implementation this package migrated from did not have it,
-// so shipping it would have been a regression the migration introduced.
-//
-// The trigger staged here is the realistic one rather than a contrived fault: a
-// KeyProvider ROTATED since the volume was attached. The mapping is live and
-// working — it was opened with the old key and dm-crypt does not care what the
-// KeyProvider says afterwards — while the key the provider would have to unlock
-// with no longer opens the container. A teardown-and-rebuild resize succeeds at
-// the teardown and fails at the rebuild, every time.
-//
-// The assertion is not that Resize fails. It is that AFTER it fails, the
-// mapping is still there and still usable.
+// TestIntegrationResizeDoesNotDestroyTheMappingItCannotGrow: after a rotated key makes Resize fail, the mapping is still there and usable.
 func TestIntegrationResizeDoesNotDestroyTheMappingItCannotGrow(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -2227,16 +1997,7 @@ func TestIntegrationResizeDoesNotDestroyTheMappingItCannotGrow(t *testing.T) {
 	}
 }
 
-// TestIntegrationBlockDeviceOperations drives internal/blkdev against a real
-// logical volume, which is the only place its two remaining operations can be
-// checked at all.
-//
-// Both need a block device opened for writing, so a unit test can reach their
-// refusals and nothing else: BLKGETSIZE64 and BLKZEROOUT are answered by a
-// driver, and a regular file's driver answers ENOTTY. What is proved here is
-// what the callers depend on and what the weaker ioctl would not have given
-// them — that after the call, the bytes that were there are zeroes, rather than
-// a range the device is free to remember.
+// TestIntegrationBlockDeviceOperations checks BLKGETSIZE64 and BLKZEROOUT on a real LV, reading back zeroes.
 func TestIntegrationBlockDeviceOperations(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -2306,10 +2067,7 @@ func TestIntegrationBlockDeviceOperations(t *testing.T) {
 	}
 }
 
-// TestIntegrationCopyMovesAWholeDevice covers the other half of the conversion:
-// the copy that used to be dd. A regular file exercises the loop, but only a
-// device proves the copy is whole-device and flushed — the property a restore
-// depends on when the volume is detached immediately afterwards.
+// TestIntegrationCopyMovesAWholeDevice checks the copy is whole-device and flushed.
 func TestIntegrationCopyMovesAWholeDevice(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -2353,18 +2111,7 @@ func TestIntegrationCopyMovesAWholeDevice(t *testing.T) {
 	}
 }
 
-// TestIntegrationMountTableIdentifiesTheDeviceByNumber is the round trip that
-// decides whether any mount lookup finds anything, checked where it can be:
-// against a real logical volume this test built.
-//
-// It cannot live in the unit suite, which runs in a container on CI — a
-// container has a mount table and no device nodes to stat, so a test needing
-// one fails there while passing on a workstation. The detail it pins would
-// otherwise be found by nobody: /proc/self/mountinfo prints major:minor in
-// DECIMAL, while the obvious way to obtain the same pair for comparison —
-// stat's %t:%T — prints hex. Read one as the other and every mount lookup
-// silently matches nothing, which this provider reports as "not mounted" and
-// acts on by destroying a volume.
+// TestIntegrationMountTableIdentifiesTheDeviceByNumber: mountinfo prints major:minor in decimal.
 func TestIntegrationMountTableIdentifiesTheDeviceByNumber(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -2425,16 +2172,7 @@ func TestIntegrationMountTableIdentifiesTheDeviceByNumber(t *testing.T) {
 	}
 }
 
-// TestIntegrationMountPropagationGuard drives the propagation guard against the
-// real kernel, in both directions, because a guard is only as good as the two
-// answers it gives: it must refuse a mount the workload could not see, and it
-// must NOT refuse one it could.
-//
-// Neither half is reachable without root and a real mount. Propagation is
-// inherited from the parent at the moment mount(2) is called, so producing a
-// shared mount means making a parent shared first — which is exactly the
-// operator action the finding's remedy tells somebody to perform, exercised
-// here rather than described.
+// TestIntegrationMountPropagationGuard requires the guard to refuse an invisible mount and accept a visible one, on the real kernel.
 func TestIntegrationMountPropagationGuard(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -2503,11 +2241,7 @@ func TestIntegrationMountPropagationGuard(t *testing.T) {
 	})
 
 	t.Run("an unmounted path is refused rather than answered", func(t *testing.T) {
-		// The fail-closed half, which needs a real block device to ask ABOUT
-		// and so cannot live in the unit suite: CI runs that in a container,
-		// and a container has no device node to name. "Nothing is mounted
-		// there" is not an answer about propagation, and a guard reading it as
-		// one would pass the case where the mount is missing entirely.
+		// Asked about a device mounted nowhere, the guard must refuse.
 		_, _, _, err := (mountinfo.System{}).PropagationOf(ctx, p.lvPath(vol.ID), filepath.Join(t.TempDir(), "nowhere"))
 		if !errors.Is(err, mountinfo.ErrNotMounted) {
 			t.Fatalf("PropagationOf of an unmounted path = %v, want ErrNotMounted", err)
@@ -2515,13 +2249,7 @@ func TestIntegrationMountPropagationGuard(t *testing.T) {
 	})
 
 	t.Run("a symlinked target never reaches the guard", func(t *testing.T) {
-		// The guard looks the target up in the kernel's table by the string it
-		// was given, which would be wrong if mount(2) could resolve that string
-		// to some other path. It cannot: the mounter pins the target with
-		// openat2 under RESOLVE_NO_SYMLINKS, so a symlink at the final
-		// component or at any parent is refused before anything is mounted.
-		// This pins the ORDERING — the refusal is the mounter's, not the
-		// guard's, and no mount is left behind for the guard to judge.
+		// The mounter refuses a symlinked target before mounting, so no mount is left for the guard.
 		link := filepath.Join(t.TempDir(), "link")
 		if err := os.Symlink(target, link); err != nil {
 			t.Fatalf("Symlink: %v", err)
@@ -2575,18 +2303,7 @@ func TestIntegrationMountPropagationGuard(t *testing.T) {
 	})
 }
 
-// TestIntegrationOrphanReaper drives the inspection against a real LUKS
-// container and a real device-mapper mapping, which is the only place the
-// identity proof can be checked: it reads /dev and /sys, and the mapping it
-// judges was made by a real unlock.
-//
-// The boot that "ended" is supplied rather than waited for — a test cannot
-// reboot the host — but everything else is real: a real volume, a real mapping,
-// and a real record written on it before the mapping existed.
-//
-// Nothing here removes anything, because the code no longer can. What is
-// verified is that each verdict is reached correctly against real state, and
-// that every one of them leaves the mapping exactly where it was.
+// TestIntegrationOrphanReaper inspects a real mapping against a supplied ended boot; every verdict leaves the mapping in place.
 func TestIntegrationOrphanReaper(t *testing.T) {
 	vg := testVG(t)
 	ctx := context.Background()
@@ -2750,14 +2467,7 @@ func TestIntegrationKeyFileContainment(t *testing.T) {
 	})
 
 	t.Run("the volume's own file at the key's path is refused on a FIRST mount", func(t *testing.T) {
-		// The case the existing-mounts check structurally cannot see, because
-		// on a first mount the volume has no mount points to inspect.
-		//
-		// The volume already contains a file called "planted.key". A host file
-		// of the same name sits in the directory it is about to be mounted on,
-		// and that host file is what the configuration names. After the mount
-		// that path would resolve to the VOLUME's file — so the provider's key
-		// would be a file inside the volume it just handed over.
+		// First mount: a same-named host key file under the target would resolve to the volume's file after the mount.
 		staging := t.TempDir()
 		if err := p.Mount(ctx, vol.ID, staging, common.MountOptions{}); err != nil {
 			t.Fatalf("Mount for staging: %v", err)

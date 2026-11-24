@@ -18,20 +18,7 @@ import (
 	"sync"
 )
 
-// Fake is a Mounter that records what it was asked to do instead of doing it.
-//
-// It lives beside the seam rather than in each provider's test files for the
-// same reason the seam itself does: two fakes for one interface drift, and a
-// provider whose fake accepts a call the real Mounter would refuse is a
-// provider whose tests pass for the wrong reason. pkg/local and pkg/drbd drive
-// this one.
-//
-// It is in a non-test file because it is consumed across package boundaries,
-// which a _test.go file cannot be. It is exported from an INTERNAL package, so
-// it is still unreachable from outside this module.
-//
-// The zero value is ready to use, and it is safe for concurrent use — the
-// providers' tests race their operations against each other deliberately.
+// Fake is a Mounter that records calls instead of mounting; its zero value is ready and safe for concurrent use.
 type Fake struct {
 	mu         sync.Mutex
 	mounts     []Call
@@ -65,11 +52,7 @@ func (f *Fake) Mount(_ context.Context, source, target, fsType string, flags uin
 	return err
 }
 
-// OnMount registers a function to run as a mount is made.
-//
-// It is how a test reaches the window after mount(2) has succeeded and before
-// whatever the caller does next — the window a compensating action has to
-// survive, since the most likely thing to happen in it is the caller giving up.
+// OnMount registers a function to run after a mount is made, before the caller continues.
 func (f *Fake) OnMount(hook func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -30,12 +30,7 @@ const (
 	// something may be using it right now. Never touched.
 	VerdictLive MappingVerdict = "live"
 
-	// VerdictForeignNode means the record names a DIFFERENT node.
-	//
-	// On shared storage the volume group is visible to every node, so this is
-	// an ordinary state and emphatically not an orphan: the other node's
-	// workload is using it. Reaping on the boot ID alone would tear it down,
-	// because another node's live boot never matches this node's.
+	// VerdictForeignNode means the record names a different node; on shared storage that is not an orphan.
 	VerdictForeignNode MappingVerdict = "another node's"
 
 	// VerdictOrphaned means this node made the mapping on a boot that has
@@ -48,18 +43,7 @@ const (
 	// volume its name claims. Reported, never removed.
 	VerdictUnattributable MappingVerdict = "unattributable"
 
-	// VerdictLivenessUnknown means ownership WAS established — this node, the
-	// boot that is still running — and the configured liveness oracle could not
-	// say whether the attachment's owner is still there.
-	//
-	// It is its own verdict rather than being folded into either neighbor,
-	// because both neighbors would be a lie told by a broken instrument. Read
-	// as live, an oracle outage makes a fleet of abandoned mappings look
-	// healthy; read as orphaned, it points anything acting on these verdicts at
-	// volumes live workloads are using. Naming the third state is what lets an
-	// operator see that the check itself is what failed — the same trade
-	// preflight makes with CauseIndeterminate, and the same one Posture makes
-	// by reporting NOT CHECKED beside checked.
+	// VerdictLivenessUnknown means this node and running boot own the mapping and the liveness oracle could not answer.
 	VerdictLivenessUnknown MappingVerdict = "liveness unknown"
 )
 
@@ -122,22 +106,7 @@ func Orphaned(findings []MappingFinding) []MappingFinding {
 	return orphans
 }
 
-// InspectMappings finds every plaintext mapping this provider owns and says
-// what it concluded about each, without changing anything.
-//
-// It never enumerates device-mapper. The candidate set is derived from the
-// volumes in THIS provider's own volume group, and for each one it asks whether
-// a mapping exists under the name this provider itself would have chosen. A
-// mapping belonging to anything else is not in the candidate set at all, which
-// is a stronger property than filtering an enumeration by a name pattern: a
-// name is not evidence of ownership, and treating it as such is how a reaper
-// destroys state it did not create (go-luks2 #96).
-//
-// Ownership then has to be POSITIVE and it takes two independent facts that
-// agree: the deterministic name, and the mapping's backing device being the
-// very volume that name encodes. Both come from mechanisms that already fail
-// closed — Mapping and Identity refuse a mapping whose backing device cannot be
-// established rather than guessing.
+// InspectMappings reports every plaintext mapping this provider owns, by name and backing device, without changing anything; it never enumerates device-mapper.
 func (p *Provider) InspectMappings(ctx context.Context) ([]MappingFinding, error) {
 	lvs, err := p.listLVs(ctx)
 	if err != nil {
@@ -175,10 +144,7 @@ func (p *Provider) inspectMapping(ctx context.Context, lv *lvInfo, self mappingO
 
 	info, open, err := p.luks.Mapping(ctx, name)
 	if err != nil {
-		// The mapping exists and its identity could not be established. That is
-		// the unattributable case in its purest form, and it is reported rather
-		// than allowed to abort the sweep: one unreadable mapping must not hide
-		// the others.
+		// Unattributable; reported without aborting the sweep.
 		return MappingFinding{
 			VolumeID: lv.Name,
 			Mapping:  name,
@@ -197,8 +163,7 @@ func (p *Provider) inspectMapping(ctx context.Context, lv *lvInfo, self mappingO
 		BackingID: info.BackingID,
 	}
 
-	// The second of the two facts: this mapping must decrypt THIS volume, not
-	// merely carry the name this provider would have given it.
+	// The mapping must decrypt this volume.
 	wantID, idErr := p.luks.Identity(ctx, p.lvPath(lv.Name))
 	switch {
 	case idErr != nil:
@@ -211,57 +176,7 @@ func (p *Provider) inspectMapping(ctx context.Context, lv *lvInfo, self mappingO
 		return finding, true, nil
 	}
 
-	// ─────────────────────────────────────────────────────────────────────────
-	// THE CRITERION. Read this before changing any case below it.
-	//
-	// Nothing here tears anything down. This provider REPORTS what it finds and
-	// removes nothing, because the fact that would make removal safe does not
-	// exist yet (issue #41). The verdicts below are a classification, and this
-	// comment is about what happens when somebody gives them teeth.
-	//
-	// VerdictOrphaned is deliberately almost unreachable. A device-mapper
-	// mapping is kernel state and does not survive a reboot — nothing recreates
-	// a bs-* mapping at boot — so "the record names a boot that has ended AND
-	// the mapping is still open" describes a state the kernel does not normally
-	// produce. The abandoned-init-container case that motivates all of this
-	// happens while the host STAYS UP, and this criterion cannot see it.
-	//
-	// Somebody will eventually notice that and loosen the predicate. Every
-	// available way to loosen it would, if anything acted on the result, take
-	// down a LIVE attachment:
-	//
-	//   - Dropping the NODE conjunct. On shared storage the volume group is
-	//     visible to every node, and another node's live mapping was made on
-	//     that node's boot — which never matches this one's. That reads as
-	//     orphaned while somebody's workload is using it. This is the one that
-	//     does not look dangerous.
-	//   - Accepting "the dm device's open count is 0". Retracted upstream:
-	//     go-luks2 #96 measured it identical for a live job mid-run.
-	//   - Accepting "the volume is not mounted anywhere". A workload can hold
-	//     the block device open raw, without ever mounting it.
-	//
-	// The missing ingredient is a LIVENESS FACT — something that says the
-	// attachment's owner is gone — and this provider cannot produce one: it
-	// holds no lease and writes no attachment record beyond this one, by
-	// design. Whether an attachment HAS an owner at all is a property of the
-	// deployment rather than of a block provider, so it is asked rather than
-	// decided here: Options.LivenessOracle is the seam, pkg/ha answers it from
-	// the lease it already holds and a CSI node plugin from the pod that
-	// consumes the staged volume (issue #41).
-	//
-	// The oracle is consulted at exactly ONE case below — this node, the boot
-	// that is still running — and that placement is the whole of its authority.
-	// It is the only case the boot ID cannot settle. It is deliberately NOT
-	// consulted on the ended-boot case, which is already proof and where an
-	// oracle could only weaken a verdict this code reaches on its own: routing
-	// that through a call that can fail would let an oracle outage erase
-	// findings that need no oracle. It is not consulted on another node's
-	// mapping either, which is not this node's to reclaim however dead its
-	// owner is.
-	//
-	// The tests below pin each conjunct and go red if one is removed. They tell
-	// you WHAT broke; this comment is the one that tells you why not to.
-	// ─────────────────────────────────────────────────────────────────────────
+	// Nothing here tears anything down; the verdicts are a classification. VerdictOrphaned needs this node and an ended boot; the oracle is consulted only for this node's running boot.
 	owner, recorded, ownerErr := lv.mappingOwner()
 	finding.Owner, finding.Recorded = owner, recorded
 	switch {
@@ -287,20 +202,7 @@ func (p *Provider) inspectMapping(ctx context.Context, lv *lvInfo, self mappingO
 // without asking anybody.
 const madeOnThisBoot = "made by this node on the boot that is still running"
 
-// sameBootVerdict decides about a mapping this node made on the boot that is
-// still running — the one case the boot ID cannot settle, and the one the
-// motivating failure lives in: an init container attaches, mounts, exits, and
-// the host stays up.
-//
-// With NO oracle the answer is the one this package reached before the seam
-// existed. That is a deliberate default rather than a gap left open: a
-// deployment where an attachment has no owner to outlive has nothing to inject,
-// and turning its every mapping into a warning would make the report unreadable
-// for the deployments that are behaving correctly. Posture reports the absence
-// so it is legible rather than inferred from a missing line.
-//
-// An oracle that CANNOT ANSWER is neither of the two answers. See
-// VerdictLivenessUnknown.
+// sameBootVerdict decides a mapping from this node's running boot: live without an oracle, otherwise the oracle's answer or VerdictLivenessUnknown.
 func (p *Provider) sameBootVerdict(ctx context.Context, volID string) (MappingVerdict, string) {
 	if p.liveness == nil {
 		return VerdictLive, madeOnThisBoot
@@ -320,18 +222,7 @@ func (p *Provider) sameBootVerdict(ctx context.Context, volID string) (MappingVe
 	}
 }
 
-// RunReaper sweeps once for every tick, until the context is done.
-//
-// The caller supplies the tick, so this holds no timer of its own and never
-// sleeps: a test drives it by sending on a channel and gets a deterministic
-// sweep rather than a wall-clock wait, and a component in production supplies a
-// time.Ticker. Each sweep's findings go to report, which is what makes a reaped
-// mapping an audit event rather than a silent removal.
-//
-// A sweep that fails is reported and does not stop the loop. The condition that
-// broke one sweep — an LVM tool that failed, a mapping whose identity could not
-// be read — is very often gone by the next, and a reaper that exits on the
-// first failure stops being a guard at the moment something is wrong.
+// RunReaper sweeps once per tick until ctx is done, sending findings to report; a failed sweep does not stop the loop.
 func (p *Provider) RunReaper(ctx context.Context, tick <-chan struct{}, report func([]MappingFinding, error)) error {
 	sweep := func() {
 		findings, err := p.InspectMappings(ctx)
@@ -340,10 +231,7 @@ func (p *Provider) RunReaper(ctx context.Context, tick <-chan struct{}, report f
 		}
 	}
 
-	// A sweep at startup, before the first tick: the orphans this exists to
-	// find are made by something that ALREADY died, so they are present the
-	// moment the process starts and waiting a whole interval to look would be
-	// waiting for nothing.
+	// Sweep once at startup, before the first tick.
 	sweep()
 
 	for {

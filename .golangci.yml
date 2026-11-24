@@ -1,27 +1,11 @@
-# golangci-lint v2 configuration for go-blockstore.
-# The single source of lint truth for the repo (project-scaffold.md §5) — the
-# `lint` Makefile target and the CI lint job both run golangci-lint over it.
-#
-# THE TIME BUDGET IS NOT DECLARED HERE. `run.timeout` in this file is silently
-# overridden by a `--timeout` flag, and both `make golangci-lint` and the CI
-# lint job pass one (go-qrdb#60 is the worked example of that trap). The budget
-# lives in those two call sites, kept identical to each other; adding it here
-# would create a second declaration that never takes effect.
+# golangci-lint v2 configuration; the timeout is passed by the Makefile and CI, not set here.
 version: "2"
 
 run:
-  # Test files are linted. This repo's tests ARE the contract for pkg/common —
-  # a compile-time interface assertion and the registry's concurrency
-  # behavior — so excluding them would leave the most load-bearing files
-  # unchecked.
+  # Test files are linted.
   tests: true
 
-  # Tag-gated providers are invisible to the linter unless their tags are
-  # listed here: golangci-lint reads only the files the build constraints
-  # select. `local` carries no tag and is always compiled; `drbd` is listed
-  # since #3, and cephrbd adds itself the same way, in the same commit that
-  # adds the tagged files — and keeps the Makefile's TAGS default and
-  # BUILD_TAGS in .github/workflows/ci.yml in step.
+  # Build tags of the tag-gated providers; keep in step with the Makefile TAGS and CI BUILD_TAGS.
   build-tags:
     - drbd
 
@@ -35,11 +19,7 @@ formatters:
         - github.com/jeremyhahn/go-blockstore
 
 linters:
-  # devops.md §8 makes six of these mandatory — errcheck, staticcheck, unused,
-  # ineffassign, misspell and gocritic. Running the umbrella with any of them
-  # switched off does not satisfy that section, so none may move to `disable`.
-  # The rest are the fleet's usual additions for a library that hands out
-  # errors and resources across a provider boundary.
+  # errcheck, staticcheck, unused, ineffassign, misspell and gocritic are mandatory and stay enabled.
   enable:
     - errcheck
     - staticcheck
@@ -65,32 +45,7 @@ linters:
         - performance
       settings:
         hugeParam:
-          # Raised from gocritic's default of 80 bytes, for one structural
-          # reason: common.VolumeSpec is 88 bytes and VolumeProvider.Provision
-          # takes it BY VALUE. That is the contract every backend implements, so
-          # at the default threshold every provider in this repo — local, and
-          # drbd and cephrbd when they land — reports hugeParam on a signature
-          # none of them is free to change. A gate that fails on the interface
-          # it exists to guard teaches people to reach for nolint.
-          #
-          # The advice is also not worth taking here. hugeParam is a performance
-          # rule, and these functions fork and exec lvcreate and mkfs, and run
-          # a LUKS key derivation in process; an 88-byte copy against a process
-          # spawn, or against a hundred thousand PBKDF2 rounds, is
-          # unmeasurable. Passing the
-          # spec by pointer would buy nothing and hand every provider a nil to
-          # check and a caller's struct it could mutate.
-          #
-          # Raised again to 256 for the second type a contract forces: pkg/ha's
-          # Status, at 192 bytes, is what `ha.Observer func(Status)` hands an
-          # orchestrator on every transition. It is passed BY VALUE deliberately
-          # — it is a snapshot, and a pointer would hand observers a view of
-          # state the controller owns and may still be writing, which is a
-          # correctness problem traded for a copy that is not a performance one.
-          # The callback fires on phase and role changes, not per I/O.
-          #
-          # 256 still catches a genuinely oversized parameter. Raise it again
-          # only for another type the contract forces, and say which here.
+          # 256 bytes: VolumeSpec and ha.Status are passed by value by contract.
           sizeThreshold: 256
     govet:
       enable:
@@ -105,10 +60,7 @@ linters:
       - common-false-positives
       - legacy
       - std-error-handling
-    # Deliberately short. Every rule below is a class of finding that is wrong
-    # in a test file specifically, not a finding this repo has decided to stop
-    # looking at. A NEW exclusion needs a written reason next to it — an
-    # unexplained entry is indistinguishable from a silenced bug.
+    # Test-only exclusions; each new one needs a reason next to it.
     rules:
       # Tests construct fixtures whose errors are the assertion itself, and
       # deliberately ignore returns while exercising a failure path.

@@ -35,15 +35,7 @@ type silentOracle struct{}
 
 func (silentOracle) AttachmentLiveness(context.Context, string) (Liveness, error) { return "", nil }
 
-// TestLivenessOfRefusesEveryAnswerThatIsNotOne is the whole contract in one
-// table: exactly two values are answers, and every other way an oracle can
-// respond is a failure that matches ErrLivenessIndeterminate.
-//
-// The rows that matter most are the last two. An implementation that returns
-// nothing, and one that returns a value BESIDE an error, are the two ways a
-// zero value reaches a caller by accident — and the zero value must never
-// arrive as "released", the answer somebody may act on by tearing a live
-// workload's mapping down.
+// TestLivenessOfRefusesEveryAnswerThatIsNotOne: only the two values are answers; everything else matches ErrLivenessIndeterminate.
 func TestLivenessOfRefusesEveryAnswerThatIsNotOne(t *testing.T) {
 	backendDown := errors.New("the coordinator is unreachable")
 
@@ -116,9 +108,7 @@ func TestLivenessOfRefusesEveryAnswerThatIsNotOne(t *testing.T) {
 	}
 }
 
-// TestLivenessOfKeepsTheOraclesOwnError pins that the wrapping preserves what an
-// operator has to act on. The sentinel says the check broke; the wrapped error
-// names the coordinator that was unreachable, and that is what gets fixed.
+// TestLivenessOfKeepsTheOraclesOwnError: the wrapped error is preserved.
 func TestLivenessOfKeepsTheOraclesOwnError(t *testing.T) {
 	backendDown := errors.New("the coordinator is unreachable")
 	oracle := oracleFunc(func(context.Context, string) (Liveness, error) { return "", backendDown })
@@ -132,10 +122,7 @@ func TestLivenessOfKeepsTheOraclesOwnError(t *testing.T) {
 	}
 }
 
-// TestLivenessOfDoesNotDoubleWrapItsOwnSentinel covers an oracle that already
-// speaks this vocabulary — the expected case for one built on a Coordinator,
-// which knows perfectly well that an unreachable backend is indeterminate. Its
-// message is passed through rather than prefixed with the same sentence twice.
+// TestLivenessOfDoesNotDoubleWrapItsOwnSentinel: an error already matching the sentinel passes through.
 func TestLivenessOfDoesNotDoubleWrapItsOwnSentinel(t *testing.T) {
 	own := errors.New("wrapped")
 	oracle := oracleFunc(func(context.Context, string) (Liveness, error) {

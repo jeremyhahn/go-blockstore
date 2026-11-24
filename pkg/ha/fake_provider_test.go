@@ -20,17 +20,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// roleOnlyProvider implements every common.VolumeProvider method by panicking.
-//
-// It is the mechanical form of the settled composition in the package doc: the
-// controller owns the replication ROLE and never the filesystem. Embedding this
-// in the test provider means a controller that grew a Mount, an Unmount, a
-// Provision or a Delete call would fail its tests with a panic naming the
-// method, rather than quietly acquiring a responsibility it cannot discharge.
-//
-// The panics are the assertion. They are not a stub to be filled in later: if
-// this package ever needs one of these operations, that is a design change to
-// argue for, not a fixture to extend.
+// roleOnlyProvider panics on every non-role method, so the controller cannot start mounting or provisioning.
 type roleOnlyProvider struct{}
 
 func (roleOnlyProvider) Provision(context.Context, common.VolumeSpec) (common.Volume, error) {
@@ -98,27 +88,14 @@ type fakeProvider struct {
 	promoteErr error
 	demoteErr  error
 
-	// promoteHonorsCancel picks which of TWO real orderings Promote models when
-	// its context is canceled while it runs.
-	//
-	// True — the default — is drbdadm killed mid-exec: the call fails, and the
-	// node did not become Primary.
-	//
-	// False is the other one, and the dangerous one: the exec COMPLETED and the
-	// cancellation landed a moment later, so the provider returns nil having
-	// genuinely made this node Primary while the lease that authorized it was
-	// already gone. A fixture that could not produce this would make the
-	// void-promotion path untestable by pretending an ordering the real
-	// provider produces cannot happen.
+	// promoteHonorsCancel: true fails Promote on cancel; false completes it and returns nil after the lease is gone.
 	promoteHonorsCancel bool
 
 	calls    []string
 	promotes int
 	demotes  int
 
-	// Hooks run INSIDE the call, before it returns, with no lock held. They are
-	// the barriers race tests use to hold a provider call open while something
-	// else happens.
+	// Hooks run inside the call, without the lock, as barriers for race tests.
 	promoteHook func(ctx context.Context)
 	demoteHook  func(ctx context.Context)
 	replHook    func(ctx context.Context)
@@ -202,11 +179,7 @@ func (p *fakeProvider) demoteCount() int {
 	return p.demotes
 }
 
-// ReplicationState answers with its scripted result. The context is checked
-// BEFORE the hook runs and not after, which models the read having completed:
-// a cancellation landing while the caller is between drbdsetup returning and
-// the provider returning is a real ordering, and it is the one that leaves a
-// controller holding a state it may no longer act on.
+// ReplicationState checks the context before the hook, modelling a read that completed.
 func (p *fakeProvider) ReplicationState(ctx context.Context, volID string) (common.ReplState, error) {
 	if err := ctx.Err(); err != nil {
 		return common.ReplState{}, err

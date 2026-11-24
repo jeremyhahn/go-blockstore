@@ -22,15 +22,7 @@ import (
 	"testing"
 )
 
-// TestNativeMappingReportsAnAbsentNameAsAbsent is the negative answer luksIsOpen
-// is allowed to act on, and the only one. A name nothing has ever opened is not
-// an error.
-//
-// It asks device-mapper, and go-luks2 can only ask through /dev/mapper/control:
-// a host without it cannot answer "no such mapping", it answers that it cannot
-// be asked, which Mapping rightly reports as an error rather than as absence.
-// So the test sits behind the kernel_dm tag, and selecting the tag is the
-// statement that this host provides the control node — see make test-kernel-dm.
+// TestNativeMappingReportsAnAbsentNameAsAbsent needs /dev/mapper/control, so it runs under the kernel_dm tag.
 func TestNativeMappingReportsAnAbsentNameAsAbsent(t *testing.T) {
 	info, exists, err := (Native{}).Mapping(context.Background(), "bs-vg0_no-such-volume-"+strconv.Itoa(os.Getpid()))
 	if err != nil {

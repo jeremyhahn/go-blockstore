@@ -46,10 +46,7 @@ func TestLocalProviderIsAlwaysRegistered(t *testing.T) {
 }
 
 func TestNewLocalProvider(t *testing.T) {
-	// "preflight": "off" because this test is about REGISTRATION and the
-	// returned type, not about whether this machine can attach a volume. The
-	// checks that setting disables are exercised on their own in
-	// TestNewLocalProviderRunsTheStartupPrivilegeChecks.
+	// Preflight off: this test covers registration and the returned type.
 	provider, err := factory.NewProvider("local", map[string]string{
 		"volume_group": "vg0",
 		"node_id":      "node-a",
@@ -66,14 +63,7 @@ func TestNewLocalProvider(t *testing.T) {
 	}
 }
 
-// TestNewLocalProviderRunsTheStartupPrivilegeChecks is the guard on the path an
-// operator's configuration actually takes.
-//
-// It asserts against the checker rather than against a fixed outcome, so it is
-// meaningful on a privileged host and on an unprivileged one: where the machine
-// can do the work the provider must be built, and where it cannot the factory
-// must refuse with something that names the missing capability. Remove the
-// check from local.New and the second half of this test fails.
+// TestNewLocalProviderRunsTheStartupPrivilegeChecks asserts against the checker, so it holds on privileged and unprivileged hosts.
 func TestNewLocalProviderRunsTheStartupPrivilegeChecks(t *testing.T) {
 	settings := map[string]string{"volume_group": "vg0"}
 
@@ -101,13 +91,7 @@ func TestNewLocalProviderRunsTheStartupPrivilegeChecks(t *testing.T) {
 	if !errors.Is(err, preflight.ErrUnavailable) {
 		t.Errorf("NewProvider = %v, want a failure matching preflight.ErrUnavailable", err)
 	}
-	// The warning belongs to the refusals an operator could "fix" with
-	// --privileged. A platform-unsupported refusal is not one of them: package
-	// preflight compiles and refuses on darwin and windows, where there is no
-	// container to make privileged, and asserting the warning there fails the
-	// suite on a platform this repository explicitly supports building on.
-	// Codex caught it; the remedy texts themselves are checked exhaustively in
-	// preflight's own TestNoRemedyEverRecommendsPrivileged.
+	// The --privileged warning applies only to refusals it could fix, not platform-unsupported ones.
 	if !errors.Is(err, preflight.ErrPlatformUnsupported) &&
 		!strings.Contains(err.Error(), "Do NOT use --privileged") {
 		t.Errorf("the refusal does not warn against the fix an operator will reach for:\n%v", err)

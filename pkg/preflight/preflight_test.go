@@ -182,13 +182,7 @@ func TestCheckTreatsANilProbeAsAFailure(t *testing.T) {
 	}
 }
 
-// TestCheckTreatsATypedNilProbeResultAsAFailure is a regression test for the
-// interface trap: a probe returning a nil *CapabilityError produces a non-nil
-// error holding a nil pointer, which is neither a pass nor renderable — it
-// panics the first time anything prints it.
-//
-// It was a real defect in this package, found because the provider tests print
-// the error they did not expect.
+// TestCheckTreatsATypedNilProbeResultAsAFailure: a nil *CapabilityError in an error interface is a failure.
 func TestCheckTreatsATypedNilProbeResultAsAFailure(t *testing.T) {
 	checker := New(WithProbe(CapabilityMount, func(context.Context) error {
 		var nilTyped *CapabilityError
@@ -280,20 +274,13 @@ func TestWithProbeReplacesRatherThanAdds(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("the replacement probe ran %d times, want 1 — the live probe was used instead", calls)
 	}
-	// Replacing must REPLACE, not add: the inventory is whatever the live
-	// constructor registers, unchanged.
+	// Replacing replaces: the inventory is what the live constructor registers.
 	if got, want := len(checker.Capabilities()), len(New().Capabilities()); got != want {
 		t.Errorf("Capabilities() has %d entries, want %d: replacing must not add one", got, want)
 	}
 }
 
-// TestPackageCheckUsesTheLiveProbes ties the package-level entry point to the
-// live implementation, so a caller that never constructs a Checker gets the
-// real checks.
-//
-// It asserts the SHAPE of the answer rather than a specific outcome, because
-// the outcome legitimately depends on the machine. The outcome itself is
-// asserted against the environment in probe_linux_test.go.
+// TestPackageCheckUsesTheLiveProbes asserts the answer's shape; probe_linux_test.go asserts the outcome.
 func TestPackageCheckUsesTheLiveProbes(t *testing.T) {
 	err := Check(context.Background(), CapabilityDeviceMapper, CapabilityMount, CapabilityKernelKeyring)
 	if err == nil {

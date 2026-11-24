@@ -24,28 +24,7 @@ import (
 	"testing"
 )
 
-// The live-kernel check in keypath_kernel_linux_test.go re-execs itself into a
-// user + mount namespace. It can fail to produce an answer two ways, and they
-// must stay distinguishable:
-//
-//   - THE HOST REFUSED THE NAMESPACE — the capability the kernel_keypath tag
-//     says this host has, it does not have;
-//   - IT RAN AND THE ANSWER WAS WRONG — the substitution behaved differently
-//     from what the guard is built on.
-//
-// Both are failures. Selecting the tag is a statement that this host provides
-// the capability, so a refusal is a broken claim rather than an excuse, and
-// NEITHER reports success (conventions/testing-guidelines.md §No Skip Guards;
-// `internal/guards` refuses a runtime skip anywhere in the tree).
-//
-// THIS FILE IS DELIBERATELY UNTAGGED. The decision above is ordinary logic that
-// needs no privilege to exercise, and it is the part that shipped broken: the
-// classifier read only the child's OUTPUT, so a runner that refuses the
-// namespace at exec — producing no output at all — was reported as a check that
-// had FAILED rather than as a host that had refused. Every developer host
-// permits the re-exec, so no local run could reach that branch. Gating these
-// tests behind the tag too would put them back out of reach of exactly the
-// environment that found the defect.
+// Tells a host that refused the namespace from a check that ran and was wrong; both fail. Untagged: the classification needs no privilege.
 
 // requireKernelChecksTag names the build tag that selects the live-kernel
 // check, so the refusal message can tell an operator what they asked for.
@@ -62,33 +41,7 @@ type kernelCheckReporter interface {
 	Fatalf(format string, args ...any)
 }
 
-// hostRefusedTheNamespace reports why the host would not run the check, or ""
-// when the child ran and gave a real answer.
-//
-// THE DISCRIMINATOR IS WHETHER THE CHILD RAN, and it is taken from the error's
-// TYPE, not from its text. exec returns *exec.ExitError only when a process
-// started and exited non-zero. A namespace refused at clone/exec time never
-// starts one: os.StartProcess hands back the syscall error and there is NO
-// OUTPUT AT ALL to classify.
-//
-// That is the defect this replaced. The previous version read only the child's
-// OUTPUT, so a container that refuses CLONE_NEWUSER|CLONE_NEWNS at exec
-// produced an empty string to classify and fell through to "the kernel check
-// failed" — reporting a host that would not run the check as a check that had
-// failed. The classifier was narrower than the condition it classified, and its
-// own doc comment named the case it did not handle.
-//
-// Both shapes measured on this host:
-//
-//	CLONE_NEWNS as uid 1000 -> output "", err *fs.PathError
-//	    "fork/exec /bin/true: operation not permitted"
-//	    errors.As(*exec.ExitError) = false, errors.Is(EPERM) = true
-//	a child that ran and exited 1 -> output present, err *exec.ExitError
-//
-// A child that RAN and failed keeps its own message. An *exec.ExitError counts
-// as a refusal only when the child MARKED the step it was denied with
-// UNSUPPORTED, which it does for the mounts it makes once already inside the
-// namespace.
+// hostRefusedTheNamespace reports why the host would not run the check, or ""; a child that never started is not an *exec.ExitError.
 func hostRefusedTheNamespace(err error, output string) string {
 	if err == nil {
 		return ""
@@ -107,11 +60,7 @@ func hostRefusedTheNamespace(err error, output string) string {
 		return ""
 	}
 
-	// The child never started. Only the REFUSAL shapes count: a harness broken
-	// some other way — the binary missing, a bad path — must be reported as the
-	// check failing rather than excused as an unsupported host. ENOSPC is here
-	// because that is what clone(2) returns when the user-namespace limit is
-	// exhausted, a refusal wearing an unlikely name.
+	// Only refusal errnos count (ENOSPC is clone's user-namespace limit); other failures are the check failing.
 	for _, refusal := range []error{
 		os.ErrPermission, syscall.EPERM, syscall.EACCES,
 		syscall.EINVAL, syscall.ENOSYS, syscall.ENOSPC,
@@ -123,14 +72,7 @@ func hostRefusedTheNamespace(err error, output string) string {
 	return ""
 }
 
-// reportKernelChildResult turns the child's outcome into a verdict.
-//
-// Neither failure path reports success, and they carry different messages so an
-// operator can tell "this host cannot do what the tag claims" from "the kernel
-// behaved differently from what the guard assumes". Every branch returns
-// explicitly: with a real *testing.T Fatalf does not return, but this is driven
-// by a recording reporter in its own tests, where a missing return would run
-// two branches for one outcome.
+// reportKernelChildResult turns the child's outcome into a verdict; every branch returns explicitly.
 func reportKernelChildResult(t kernelCheckReporter, output string, err error) {
 	t.Helper()
 
@@ -188,19 +130,12 @@ func (r *recordingReporter) verdict() string {
 	return "none"
 }
 
-// execRefusedEPERM is the error shape a host that refuses the namespace hands
-// back, reproduced exactly as measured: os.StartProcess never starts a process,
-// so it is an *fs.PathError wrapping EPERM and NOT an *exec.ExitError.
-//
-// TestTheMeasuredRefusalHasTheShapeThisFileAssumes checks that against the
-// kernel, so the table below is not a guess about it.
+// execRefusedEPERM is the *fs.PathError wrapping EPERM a refusing host returns.
 func execRefusedEPERM() error {
 	return &fs.PathError{Op: "fork/exec", Path: "/tmp/go-build/local.test", Err: syscall.EPERM}
 }
 
-// ranAndFailed builds a REAL *exec.ExitError from a child that started, wrote
-// something and exited non-zero — the shape of a kernel check whose assertion
-// was wrong.
+// ranAndFailed builds a real *exec.ExitError from a child that started and failed.
 func ranAndFailed(t *testing.T, childOutput string) (string, error) {
 	t.Helper()
 	cmd := exec.Command("/bin/sh", "-c", "cat; exit 1")
@@ -231,16 +166,13 @@ func TestTheVerdictOnEachChildOutcome(t *testing.T) {
 		mustSay string
 		mustNot string
 	}{
-		// The case CI took, and the one the old classifier got wrong: it must
-		// be reported as the HOST refusing, not as the check having failed.
+		// A refused exec is the host refusing, not the check failing.
 		"the host refused the re-exec": {
 			output: "", err: execRefusedEPERM(),
 			want: "FAIL", mustSay: "refused the namespace the kernel_keypath tag says it provides",
 			mustNot: "the kernel check failed",
 		},
-		// THE CONTROL. The child ran and the answer was wrong: it keeps its own
-		// message and must not be dressed up as an unsupported host, which
-		// would excuse a real defect.
+		// The control: a child that ran and was wrong keeps its own message.
 		"the check ran and the answer was wrong": {
 			output: realFailureOutput, err: realFailureErr,
 			want: "FAIL", mustSay: "the kernel check failed",
@@ -283,12 +215,7 @@ func TestTheVerdictOnEachChildOutcome(t *testing.T) {
 	}
 }
 
-// TestARefusalSaysTheMeasurementDidNotHappen keeps a refused host from reading
-// as a check that ran.
-//
-// It has to name what was NOT measured and what the operator asked for by
-// selecting the tag. A refusal that only says "operation not permitted" leaves
-// the reader to work out that the substitution went unchecked.
+// TestARefusalSaysTheMeasurementDidNotHappen: a refusal names what was not measured.
 func TestARefusalSaysTheMeasurementDidNotHappen(t *testing.T) {
 	r := &recordingReporter{}
 	reportKernelChildResult(r, "", execRefusedEPERM())
@@ -307,20 +234,7 @@ func TestARefusalSaysTheMeasurementDidNotHappen(t *testing.T) {
 	}
 }
 
-// TestTheMeasuredRefusalHasTheShapeThisFileAssumes checks the instrument.
-//
-// Everything above rests on one claim about the kernel: a namespace refused at
-// clone/exec time produces NO OUTPUT and an error that is not an
-// *exec.ExitError. That claim is exactly what the previous classifier got
-// wrong, so it is asserted against the kernel rather than assumed — by asking
-// for CLONE_NEWNS without CLONE_NEWUSER as an unprivileged user, which is
-// refused at the same moment a container refuses CLONE_NEWUSER|CLONE_NEWNS.
-//
-// Running as root the request SUCCEEDS and there is no refusal here to measure.
-// That is not a skip: the test still runs and still asserts the branch it can
-// see — that a success is not classified as a refusal — and says which half it
-// took, so a reader is never left thinking the shape was re-measured when it
-// was not.
+// TestTheMeasuredRefusalHasTheShapeThisFileAssumes: an unprivileged CLONE_NEWNS is refused with no output and no *exec.ExitError; as root it succeeds.
 func TestTheMeasuredRefusalHasTheShapeThisFileAssumes(t *testing.T) {
 	cmd := exec.Command("/bin/true")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
@@ -347,7 +261,7 @@ func TestTheMeasuredRefusalHasTheShapeThisFileAssumes(t *testing.T) {
 		t.Errorf("a refused re-exec produced %v, which is not EPERM; the refusal list needs its shape", err)
 	}
 
-	// And the verdict on the REAL error, not only on the reproduction of it.
+	// And the verdict on the real error.
 	r := &recordingReporter{}
 	reportKernelChildResult(r, string(output), err)
 	if !r.failed || !strings.Contains(r.message, "refused the namespace") {

@@ -214,9 +214,7 @@ func TestStopAfterAFenceIsClean(t *testing.T) {
 	}
 }
 
-// Cancellation arriving while the acquisition is in flight has to unwind
-// cleanly rather than being mistaken for a coordinator that could not answer
-// and retried forever.
+// Cancellation during acquisition unwinds cleanly instead of retrying.
 func TestCancellationDuringAcquisitionStopsTheManager(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 	r := newRig(t, prov, nil)
@@ -253,9 +251,7 @@ func TestCancellationDuringAcquisitionStopsTheManager(t *testing.T) {
 	}
 }
 
-// A promotion can also be voided by the manager being stopped rather than by
-// the lease dying, and the reason has to say which: "the lease was lost" and
-// "you stopped me" are not the same incident to whoever reads the status.
+// A promotion voided by stopping the manager says so, distinct from a lost lease.
 func TestPromotionVoidedByAStoppedManagerSaysSo(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 
@@ -421,14 +417,7 @@ func TestStoppingAfterAFenceKeepsTheDemoteFailure(t *testing.T) {
 	}
 }
 
-// The retry sequence is bounded by ActionTimeout, not only by the attempt
-// count. Once the context is done every remaining attempt is an immediate
-// failure against a dead deadline, so a high ReleaseAttempts must not turn a
-// bounded shutdown into a spin.
-//
-// The bound is reached deterministically: the manual clock never fires, so the
-// wait between attempts can only end at the timeout, and the attempt after it
-// meets a context that is already done.
+// Release retries stop at ActionTimeout, not only after ReleaseAttempts.
 func TestReleaseRetriesStopAtTheActionTimeout(t *testing.T) {
 	const attempts = 8
 
@@ -472,16 +461,7 @@ func TestReleaseRetriesStopAtTheActionTimeout(t *testing.T) {
 	}
 }
 
-// A planned shutdown holds the lease across the demote instead of dropping it
-// first. Demoting can take longer than the lease has left — ActionTimeout is
-// larger than a typical TTL, and a demote blocked on an open device is exactly
-// the slow case — and letting the lease lapse there would invite the peer to
-// promote against a node that is still Primary. That is a window this path
-// chooses, unlike a crash, so it does not take it.
-//
-// The interleave is forced and asserted: the demote is held open, the clock is
-// advanced past a renewal interval while it is held, and the test requires a
-// Renew to have reached the coordinator BEFORE the demote is let go.
+// A planned shutdown renews the lease while the demote is held open.
 func TestGracefulStopRenewsTheLeaseWhileDemoting(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 
@@ -651,11 +631,7 @@ func TestALeaseEndingDuringTheShutdownDemoteIsFenced(t *testing.T) {
 	case <-time.After(waitTimeout):
 		t.Fatal("the lease did not end")
 	}
-	// The announcement must be withdrawn WHILE the demote is still blocked. A
-	// demote held on an open device can run for the whole ActionTimeout, and
-	// advertising this node as the authorized primary for that long — with the
-	// lease already gone and a peer free to take it — is the one thing a
-	// fencing controller must never do.
+	// The announcement is withdrawn while the demote is still blocked.
 	waitFor(t, func() bool {
 		s, err := r.ctrl.Status(testVolume)
 		return err == nil && s.Phase == PhaseFenced && !s.Primary
@@ -711,10 +687,7 @@ func TestALeaseEndingDuringTheShutdownDemoteIsFenced(t *testing.T) {
 	if n := countOp(r.coord.recorded(), "Release"); n != 0 {
 		t.Fatalf("Release was attempted %d times on a lease that had already ended", n)
 	}
-	// The demote here SUCCEEDED, so the role was yielded and the hazard
-	// sentinel must be absent. A sentinel that appeared on every fence would
-	// tell a consumer nothing, and the thing it is meant to single out is the
-	// node that may still be writable.
+	// The demote succeeded, so the hazard sentinel must be absent.
 	if errors.Is(got.Err, ErrRoleNotYielded) {
 		t.Fatalf("final Err = %v claims the role was not yielded, but the demote succeeded", got.Err)
 	}
@@ -778,9 +751,7 @@ func TestTheShutdownRenewalStopsAtTheActionTimeout(t *testing.T) {
 	}
 }
 
-// Both can go wrong at once: the lease ends during the shutdown demote AND the
-// demote fails. Both facts have to survive into the record — the node may still
-// be writable, and it no longer has a lease saying it may be.
+// The lease ends during the shutdown demote and the demote fails; both facts survive into the record.
 func TestALeaseEndingAndAFailedDemoteBothSurvive(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 	stillOpen := errors.New("drbdadm secondary vol1: Device is held open by someone")
@@ -848,13 +819,7 @@ func TestALeaseEndingAndAFailedDemoteBothSurvive(t *testing.T) {
 	}
 }
 
-// A clean stop reports a clean stop. A refusal standing from the last reconcile
-// is resolved by no longer trying, so carrying it into the final status would
-// make every shutdown of a volume that was not promotable look like a failure.
-//
-// Only a condition that OUTLIVES the shutdown survives it, and the fence is the
-// one that does — see TestStoppingAfterAFenceKeepsTheDemoteFailure for the
-// other side of this rule.
+// A clean stop clears a standing refusal; only a fence survives a nil stop.
 func TestACleanStopClearsAResolvedRefusal(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateSyncTarget, common.ReplRoleSecondary)
 	r := newRig(t, prov, nil)
@@ -879,8 +844,7 @@ func TestACleanStopClearsAResolvedRefusal(t *testing.T) {
 	}
 }
 
-// The same for a renewal warning: the Coordinator being briefly unreachable is
-// not something a completed shutdown is still failing at.
+// A clean stop clears a renewal warning too.
 func TestACleanStopClearsAResolvedRenewalWarning(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 	r := newRig(t, prov, nil)
@@ -917,14 +881,7 @@ func TestASuccessfulShutdownDemoteWithdrawsTheAnnouncementBeforeTheRelease(t *te
 	r.awaitPrimary(testVolume, true)
 	r.clock.awaitTimers(t, 1)
 
-	// The demote succeeds; the release then fails and retries until the
-	// timeout, which is the window this test is about.
-	//
-	// It is sampled through Status rather than through the observer, and that
-	// is the whole point: leaving Primary set while only the role moved
-	// produces NO transition, so an observer would never be told about it. A
-	// contradiction nobody is notified of is still a contradiction to anyone
-	// polling.
+	// Sampled through Status: Primary must clear while the release retries, though no transition is emitted.
 	r.coord.setReleaseErr(errors.New("coordinator unreachable"))
 
 	stopPolling := make(chan struct{})

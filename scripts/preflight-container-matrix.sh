@@ -1,57 +1,5 @@
 #!/usr/bin/env bash
-# Prove the startup privilege guard fires — and does NOT fire — in real
-# containers.
-#
-#   usage: scripts/preflight-container-matrix.sh [docker-binary]
-#
-# WHY A SCRIPT AND NOT A UNIT TEST
-# --------------------------------
-# The condition the guard exists to catch cannot be produced inside `go test`.
-# It is a property of how the PROCESS WAS STARTED: a container holding
-# CAP_SYS_ADMIN, with /dev/mapper/control passed in, under the runtime's DEFAULT
-# seccomp profile. Device-mapper works there. The kernel keyring does not. No
-# fixture reachable from a test binary can reproduce that, so a green unit suite
-# says nothing about it — and green tests have been false evidence for exactly
-# this class of claim before.
-#
-# So the demonstration is a script that starts the containers, and it ASSERTS
-# rather than prints: every row states the expected verdict, and a row that does
-# not match exits non-zero. Run it after changing anything in pkg/preflight.
-#
-# WHAT IT PROVES
-# --------------
-#   1. cap SYS_ADMIN + the device, DEFAULT seccomp  → the guard REFUSES, naming
-#      the kernel keyring. This is the trap: device-mapper works, so the
-#      container looks correctly privileged.
-#   2. the same, plus a NARROW seccomp profile that adds add_key, keyctl and
-#      request_key → the guard PASSES. Without this row the guard could be one
-#      that refuses everything.
-#   3. the narrow profile with those three syscalls REMOVED → refuses again.
-#      That is the mutation: the pass in row 2 is caused by the allowance and
-#      not by anything else about the profile.
-#   4. no capabilities at all → refuses, naming device-mapper as well.
-#   5-7. the three verdicts the mount(2) capability witness can reach: an LSM
-#      denial, a seccomp denial with the capability PROVEN held, and an EPERM
-#      with no witness available reported as ambiguous rather than guessed.
-#   8-9. the same errno split for device-mapper itself: the kernel's own
-#      capability check answers EACCES, a seccomp denial of ioctl answers EPERM,
-#      and the two get different remedies.
-#   10-11. opening the node can fail for reasons that are neither the capability
-#      nor a filter — a node made visible without being allowed by the device
-#      cgroup, and a node whose own 0600 permissions refuse a non-root uid.
-#   12-14. the REPLICATED backend, whose capability set is not the local one's:
-#      CAP_NET_ADMIN refused and then granted (device-mapper working proves
-#      nothing about it), and the drbd module absent — which no capability
-#      grant can fix, so the remedy names modprobe rather than a flag.
-#
-# The narrow profile is generated here rather than committed, so it cannot rot
-# against the syscalls the binary actually makes, and so that nothing in this
-# repository looks like a profile to copy verbatim into production. A real
-# deployment takes ITS OWN runtime's default profile and adds the three
-# syscalls; see pkg/preflight/doc.go.
-#
-# --privileged appears nowhere in this file on purpose. It would make every row
-# pass and prove nothing, and it is not a remedy this project offers.
+# Runs the preflight probe in containers with varied capabilities, seccomp profiles and devices, asserting each row's verdict (usage: scripts/preflight-container-matrix.sh [docker-binary]).
 set -euo pipefail
 
 DOCKER="${1:-docker}"
@@ -113,10 +61,7 @@ func main() {
 }
 GO
 
-# The probe has to be built INSIDE the module to import it, so it is staged in
-# a directory this script owns and removes. There is no `|| true` and no
-# fallback anywhere in this file: a build that fails must stop the run, because
-# a matrix that silently ran an old binary would be worse than no matrix.
+# Build the probe inside the module in a staging directory this script removes; a failed build stops the run.
 echo "→ building the probe against this working tree"
 STAGE="$ROOT/.preflight-matrix-tmp"
 rm -rf "$STAGE"
@@ -125,20 +70,7 @@ trap 'rm -rf "$WORK" "$STAGE"' EXIT
 cp "$WORK/cmd/main.go" "$STAGE/main.go"
 ( cd "$ROOT" && CGO_ENABLED=0 go build -o "$WORK/preflight-probe" ./.preflight-matrix-tmp )
 
-# ---------------------------------------------------------------------------
-# the seccomp profiles
-# ---------------------------------------------------------------------------
-# Default-DENY with an explicit allow list: narrow in the direction that
-# matters, and small enough to read. The syscalls are the ones the probe binary
-# and the container's own start-up make.
-#
-# The socket family at the end is NOT decoration. The replicated backend reaches
-# the DRBD module over generic netlink and tests CAP_NET_ADMIN with an ethtool
-# ioctl on an AF_INET socket, so a profile sized for the LOCAL provider denies
-# both — measured, when these rows were first added and the guard correctly
-# reported syscall-blocked against a profile this script called "correct". An
-# operator copying the local component's profile onto a replicated one walks
-# into the same thing.
+# Seccomp profiles: default-deny with an explicit allow list, including the socket families the replicated backend needs.
 KEYRING_SYSCALLS='"add_key","keyctl","request_key",'
 BASE_SYSCALLS='
 "arch_prctl","brk","capget","capset","chdir","clone","clone3","close","dup","dup2","dup3",
@@ -202,8 +134,7 @@ run_case() { # $1 = name, $2 = expected PASS|REFUSED, $3 = expected substring, $
 
 	local output status
 	set +e
-	# --user 0 first so a row that passes its own --user overrides it: docker
-	# takes the LAST occurrence, which is what lets row 11 run as a non-root uid.
+	# --user 0 first; docker takes the last --user, so a row can override it.
 	output="$("$DOCKER" run --rm \
 		-v "$WORK/preflight-probe:/preflight-probe:ro" \
 		--user 0 "$@" "$IMAGE" /preflight-probe "$mode" 2>&1)"
@@ -247,11 +178,7 @@ run_case "CAP_SYS_ADMIN + the device + a NARROW profile allowing the three" \
 	--cap-add SYS_ADMIN --device /dev/mapper/control \
 	--security-opt seccomp="$WORK/narrow.json"
 
-# mount(2) answers EPERM for a missing capability AND for a seccomp denial, so
-# the guard witnesses the capability with a device-mapper ioctl rather than
-# guessing. These three rows are the three verdicts that witness can reach; the
-# middle one is the misclassification the first draft shipped, where a container
-# that HELD CAP_SYS_ADMIN was told to grant it.
+# mount(2) rows: the three verdicts of the device-mapper capability witness.
 run_case "mount denied by the default AppArmor profile, with the capability held" \
 	REFUSED "[lsm-denied]" mount \
 	--cap-add SYS_ADMIN --device /dev/mapper/control \
@@ -267,10 +194,7 @@ run_case "mount denied with no witness available, reported as ambiguous" \
 	REFUSED "[privilege-or-policy]" mount \
 	--security-opt apparmor=unconfined
 
-# The same errno split one layer down. The device-mapper ioctl handler's own
-# capability check answers EACCES; a seccomp filter denying ioctl answers EPERM
-# before that handler runs. Reading EPERM as a missing capability would tell an
-# operator holding CAP_SYS_ADMIN to grant it.
+# Device-mapper rows: EACCES from the handler's capability check, EPERM from seccomp.
 run_case "device-mapper denied by the kernel capability check (EACCES)" \
 	REFUSED "[privilege-missing]" dm-keyring \
 	--device /dev/mapper/control \
@@ -281,9 +205,7 @@ run_case "device-mapper denied by seccomp on ioctl (EPERM), capability held" \
 	--cap-add SYS_ADMIN --device /dev/mapper/control \
 	--security-opt seccomp="$WORK/narrow-without-ioctl.json"
 
-# Opening the node fails for reasons that are neither the capability nor a
-# syscall filter, and each has its own fix. A node made VISIBLE without being
-# ALLOWED is the mistake a Kubernetes hostPath walks straight into.
+# Device node rows: visible but not allowed by the device cgroup, and refused by node permissions.
 run_case "the node is bind-mounted but not allowed by the device cgroup" \
 	REFUSED "[device-access-denied]" dm-keyring \
 	--cap-add SYS_ADMIN -v /dev/mapper/control:/dev/mapper/control \
@@ -294,10 +216,7 @@ run_case "the node is allowed but the storage component runs as a non-root uid" 
 	--cap-add SYS_ADMIN --device /dev/mapper/control \
 	--security-opt seccomp="$WORK/narrow.json" --user 65534
 
-# The REPLICATED backend needs a capability the local one does not, and the two
-# are independent bits. A container that can drive device-mapper all day still
-# cannot bring a DRBD resource up without CAP_NET_ADMIN — which is exactly the
-# shape of the trap in rows 2-3, one capability over.
+# Replicated backend rows: CAP_NET_ADMIN is independent of device-mapper access.
 run_case "CAP_SYS_ADMIN but no CAP_NET_ADMIN: device-mapper works, DRBD cannot" \
 	REFUSED "[privilege-missing]" net-admin \
 	--cap-add SYS_ADMIN --device /dev/mapper/control \

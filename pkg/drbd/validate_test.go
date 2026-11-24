@@ -153,12 +153,7 @@ func TestValidateMountTarget(t *testing.T) {
 		}
 	}
 
-	// Whitespace at the edge of a component is the shape that goes wrong
-	// quietly: it reads as the same path to a human, is a different path to the
-	// kernel, and anything that trims it turns "mounted elsewhere" into "not
-	// mounted" and a teardown into a silent no-op. A control character is
-	// worse — a newline makes one path look like two in every line-oriented
-	// tool an operator will reach for.
+	// Edge whitespace and control characters in path components are refused.
 	for _, in := range []string{
 		"", "mnt/vol1", "/mnt/../etc", "/mnt/vol1/", "/mnt//vol1", "/",
 		"/mnt/vol1 ", "/mnt/ vol1", "/mnt/vol1\t", "/mnt/a /b", "/mnt/a/ b",
@@ -194,13 +189,7 @@ func TestSnapshotNameRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAllowedMountFlagsAreClassified holds the relationship between this
-// provider's allowlist and internal/mount's table: a subset, never a superset.
-//
-// An option outside the shared table has no classification, so mount(2) would
-// get it as neither a kernel flag nor a data string — silently dropped rather
-// than applied, which for something like nosuid means a security option the
-// caller asked for and did not get.
+// TestAllowedMountFlagsAreClassified: this provider's flags are a subset of internal/mount's table.
 func TestAllowedMountFlagsAreClassified(t *testing.T) {
 	if flag, ok := mountFlagsAreClassified(); !ok {
 		t.Errorf("this provider allows %q, which internal/mount does not classify; "+
@@ -208,12 +197,7 @@ func TestAllowedMountFlagsAreClassified(t *testing.T) {
 	}
 }
 
-// TestNoUUIDIsAllowedForRestoredXFS covers a combination the API has to
-// support because it supports both halves. A restore is a byte-for-byte copy,
-// so a restored XFS volume carries its source's UUID, and XFS refuses to mount
-// a filesystem whose UUID matches one already mounted. Rejecting nouuid would
-// mean supporting XFS, supporting restores, and being unable to mount the
-// result beside its source.
+// TestNoUUIDIsAllowedForRestoredXFS: a restored XFS volume carries its source's UUID.
 func TestNoUUIDIsAllowedForRestoredXFS(t *testing.T) {
 	if err := validateMountFlags([]string{"nouuid"}); err != nil {
 		t.Fatalf("validateMountFlags(nouuid) = %v, want nil", err)
@@ -229,17 +213,7 @@ func TestNoUUIDIsAllowedForRestoredXFS(t *testing.T) {
 	}
 }
 
-// TestValidateNameRejectsLVMReservedNames covers names this provider's own
-// character set permits and LVM will not take.
-//
-// A volume's name IS its logical volume's name, handed straight to lvcreate.
-// Without this the request fails partway through provisioning — after the state
-// record, after allocation, into the rollback path — for a reason the caller
-// could have been told at the API boundary.
-//
-// Measured against LVM 2.03.16 on a loopback volume group rather than read out
-// of documentation: every name below was refused by a real lvcreate, and the
-// accepted ones were created and removed.
+// TestValidateNameRejectsLVMReservedNames: names lvcreate refuses are rejected at the API boundary.
 func TestValidateNameRejectsLVMReservedNames(t *testing.T) {
 	rejected := []string{
 		// "Names starting ... are reserved"

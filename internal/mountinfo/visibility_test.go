@@ -20,23 +20,9 @@ import (
 	"testing"
 )
 
-// The tables below are not invented. Each was produced by making the mounts in
-// a throwaway user + mount namespace on a Linux 6.8 host and copying the
-// matching lines out of /proc/self/mountinfo — the root record included, so the
-// parent chains in them are the kernel's own and terminate the way a real table
-// terminates. Inventing these is exactly the mistake the code they test
-// exists to correct: the assumptions that look obvious about mount ordering and
-// mount-point strings are the ones the kernel does not honor.
+// The tables below were captured from /proc/self/mountinfo on a Linux 6.8 host, root record included.
 
-// ancestorOvermountTable is the case this file is about.
-//
-//	mount -t tmpfs tmpBASE /tmp/bs33/base
-//	mount -t tmpfs tmpVOL  /tmp/bs33/base/vol
-//	mount -t tmpfs tmpOVER /tmp/bs33/base      <- covers the ANCESTOR
-//
-// The volume 0:87 is still mounted at /tmp/bs33/base/vol and no second record
-// names that path — record 626 names /tmp/bs33/base. Nothing about the volume's
-// own mount point changed, and yet a walk to it now lands inside tmpOVER.
+// ancestorOvermountTable: tmpBASE at base, tmpVOL at base/vol, then tmpOVER over base, covering the volume's ancestor.
 const ancestorOvermountTable = `562 438 252:1 / / rw,relatime - ext4 /dev/mapper/vgmint-root rw,errors=remount-ro
 624 562 0:76 / /tmp/bs33/base rw,relatime - tmpfs tmpBASE rw,size=1024k,uid=1000,gid=1000,inode64
 625 624 0:87 / /tmp/bs33/base/vol rw,relatime - tmpfs tmpVOL rw,size=1024k,uid=1000,gid=1000,inode64
@@ -52,57 +38,19 @@ const ancestorBeforeOvermountTable = `562 438 252:1 / / rw,relatime - ext4 /dev/
 625 624 0:87 / /tmp/bs33/base/vol rw,relatime - tmpfs tmpVOL rw,size=1024k,uid=1000,gid=1000,inode64
 `
 
-// equalPathTable is two mounts on one path:
-//
-//	mount -t tmpfs tmpLOWER /tmp/bs33/x
-//	mount -t tmpfs tmpUPPER /tmp/bs33/x
-//
-// Worth having as real text because it settles what the kernel writes when a
-// mount point is mounted over: record 625's parent is 624, the mount it covers
-// — not 624's parent. Stacking is a CHAIN, so the tree states the covering
-// relation directly and no reasoning about record order is needed to find it.
+// equalPathTable: two tmpfs mounts on one path; record 625's parent is 624, the mount it covers.
 const equalPathTable = `562 438 252:1 / / rw,relatime - ext4 /dev/mapper/vgmint-root rw,errors=remount-ro
 624 562 0:76 / /tmp/bs33/x rw,relatime - tmpfs tmpLOWER rw,size=1024k,uid=1000,gid=1000,inode64
 625 624 0:87 / /tmp/bs33/x rw,relatime - tmpfs tmpUPPER rw,size=1024k,uid=1000,gid=1000,inode64
 `
 
-// movedOnTopTable is why order is checked second and the tree first.
-//
-//	mount -t tmpfs tmpEARLY /tmp/bs33/x
-//	mount -t tmpfs tmpLATE  /tmp/bs33/y
-//	mount --move /tmp/bs33/x /tmp/bs33/y
-//
-// mount --move re-parents a mount and leaves its record where it already was in
-// the file, so the mount now ON TOP (624, whose parent is 625) is listed FIRST.
-// "The last record naming a path wins" gets both answers backwards here.
+// movedOnTopTable: after mount --move, the mount on top (624) is listed first.
 const movedOnTopTable = `562 438 252:1 / / rw,relatime - ext4 /dev/mapper/vgmint-root rw,errors=remount-ro
 624 625 0:76 / /tmp/bs33/y rw,relatime - tmpfs tmpEARLY rw,size=1024k,uid=1000,gid=1000,inode64
 625 562 0:87 / /tmp/bs33/y rw,relatime - tmpfs tmpLATE rw,size=1024k,uid=1000,gid=1000,inode64
 `
 
-// compositeOvermountTable is the two rules meeting: an ancestor overmount AND a
-// second record naming the covered mount's path, with no tree edge between the
-// two records that share it.
-//
-//	mount -t tmpfs tmpBASE  /tmp/bs33c/base
-//	mount -t tmpfs tmpVOL   /tmp/bs33c/base/vol
-//	mount -t tmpfs tmpOVER  /tmp/bs33c/base        <- covers the ancestor
-//	mount -t tmpfs tmpVOL2  /tmp/bs33c/base/vol    <- INSIDE tmpOVER, same path
-//	mount --bind   /tmp/bs33c/base/vol /tmp/bs33c/bindtarget
-//
-// 625 (tmpVOL) and 684 (tmpVOL2) both render as /tmp/bs33c/base/vol and neither
-// is the other's parent — 625 hangs off the covered 624, 684 off the covering
-// 626. Only the ancestor chain separates them, and the kernel's own answer was
-// recorded alongside: the file created through that path afterwards was visible
-// in tmpVOL2, not in tmpVOL.
-//
-// The record ORDER here is not incidental. 625 is written before 684, and it
-// cannot be otherwise on a kernel: 684 exists only because 626 covered 624, and
-// 626 could only cover 624 after 625 was already made — a mount created at
-// /tmp/bs33c/base/vol after the cover lands inside the covering filesystem and
-// gets 626 for a parent, as 684 did. So the mount beneath the covered ancestor
-// is always the earlier record, which is why applying the order rule after the
-// tree rule cannot invert this case.
+// compositeOvermountTable: 625 and 684 share a path, separated only by their ancestor chain; 684 sits inside the covering mount.
 const compositeOvermountTable = `562 438 252:1 / / rw,relatime - ext4 /dev/mapper/vgmint-root rw,errors=remount-ro
 624 562 0:76 / /tmp/bs33c/base rw,relatime - tmpfs tmpBASE rw,uid=1000,gid=1000,inode64
 625 624 0:87 / /tmp/bs33c/base/vol rw,relatime - tmpfs tmpVOL rw,uid=1000,gid=1000,inode64
@@ -111,15 +59,7 @@ const compositeOvermountTable = `562 438 252:1 / / rw,relatime - ext4 /dev/mappe
 720 562 0:89 / /tmp/bs33c/bindtarget rw,relatime - tmpfs tmpVOL2 rw,uid=1000,gid=1000,inode64
 `
 
-// ordinaryHostTable is an untouched /proc/self/mountinfo from a workstation
-// with nothing arranged for this test. It is the false-positive guard, and it
-// is the measurement that ruled out the shortcut: a rule that treats a later
-// record whose mount point is a path PREFIX of this one as covering it flags 6
-// pairs of these 28 records with nothing overmounted at all.
-//
-// Two properties of it are load-bearing and easy to lose if anyone tidies it:
-// the root record 30 is listed AFTER five of its own children, and its parent
-// id 1 names no record in the table at all.
+// ordinaryHostTable is an untouched workstation table; root record 30 follows its children and its parent id 1 names no record.
 const ordinaryHostTable = `25 30 0:23 / /sys rw,nosuid,nodev,noexec,relatime shared:7 - sysfs sysfs rw
 26 30 0:24 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw
 27 30 0:5 / /dev rw,nosuid,relatime shared:2 - devtmpfs udev rw,size=32497924k,nr_inodes=8124481,mode=755,inode64
@@ -190,18 +130,7 @@ func sameIDs(got, want []uint32) bool {
 	return true
 }
 
-// TestVisibleMountPointsForSeesAnAncestorOvermount is the defect.
-//
-// Before this, visibility was decided by comparing mount points, and no second
-// record names /tmp/bs33/base/vol — so the volume was reported visible there and
-// a teardown would hand that path to umount(2). What umount(2) does with a path
-// that no longer resolves to the volume is not unmount the volume.
-//
-// The test pins both halves: with nothing covering the base the volume IS
-// visible, and the arrival of a record covering the base — a record naming a
-// DIFFERENT path — takes it out of view. That the only difference between the
-// two tables is a line about another path is the whole point; a rule that
-// looked at /tmp/bs33/base/vol alone cannot tell them apart.
+// TestVisibleMountPointsForSeesAnAncestorOvermount requires a mount covering the base to hide the volume.
 func TestVisibleMountPointsForSeesAnAncestorOvermount(t *testing.T) {
 	const volDevice = "0:87"
 
@@ -234,11 +163,7 @@ func TestVisibleMountPointsForSeesAnAncestorOvermount(t *testing.T) {
 	}
 }
 
-// TestVisibleMountPointsForOnEqualPaths keeps the case that already worked, on
-// real text rather than on hand-built entries — because the reason it works is
-// not the one the old code gave. The kernel does not write two siblings on one
-// path; it writes a chain, where the covering mount's PARENT is the mount it
-// covers. The tree says so directly.
+// TestVisibleMountPointsForOnEqualPaths: the covering mount's parent is the mount it covers.
 func TestVisibleMountPointsForOnEqualPaths(t *testing.T) {
 	entries := mustParse(t, equalPathTable)
 
@@ -282,14 +207,7 @@ func TestVisibleMountPointsForFollowsTheTreeWhenFileOrderDisagrees(t *testing.T)
 	}
 }
 
-// TestVisibleMountPointsForDoesNotInventCoveringOnAnOrdinaryHost is the guard
-// on the direction that actually hurts.
-//
-// A mount wrongly called hidden is a volume Delete refuses to remove, with
-// nothing an operator can do about it; a rule that over-reports is worse than
-// the rare case it catches. This host has one genuine double mount — systemd's
-// autofs at /proc/sys/fs/binfmt_misc with the real binfmt_misc mounted over it
-// — and 27 records that are not covered by anything. Exactly one may be hidden.
+// TestVisibleMountPointsForDoesNotInventCoveringOnAnOrdinaryHost allows exactly one hidden mount, binfmt_misc over autofs.
 func TestVisibleMountPointsForDoesNotInventCoveringOnAnOrdinaryHost(t *testing.T) {
 	entries := mustParse(t, ordinaryHostTable)
 	if len(entries) != 28 {
@@ -323,12 +241,7 @@ func TestVisibilityTreatsADanglingParentAsTheTopOfTheTable(t *testing.T) {
 	}
 }
 
-// TestVisibilityFailsOpenOnATableThatLoops cannot come from a kernel, but Parse
-// is fed text and text can say anything. The choice on record: a loop is
-// unresolvable, and the resolvable-looking answer — refuse everything on the
-// cycle — would leave an operator with a volume that cannot be deleted and no
-// way to argue with it. Reporting the mounts is the direction callers can
-// recover from, and it is what they already get today.
+// TestVisibilityFailsOpenOnATableThatLoops: a parent loop reports the mounts rather than refusing them.
 func TestVisibilityFailsOpenOnATableThatLoops(t *testing.T) {
 	const loop = `10 11 0:76 / /a rw,relatime - tmpfs a rw
 11 10 0:87 / /b rw,relatime - tmpfs b rw
@@ -339,15 +252,7 @@ func TestVisibilityFailsOpenOnATableThatLoops(t *testing.T) {
 	}
 }
 
-// TestVisibilityTreatsASelfParentedRecordAsTheTopOfTheTable is the third
-// not-an-edge shape, and the one a caller can produce without meaning to.
-//
-// A record that is its own parent would, followed, be its own ancestor AND be
-// covering its own mount point — so the record and everything under it would
-// come back hidden. It is not a shape a kernel writes, but Parse is fed text,
-// and it is also what a table ASSEMBLED IN CODE looks like: a zero-valued Entry
-// has ID and ParentID both zero, so a caller building entries by hand would
-// have every one of its mounts refused.
+// TestVisibilityTreatsASelfParentedRecordAsTheTopOfTheTable, as a zero-valued Entry would be.
 func TestVisibilityTreatsASelfParentedRecordAsTheTopOfTheTable(t *testing.T) {
 	const selfParented = `10 10 0:76 / / rw,relatime - tmpfs root rw
 20 10 0:87 / /vol rw,relatime - tmpfs vol rw
@@ -391,11 +296,6 @@ func TestVisibilityFailsOpenOnADuplicatedMountID(t *testing.T) {
 }
 
 // TestParseRejectsAMalformedParentID pins the refusal rather than a zero.
-//
-// A zero would not read as "unknown". It would read as "no parent", the one
-// shape treated as the top of the table and so always reachable — a record
-// whose tree edge could not be read would come back with the most confident
-// answer available.
 func TestParseRejectsAMalformedParentID(t *testing.T) {
 	const bad = `580 notanumber 252:3 / /tmp/scratch/mi2 rw,relatime - ext4 /dev/mapper/bsmi-vol rw`
 
@@ -434,8 +334,7 @@ func TestEntryAtReportsNothingBehindAnOvermountedAncestor(t *testing.T) {
 	}
 }
 
-// TestEntryAtFollowsTheTreeWhenFileOrderDisagrees is the movedOnTopTable case
-// for the lookup: the last record naming /tmp/bs33/y is the one UNDERNEATH.
+// TestEntryAtFollowsTheTreeWhenFileOrderDisagrees: the last record naming /tmp/bs33/y is underneath.
 func TestEntryAtFollowsTheTreeWhenFileOrderDisagrees(t *testing.T) {
 	entries := mustParse(t, movedOnTopTable)
 	got, ok := EntryAt(entries, "/tmp/bs33/y")
@@ -448,15 +347,7 @@ func TestEntryAtFollowsTheTreeWhenFileOrderDisagrees(t *testing.T) {
 	}
 }
 
-// TestVisibleMountPointsForReportsABindOfACoveredMountUnderTheCoveringDevice
-// records a conclusion that is easy to assume the other way round.
-//
-// mount --bind resolves its source by walking the path, so binding a path whose
-// mount has been covered binds the COVERING filesystem. Measured: with tmpVOL
-// covered by tmpVOL2 at /tmp/bs33/base/vol, `mount --bind` of that path
-// produced a record for device 0:88 — tmpVOL2 — at the new path. The bind is a
-// mount of the covering device and is reported under it, and the covered device
-// gains no visible path from having been bound.
+// TestVisibleMountPointsForReportsABindOfACoveredMountUnderTheCoveringDevice: a bind of a covered path binds the covering device.
 func TestVisibleMountPointsForReportsABindOfACoveredMountUnderTheCoveringDevice(t *testing.T) {
 	const boundTable = `562 438 252:1 / / rw,relatime - ext4 /dev/mapper/vgmint-root rw,errors=remount-ro
 624 562 0:76 / /tmp/bs33/base rw,relatime - tmpfs tmpBASE rw,size=1024k,uid=1000,gid=1000,inode64
@@ -475,15 +366,7 @@ func TestVisibleMountPointsForReportsABindOfACoveredMountUnderTheCoveringDevice(
 	}
 }
 
-// TestVisibilitySeparatesTwoRecordsOnOnePathByTheirAncestorChain is the case
-// where neither rule alone is enough.
-//
-// Two records render as /tmp/bs33c/base/vol and neither is the other's parent,
-// so the tree states no covering relation between them; what separates them is
-// that one hangs off a mount that has been covered and the other off the mount
-// that covered it. The answer has to come from the ancestor chain, and the
-// kernel's own verdict was recorded when the table was captured: a file created
-// through that path landed in tmpVOL2, the one this reports.
+// TestVisibilitySeparatesTwoRecordsOnOnePathByTheirAncestorChain: the kernel placed the file in tmpVOL2, the mount this reports.
 func TestVisibilitySeparatesTwoRecordsOnOnePathByTheirAncestorChain(t *testing.T) {
 	entries := mustParse(t, compositeOvermountTable)
 
@@ -517,16 +400,7 @@ func TestVisibilitySeparatesTwoRecordsOnOnePathByTheirAncestorChain(t *testing.T
 	}
 }
 
-// mountPointStringRule is the rule this package used before: the last record
-// naming a path is what is visible there, and a path no second record names is
-// not covered at all. It is reproduced here verbatim from the implementation it
-// replaced, so the tests below compare against what the code ACTUALLY did
-// rather than against a description of it.
-//
-// Keeping it is the point. A fix whose test passes before and after has not
-// been shown to fix anything, and the two tests that use this are the ones that
-// would still pass if the tree logic were deleted tomorrow — they fail instead,
-// because they assert the old answer and the new answer are different.
+// mountPointStringRule is the previous last-record-wins rule, kept to show the tree rule gives a different answer.
 func mountPointStringRule(entries []Entry, major, minor uint32) []string {
 	top := make(map[string]Entry, len(entries))
 	var order []string
@@ -546,13 +420,7 @@ func mountPointStringRule(entries []Entry, major, minor uint32) []string {
 	return targets
 }
 
-// TestTheStringRuleCallsAnAncestorOvermountVisible is the defect, stated as a
-// difference rather than as an assertion about the new code alone.
-//
-// On the ancestor-overmount table the old rule reports the volume as visible at
-// /tmp/bs33/base/vol — because no second record names that path, which is
-// precisely the shape it cannot see. A teardown acting on that answer hands
-// umount(2) a path that no longer resolves to the volume.
+// TestTheStringRuleCallsAnAncestorOvermountVisible shows the string rule wrongly reports the covered volume visible.
 func TestTheStringRuleCallsAnAncestorOvermountVisible(t *testing.T) {
 	entries := mustParse(t, ancestorOvermountTable)
 

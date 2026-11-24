@@ -84,9 +84,7 @@ func TestFencedControllerInitiatesNoPromotion(t *testing.T) {
 	}()
 
 	after := prov.promoteCount()
-	// Two timers exist by now: the renewal wait from when it led, and the retry
-	// wait it parked on after being fenced. Each further round adds one. The
-	// barrier comes BEFORE the advance so no tick is fired into an empty clock.
+	// Two timers exist now, plus one per round; the barrier comes before the advance.
 	for i := 0; i < 5; i++ {
 		r.clock.awaitTimers(t, 2+i)
 		r.clock.Advance(r.ctrl.Config().RetryInterval)
@@ -100,10 +98,7 @@ func TestFencedControllerInitiatesNoPromotion(t *testing.T) {
 	}
 }
 
-// The window this closes: the lease dies with drbdadm already running. The
-// barrier holds the provider call open, the test kills the lease while it is
-// held, and the hook records what the IN-FLIGHT call saw — so the test proves
-// the interleave happened rather than assuming it did.
+// The lease dies while Promote is in flight; the hook records what the call saw.
 func TestFenceCancelsAPromotionAlreadyInFlight(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 
@@ -155,10 +150,7 @@ func TestFenceCancelsAPromotionAlreadyInFlight(t *testing.T) {
 	}
 }
 
-// The dangerous ordering: drbdadm SUCCEEDED and the cancellation landed a
-// moment later, so the provider honestly reports nil while the lease that
-// authorized the promotion is already gone. The controller must not keep the
-// claim.
+// Promote succeeded after the lease was gone; the controller must drop the claim.
 func TestPromotionThatSucceedsAfterLeaseLossIsVoided(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 	prov.setPromoteCompletesAfterCancel()
@@ -267,10 +259,7 @@ func TestFencedControllerCampaignsAgainAndReElects(t *testing.T) {
 	}
 }
 
-// A read that failed BECAUSE the lease died is not a provider failure, and must
-// not be reported as one. The distinction matters to whoever reads the status:
-// "drbdsetup is broken" and "you were fenced mid-read" call for different
-// responses.
+// A read that failed because the lease died is not reported as a provider failure.
 func TestAStateReadCutShortByAFenceIsNotAProviderFailure(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 	killed := errors.New("drbdsetup status: signal: killed")
@@ -315,16 +304,7 @@ func TestAStateReadCutShortByAFenceIsNotAProviderFailure(t *testing.T) {
 	}
 }
 
-// A lease that ends in the same instant the manager is canceled must still be
-// recorded as a fence. Both exits demote, so nothing unsafe follows either way,
-// but a node that was fenced reporting only a clean stop loses the one fact an
-// operator needs from the incident.
-//
-// The tie is forced rather than hoped for. The manager is held inside a
-// ReplicationState call — deliberately NOT inside a promotion, because a voided
-// promotion records the fence on its own and would satisfy this test for the
-// wrong reason — and both conditions are established before the call is let go,
-// so the loop is guaranteed to meet two ready cases at once.
+// A lease ending as the manager is canceled is recorded as a fence; the tie is forced inside ReplicationState.
 func TestAFenceRacingAShutdownIsStillRecordedAsAFence(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 
@@ -439,8 +419,7 @@ func TestAnUnyieldedRoleSurvivesTheRetryLoop(t *testing.T) {
 	}
 }
 
-// The counterpart: a fence whose demote SUCCEEDED carries no such hazard, so
-// campaigning reports the contender's own error normally.
+// A fence whose demote succeeded carries no hazard.
 func TestACleanlyYieldedRoleDoesNotMaskTheCampaignError(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 	r := newRig(t, prov, nil)
@@ -494,9 +473,7 @@ func TestASuccessfulDemoteUpdatesTheReportedRole(t *testing.T) {
 		r.status(testVolume))
 }
 
-// A demote that FAILED leaves the role alone, because it does not know where
-// the role ended up — and guessing secondary would report the node as safe when
-// the whole point of the failure is that it may not be.
+// A failed demote leaves the recorded role alone.
 func TestAFailedDemoteLeavesTheReportedRoleAlone(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 	prov.setDemoteErr(errors.New("drbdadm secondary vol1: Device is held open by someone"))
@@ -517,17 +494,7 @@ func TestAFailedDemoteLeavesTheReportedRoleAlone(t *testing.T) {
 	}
 }
 
-// The scheduling window the context alone cannot cover.
-//
-// leaseCtx is canceled by a watcher goroutine when Done closes, and Go does not
-// promise that goroutine has run. So there is a window in which the lease is
-// provably over and leaseCtx.Err() is still nil — and a check consulting only
-// the context would, in that window, accept and ANNOUNCE a completed promotion
-// for a node that no longer owns the volume.
-//
-// The window is reproduced exactly rather than raced for: reconcile is called
-// directly with a lease whose Done has closed and a context that is still live,
-// which is the state the watcher has not yet caught up with.
+// The lease's Done has closed while leaseCtx is still live; reconcile is called directly in that state.
 func TestReconcileRefusesOnAClosedDoneWithALiveContext(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 	r := newRig(t, prov, nil)

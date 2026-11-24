@@ -22,34 +22,13 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/preflight"
 )
 
-// Posture is what this provider checks and what it does not, by name.
-//
-// It is the type pkg/local reports, not a second one: a component that builds
-// whichever provider a deployment configured prints one posture with one
-// renderer, and a guard present in one provider and absent in the other shows up
-// as a missing LINE rather than as a different type. See internal/posture.
+// Posture is what this provider checks and what it does not, by name; the type is shared with pkg/local.
 type Posture = posture.Posture
 
 // GuardStatus is one guard's configured state.
 type GuardStatus = posture.GuardStatus
 
-// guardNames maps a preflight capability onto the words this report uses for
-// it. A capability absent from the map is reported under its own name rather
-// than dropped: an unnamed guard is still a guard, and omitting it would be the
-// silence this type exists to remove.
-//
-// The set is this provider's, not pkg/local's — net-admin and drbd-control are
-// required here and have no analog there. See requiredCapabilities, which
-// measured it.
-//
-// The kernel keyring is listed CONDITIONALLY, and the condition is the whole
-// reason it is here. It used to be the one capability this package never
-// touched; LUKS-above-DRBD (#13) made it required whenever the provider is
-// configured to encrypt, and not otherwise. Leaving it out of this map would
-// mean New performs a startup check that the report does not mention — the
-// same invisible-guard defect one level up, with the sign flipped: not an off
-// guard nobody can see, but an ON one. Listing it lets an operator tell an
-// encrypting provider from a plain one by reading the posture.
+// guardNames maps a preflight capability to its report name; unmapped ones are reported under their own name. The keyring appears only when encrypting.
 var guardNames = map[preflight.Capability]string{
 	preflight.CapabilityDeviceMapper:  "device-mapper access",
 	preflight.CapabilityMount:         "mount(2) privilege",
@@ -58,29 +37,12 @@ var guardNames = map[preflight.Capability]string{
 	preflight.CapabilityKernelKeyring: "kernel keyring",
 }
 
-// Posture reports what this provider checks and what it does not.
-//
-// It exists because an off guard is invisible. The startup capability checks
-// announce themselves by refusing construction, so an operator learns about them
-// the moment they are wrong; the mount-propagation guard added in #40 defaults
-// to OFF, so without this an operator who never enabled it sees exactly what an
-// operator whose cluster does not need it sees — nothing at all. Off-by-default
-// with no way to see it is not a conservative default, it is a silently absent
-// guard, which is the defect the guard was written to remove one level up.
-//
-// It is derived from the configuration the provider was built with and from
-// which seams were injected, so it describes THIS Provider rather than what the
-// package can do in general. The capability half is derived by the same function
-// New runs, so the report cannot claim a check New did not make.
+// Posture reports what this provider checks and what it does not, derived from its configuration and New's own capability derivation.
 func (p *Provider) Posture() Posture {
 	report := Posture{Component: "drbd"}
 
 	checked := make(map[preflight.Capability]struct{})
-	// The SAME arguments New passes to runPreflight, encryption included. That
-	// is what backs this method's promise that the report cannot claim a check
-	// New did not make — and it is a promise that only holds if the argument
-	// lists stay identical, which is why they are spelled out here rather than
-	// defaulted.
+	// The same arguments New passes to runPreflight; keep them identical.
 	for _, capability := range requiredCapabilities(p.injected, p.cfg.Encrypted, p.cfg.Preflight) {
 		checked[capability] = struct{}{}
 	}
@@ -111,11 +73,7 @@ func (p *Provider) Posture() Posture {
 			Active: p.secrets != nil,
 			Detail: peerAuthDetail(p.secrets != nil),
 		},
-		// Reported as a mitigation that is on or off rather than as a check,
-		// because that is what it is: nothing verifies afterwards that the
-		// extents were wiped. Its absence is the one line here an operator is
-		// most likely to want and least likely to go looking for — see
-		// Config.WipeOnDelete for what an unwiped delete leaves behind.
+		// A mitigation, on or off, not a check; see Config.WipeOnDelete.
 		GuardStatus{
 			Name:   "delete-time wipe",
 			Active: p.cfg.WipeOnDelete,
@@ -145,10 +103,6 @@ func propagationDetail(policy MountPropagationPolicy) string {
 }
 
 // peerAuthDetail says whether the replication link authenticates its peer.
-//
-// New already refuses to build a provider with neither a secret nor the explicit
-// acknowledgement, so the off case here is always a deployment that ASKED for
-// it — which is exactly the choice worth restating once at startup.
 func peerAuthDetail(haveSecret bool) string {
 	if haveSecret {
 		return "resources are provisioned with a shared secret DRBD authenticates the peer with"

@@ -35,8 +35,7 @@ func TestParseReadsARealRecord(t *testing.T) {
 
 	got := entries[0]
 	want := Entry{
-		// The kernel's identity for this MOUNT, which is what distinguishes it
-		// from a second mount of the same device at the same path.
+		// The mount ID, which tells this mount from a second mount of the device at the path.
 		ID: 580,
 		// The mount this one is mounted ON. It is the edge that makes the table
 		// a tree, and the tree is what decides whether a path reaches this
@@ -157,9 +156,7 @@ func TestParseRejectsMalformedRecords(t *testing.T) {
 	}
 }
 
-// TestParseDeviceNumbersAreDecimal pins the detail that silently matches the
-// wrong device: mountinfo prints major:minor in DECIMAL, while stat's %t:%T —
-// the obvious way to get the same pair for comparison — prints hex.
+// TestParseDeviceNumbersAreDecimal: mountinfo prints major:minor in decimal.
 func TestParseDeviceNumbersAreDecimal(t *testing.T) {
 	entries, err := Parse(strings.NewReader(`1 2 252:16 / /mnt rw - ext4 /dev/dm-16 rw`))
 	if err != nil {
@@ -261,9 +258,7 @@ func TestVisibleMountPointsForSkipsShadowedMounts(t *testing.T) {
 	}
 }
 
-// TestVisibleMountPointsForKeepsTheTopOfAStack covers the other direction: a
-// device mounted OVER something else is what is visible there, and it is this
-// provider's to unmount.
+// TestVisibleMountPointsForKeepsTheTopOfAStack: a device mounted over another is the visible one.
 func TestVisibleMountPointsForKeepsTheTopOfAStack(t *testing.T) {
 	entries := []Entry{
 		{Major: 8, Minor: 1, MountPoint: "/mnt/data"},
@@ -302,14 +297,7 @@ func TestVisibleMountPointsForAnUnmountedDevice(t *testing.T) {
 	}
 }
 
-// TestParsePropagation covers the optional fields, which are what decide
-// whether a mount made here can be seen anywhere else.
-//
-// A mount under a private parent exists only in the namespace that made it: a
-// workload in another namespace walks to the path and finds the directory as it
-// was before anything was mounted on it, with no error at any layer. These
-// fields are the only evidence of that, and they are the ones a parser is most
-// tempted to skip over on the way to the fields after the separator.
+// TestParsePropagation covers the optional fields that decide whether a mount is visible elsewhere.
 func TestParsePropagation(t *testing.T) {
 	cases := map[string]struct {
 		optional string
@@ -408,10 +396,7 @@ func TestPropagationPrivate(t *testing.T) {
 	}
 }
 
-// TestPropagationSurvivesAVariableNumberOfOptionalFields is the interaction
-// between this and the separator search: the optional fields are where the
-// record's length varies, so reading them wrongly is also how the fields AFTER
-// the separator get misread.
+// TestPropagationSurvivesAVariableNumberOfOptionalFields covers the separator search with varying optional fields.
 func TestPropagationSurvivesAVariableNumberOfOptionalFields(t *testing.T) {
 	line := `1 2 8:1 / /mnt rw shared:1 master:2 propagate_from:3 unbindable - ext4 /dev/sda1 rw`
 

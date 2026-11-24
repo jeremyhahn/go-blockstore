@@ -11,17 +11,7 @@
 // 2. Commercial License
 //    Contact licensing@automatethethings.com for commercial licensing options.
 
-// Package luktest reads and rewrites the JSON metadata of a LUKS2 container, for
-// tests that assert on what is ON DISK rather than on what a library reports.
-//
-// It exists because go-luks2 has no API that writes a header it did not build
-// itself, and two suites need exactly that: the unit suite checks the shapes
-// DataOffset must refuse, and the integration suite builds a container whose
-// data starts somewhere this package never would have put it. Neither shape can
-// be produced by formatting.
-//
-// Nothing here is for production code. It is a package of its own, instead of a
-// helper in a _test file, because the two suites live in different packages.
+// Package luktest reads and rewrites LUKS2 JSON metadata on disk, for tests only.
 package luktest
 
 import (
@@ -46,11 +36,7 @@ const (
 	checksumLen    = 64
 )
 
-// Metadata is the part of a LUKS2 JSON area the tests assert on. It is parsed
-// from the bytes on disk rather than taken from go-luks2's Header, which is a
-// typed view: the point of a conformance check is what was WRITTEN, and a view
-// that normalizes (a digest it does not expose, a hash it renders as a
-// crypto.Hash) cannot show a malformed spelling.
+// Metadata is the part of a LUKS2 JSON area the tests assert on, parsed from the bytes on disk.
 type Metadata struct {
 	Keyslots map[string]Keyslot `json:"keyslots"`
 	Segments map[string]Segment `json:"segments"`
@@ -190,10 +176,7 @@ func SetSegmentOffset(metadata map[string]any, offset string) error {
 	return nil
 }
 
-// SetKeyslotsSize overwrites config.keyslots_size in a decoded JSON area. The
-// area of keyslots is everything between the two header copies and the data, so
-// a rewrite that moves the data has to move it too, or the header contradicts
-// itself and go-luks2 refuses it.
+// SetKeyslotsSize overwrites config.keyslots_size in a decoded JSON area.
 func SetKeyslotsSize(metadata map[string]any, size string) error {
 	config, ok := metadata["config"].(map[string]any)
 	if !ok {
@@ -203,15 +186,7 @@ func SetKeyslotsSize(metadata map[string]any, size string) error {
 	return nil
 }
 
-// Rewrite applies edit to the JSON area of the container at device and writes
-// the result back to BOTH header copies with their checksums recomputed.
-//
-// Re-checksumming is what keeps the result honest: a header whose checksum no
-// longer matches is refused for that, and a test would pass without ever
-// reaching the branch it names. What comes back is a header the code under test
-// genuinely has to cope with, not a mangled file.
-//
-// Only the two header copies are written, so device may be a block device.
+// Rewrite applies edit to the JSON area and writes both header copies back with recomputed checksums.
 func Rewrite(tb testing.TB, device string, edit func(map[string]any) error) {
 	tb.Helper()
 

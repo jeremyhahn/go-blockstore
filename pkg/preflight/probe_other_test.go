@@ -22,13 +22,7 @@ import (
 	"testing"
 )
 
-// TestEveryProbeRefusesOnThisPlatform is the fail-closed rule where the kernel
-// facilities do not exist at all.
-//
-// The package compiles on darwin and windows so the tree can be built and
-// vetted there, matching pkg/local. What it must never do is answer "the
-// capability is available" — a preflight that passes where device-mapper does
-// not exist lies in the one direction that costs something.
+// TestEveryProbeRefusesOnThisPlatform: no probe reports a capability as available off Linux.
 func TestEveryProbeRefusesOnThisPlatform(t *testing.T) {
 	for capability, probe := range platformProbes() {
 		t.Run(string(capability), func(t *testing.T) {

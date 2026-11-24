@@ -20,25 +20,11 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/preflight"
 )
 
-// PreflightMode selects which privilege checks New runs before it hands back a
-// Provider.
-//
-// The checks exist because the privileges this provider needs are granted by
-// three independent mechanisms — capabilities, seccomp and an LSM profile — and
-// a deployment can satisfy two of them and fail the third silently until the
-// first volume is attached. See package preflight.
+// PreflightMode selects which privilege checks New runs; see package preflight.
 type PreflightMode int
 
 const (
-	// PreflightConfigured checks the capabilities this provider's configuration
-	// will actually exercise, for each seam left at its real implementation. It
-	// is the zero value, so a provider built for production is checked without
-	// anybody having to opt in.
-	//
-	// A seam replaced by the caller is NOT checked, and that is a derivation
-	// rather than a guess: a Provider given its own Mounter does not call
-	// mount(2), so mount(2) being unavailable would not affect it. Injecting a
-	// seam is an explicit act that replaces the real operation.
+	// PreflightConfigured, the zero value, checks the capabilities of every seam left at its real implementation.
 	PreflightConfigured PreflightMode = iota
 
 	// PreflightAll checks every capability the provider could need, whatever
@@ -46,14 +32,7 @@ const (
 	// deployment is correct rather than merely that this provider will work.
 	PreflightAll
 
-	// PreflightOff runs no checks.
-	//
-	// It exists for callers that construct a Provider they will not perform
-	// privileged operations with — enumerating configuration, validating
-	// settings in a CLI, a test harness driving fakes through the factory. It
-	// is an explicit, recorded choice in configuration, never a default and
-	// never something this package infers, because the failure it re-enables is
-	// exactly the one the checks were added to remove.
+	// PreflightOff runs no checks, for providers that perform no privileged operations; it must be chosen explicitly.
 	PreflightOff
 )
 
@@ -76,12 +55,7 @@ func preflightModeSpellings() []string {
 	return spellings
 }
 
-// requiredCapabilities derives what this configuration will actually ask the
-// kernel to do.
-//
-// The derivation is from the Options as the caller supplied them, before New
-// substitutes defaults, because a nil seam is precisely what says "the real one
-// will be used".
+// requiredCapabilities derives the needed capabilities from the Options before defaults are applied.
 func requiredCapabilities(opts Options, mode PreflightMode) []preflight.Capability {
 	if mode == PreflightOff {
 		return nil
@@ -99,10 +73,7 @@ func requiredCapabilities(opts Options, mode PreflightMode) []preflight.Capabili
 		capabilities = append(capabilities, preflight.CapabilityMount)
 	}
 
-	// The kernel keyring is only reached when this provider handles encrypted
-	// volumes, which is what Encrypted or a KeyProvider says. Encryption also
-	// creates dm-crypt mappings, so it implies device-mapper whatever the
-	// runner is.
+	// Encryption needs the kernel keyring and implies device-mapper.
 	if all || (opts.luks == nil && (opts.Encrypted || opts.KeyProvider != nil)) {
 		capabilities = append(capabilities, preflight.CapabilityKernelKeyring)
 		usesDeviceMapper = true
@@ -114,20 +85,7 @@ func requiredCapabilities(opts Options, mode PreflightMode) []preflight.Capabili
 	return capabilities
 }
 
-// runPreflight verifies the deployment before New returns a Provider.
-//
-// It runs LAST in New, after every argument has been validated, so that a
-// caller who got the configuration wrong hears about the configuration rather
-// than about a container's capabilities. And it runs at construction rather
-// than at the first Attach: the conditions it detects are fixed when the
-// process starts and cannot change afterwards, so discovering them at the first
-// volume operation converts a deployment mistake into an outage in the middle
-// of a shift, in a code path that reads like a storage fault.
-//
-// Nothing is checked when the derived capability set is empty — a provider
-// driven entirely through injected seams performs no privileged operation of
-// its own — and that is not a silent pass: it is the case where there is
-// nothing to be privileged for.
+// runPreflight runs last in New, after argument validation; an empty capability set checks nothing.
 func runPreflight(opts Options, mode PreflightMode) error {
 	capabilities := requiredCapabilities(opts, mode)
 	if len(capabilities) == 0 {

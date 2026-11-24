@@ -19,19 +19,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/internal/mountguard"
 )
 
-// MountPropagationPolicy selects whether Mount verifies that the mount it just
-// made can be seen outside this mount namespace.
-//
-// Wrong mount propagation is the quietest failure in the whole deployment
-// model. mount(2) succeeds, the provider reports success, and the workload in
-// its own namespace walks to the path and finds the directory exactly as it was
-// before anything was mounted on it. There is no error, no log line and no
-// non-zero exit anywhere; the first evidence is a workload writing to its own
-// filesystem, and the second is somebody wondering where the data went.
-//
-// It is an alias for the shared policy, not a copy of it: pkg/drbd asks the same
-// question of the same mount table, and two policies would be two chances to
-// answer it differently. See internal/mountguard.
+// MountPropagationPolicy selects whether Mount verifies the new mount is visible outside this namespace; alias of the internal/mountguard policy.
 type MountPropagationPolicy = mountguard.Policy
 
 const (
@@ -52,10 +40,7 @@ var errUnwindTargetTakenOver = mountguard.ErrTargetTakenOver
 // order, for the error a misspelling produces.
 func mountPropagationSpellings() []string { return mountguard.Spellings() }
 
-// mountGuard is this provider's policy over its mount table.
-//
-// It is built at each call site rather than held as a field, so the policy the
-// guard enforces and the policy Posture reports are the same one value.
+// mountGuard is this provider's policy over its mount table, built per call so Posture reports the same value.
 func (p *Provider) mountGuard() mountguard.Guard {
 	return mountguard.Guard{Policy: p.mountPropagation, Table: p.mountTable}
 }

@@ -263,13 +263,7 @@ func TestSystemCommandFailuresSurface(t *testing.T) {
 	}
 }
 
-// TestMountTableFailuresFailClosed is the sweep above's counterpart for the one
-// lookup that is no longer a command.
-//
-// A mount table that could not be read must never be reported as "not mounted".
-// That confusion is what asking findmnt made unavoidable — its single non-zero
-// exit meant both — and "not mounted" is what Unmount converges on and what
-// Status presents as a volume nobody is using.
+// TestMountTableFailuresFailClosed: an unreadable mount table is never "not mounted".
 func TestMountTableFailuresFailClosed(t *testing.T) {
 	cases := map[string]error{
 		"unreadable proc file": &mountinfo.ReadError{Path: mountinfo.ProcPath, Err: os.ErrPermission},
@@ -287,8 +281,7 @@ func TestMountTableFailuresFailClosed(t *testing.T) {
 	}{
 		"Unmount": {
 			call: func(p *Provider) error { return p.Unmount(context.Background(), testVolume, testMountPoint) },
-			// Unmount asks where the DEVICE is mounted, not what is mounted at
-			// the path, so the device is what its failure names.
+			// Unmount asks where the device is mounted, so the device is what its failure names.
 			wantIn: "/dev/drbd0",
 		},
 		"Status": {

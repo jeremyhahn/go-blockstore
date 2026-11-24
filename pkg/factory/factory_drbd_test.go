@@ -30,9 +30,7 @@ func drbdSettings(t *testing.T) map[string]string {
 	t.Helper()
 	dir := t.TempDir()
 
-	// The factory builds from settings alone, so peer authentication has to be
-	// reachable that way — there is no option to inject a provider through.
-	// This is the settings-driven path an operator actually uses.
+	// Peer authentication must be reachable from settings alone.
 	secret := filepath.Join(dir, "drbd.secret")
 	if err := os.WriteFile(secret, []byte("s3cr3t-replication-key-for-tests\n"), 0o600); err != nil {
 		t.Fatalf("writing the replication secret: %v", err)
@@ -41,12 +39,7 @@ func drbdSettings(t *testing.T) map[string]string {
 	// this is the settings map a caller writes, and the test is worth failing
 	// if a key is renamed without the callers being told.
 	return map[string]string{
-		// The startup privilege checks are off because these tests are about
-		// REGISTRATION and the settings-driven path, not about whether this
-		// machine has a drbd kernel module and CAP_NET_ADMIN. The checks that
-		// this disables are exercised on their own in the drbd package's
-		// preflight tests, which assert New refuses exactly when the checker
-		// does.
+		// Preflight is off: these tests cover registration; the drbd package tests the checks.
 		"preflight": "off",
 
 		"volume_group": "vg0",
@@ -79,16 +72,13 @@ func TestNewDRBDProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProvider(%q): %v", factory.ProviderNameDRBD, err)
 	}
-	// The factory hands back a VolumeProvider; the DRBD backend must also
-	// satisfy the replicated contract, or the HA controller cannot drive it.
+	// The DRBD backend must also satisfy the replicated contract.
 	if _, ok := p.(common.ReplicatedProvider); !ok {
 		t.Fatalf("the %q provider does not satisfy common.ReplicatedProvider", factory.ProviderNameDRBD)
 	}
 }
 
-// TestNewDRBDProviderRejectsBadSettings proves the constructor's validation is
-// reachable through the factory, so a misconfigured deployment fails at
-// construction rather than at the first drbdadm call.
+// TestNewDRBDProviderRejectsBadSettings: validation is reachable through the factory.
 func TestNewDRBDProviderRejectsBadSettings(t *testing.T) {
 	settings := drbdSettings(t)
 	delete(settings, "volume_group")
@@ -102,11 +92,7 @@ func TestNewDRBDProviderRejectsBadSettings(t *testing.T) {
 	}
 }
 
-// TestFailedConstructionReturnsANilProvider guards a trap the compiler will not
-// catch: returning a constructor's (*drbd.Provider, error) pair straight from a
-// function typed (common.VolumeProvider, error) boxes a nil POINTER inside a
-// non-nil INTERFACE, so a caller's `if provider != nil` is true for a
-// construction that failed.
+// TestFailedConstructionReturnsANilProvider: a nil *drbd.Provider must not come back as a non-nil interface.
 func TestFailedConstructionReturnsANilProvider(t *testing.T) {
 	settings := drbdSettings(t)
 	delete(settings, "volume_group")
@@ -120,10 +106,7 @@ func TestFailedConstructionReturnsANilProvider(t *testing.T) {
 	}
 }
 
-// TestDRBDRefusesUnauthenticatedPeersByDefault checks that the refusal survives
-// construction through the factory, which is how a deployment actually builds
-// one. A provider that authenticated its peer only when built directly would
-// leave the configured path unprotected.
+// TestDRBDRefusesUnauthenticatedPeersByDefault through the factory.
 func TestDRBDRefusesUnauthenticatedPeersByDefault(t *testing.T) {
 	settings := drbdSettings(t)
 	delete(settings, "replication_secret_file")

@@ -27,18 +27,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// Setting keys accepted by New.
-//
-// They are snake_case, which is the convention across every go-blockstore
-// provider and is inherited from go-objstore (access_key_id,
-// secret_access_key, encryption_kms_path). The LVM volume group is
-// volume_group rather than the terser vg because pkg/local names the same
-// concept that way and the two must agree — a caller configuring either
-// provider should not have to remember which spelling this one wants.
-//
-// Any other key is rejected rather than ignored: a mistyped setting that
-// silently does nothing is a configuration bug that only shows up as wrong
-// behavior much later, on the node it was meant to fix.
+// Setting keys accepted by New, snake_case and shared with pkg/local; any other key is rejected.
 const (
 	SettingVolumeGroup         = "volume_group"
 	SettingConfigDir           = "config_dir"
@@ -53,75 +42,26 @@ const (
 	SettingPortBase            = "port_base"
 	SettingSnapshotSizePercent = "snapshot_size_percent"
 
-	// SettingReplicationSecretFile points at the file holding the shared secret
-	// DRBD authenticates the peer with. Both nodes of a pair need the same
-	// secret for a resource.
-	// #nosec G101 -- this is the NAME of a setting key, not a credential; the
-	// value it names is a path, and the secret itself never appears in source.
+	// SettingReplicationSecretFile names the file holding the peer authentication secret; both nodes need the same secret.
+	// #nosec G101 -- the name of a setting key, not a credential.
 	SettingReplicationSecretFile = "replication_secret_file"
 
-	// SettingAllowUnauthenticatedPeers ("true") provisions resources with no
-	// peer authentication at all.
-	//
-	// It exists for lab bring-up and is named so that nobody sets it by
-	// accident or mistakes it for a tuning knob. Absent — the default — a
-	// resource cannot be provisioned without a secret.
+	// SettingAllowUnauthenticatedPeers ("true") provisions resources with no peer authentication; by default a secret is required.
 	SettingAllowUnauthenticatedPeers = "allow_unauthenticated_peers"
 
-	// SettingWipeOnDelete ("true"/"false") zero-fills a volume's backing device
-	// before removing it, so its contents do not survive in the volume group's
-	// free extents. It defaults to false.
-	//
-	// Read Config.WipeOnDelete before leaving it at that default: it documents
-	// what an unwiped delete leaves behind, and what this option does and does
-	// not reach.
+	// SettingWipeOnDelete ("true"/"false", default false) zero-fills a volume's backing device before removing it; see Config.WipeOnDelete.
 	SettingWipeOnDelete = "wipe_on_delete"
 
-	// SettingEncrypted ("true"/"false") puts a LUKS2 container over each
-	// replicated device, so what crosses the wire and what rests on both nodes'
-	// backing volumes is ciphertext. It requires SettingLUKSKeyFile or an
-	// injected KeyProvider. It defaults to false.
-	//
-	// It is spelled the same as pkg/local's setting and means the same thing at
-	// the same layer of the API. What differs is where the container lives —
-	// ABOVE the replication here, not over a logical volume — and therefore
-	// when it is opened: see Promote.
+	// SettingEncrypted ("true"/"false", default false) puts a LUKS2 container above each replicated device; needs SettingLUKSKeyFile or a KeyProvider.
 	SettingEncrypted = "encrypted"
 
-	// SettingLUKSKeyFile is the path to a file holding the LUKS passphrase. It
-	// is read on every operation that needs one, so a rotated file takes effect
-	// without restarting the process; the file's bytes are the passphrase,
-	// trailing newline included.
-	//
-	// It must be an absolute path in cleaned form, and it must NOT be the file
-	// named by SettingReplicationSecretFile: that secret authenticates the peer
-	// and is shared with it, and giving it the additional job of protecting the
-	// data is not a configuration this provider will accept.
+	// SettingLUKSKeyFile is the absolute, cleaned path of the LUKS passphrase file, re-read on each use; it must differ from the replication secret file.
 	SettingLUKSKeyFile = "luks_key_file"
 
-	// SettingPreflight selects which startup privilege checks New performs:
-	// "configured" (the default), "all", or "off".
-	//
-	// It is spelled out in configuration rather than inferred because "off" is
-	// the value that re-enables the silent failure the checks removed — a
-	// provider that constructs happily on a node that cannot bring a resource
-	// up — and a choice with that consequence belongs where a reviewer sees it.
+	// SettingPreflight selects the startup privilege checks: "configured" (default), "all" or "off".
 	SettingPreflight = "preflight"
 
-	// SettingMountPropagation selects whether Mount verifies that the mount it
-	// made is visible outside this mount namespace: "unchecked" (the default)
-	// or "shared".
-	//
-	// Set it to "shared" where a workload in ANOTHER mount namespace consumes
-	// these mounts — a container handed a replicated volume by a storage
-	// component. Left unchecked there, a wrong propagation setting is the
-	// quietest failure in that model: the mount succeeds on this node, the
-	// workload finds an empty directory, and nothing anywhere reports an error.
-	//
-	// It is not the default because a mount is private on an ordinary host and
-	// that is correct there — a replicated cluster whose mounts nobody consumes
-	// from another namespace is not broken, and requiring propagation of it
-	// would refuse a working deployment on upgrade. See MountPropagationPolicy.
+	// SettingMountPropagation is "unchecked" (default) or "shared"; use shared where a workload in another mount namespace consumes the mounts.
 	SettingMountPropagation = "mount_propagation"
 )
 
@@ -159,8 +99,7 @@ type Config struct {
 	// because that is what DRBD matches an "on" section against.
 	NodeName string
 
-	// NodeAddress is the local replication address — the storage-VLAN IP, not
-	// the management one. The per-resource port is appended to it.
+	// NodeAddress is the local replication address (storage network); the per-resource port is appended.
 	NodeAddress net.IP
 
 	// NodeID is the local DRBD node id. Left unset, it and PeerNodeID are
@@ -174,10 +113,7 @@ type Config struct {
 	PeerAddress net.IP
 	PeerNodeID  int
 
-	// MinorBase and PortBase are the low ends of the device-minor and TCP-port
-	// ranges this provider allocates from. Minors and ports below them, or
-	// belonging to resources outside StateDir, are the operator's to keep clear
-	// of the range.
+	// MinorBase and PortBase are the low ends of the minor and port ranges this provider allocates from.
 	MinorBase int
 	PortBase  int
 
@@ -194,80 +130,12 @@ type Config struct {
 	// authentication. It is off unless explicitly set.
 	AllowUnauthenticatedPeers bool
 
-	// WipeOnDelete zero-fills a volume's backing logical volume before removing
-	// it, so its contents do not survive in the volume group's free extents.
-	//
-	// Read this before leaving it at its default: AN UNENCRYPTED VOLUME ON
-	// NON-DISCARDING MEDIA RETAINS READABLE DATA AFTER Delete UNLESS
-	// WipeOnDelete IS SET. Its extents go back to the volume group holding
-	// whatever was written to them, and the next volume to be allocated those
-	// extents can read it — lvcreate zeroes only the first few kilobytes of a
-	// new volume, enough that a stale filesystem signature is not detected, not
-	// enough that the last tenant's data is gone. The extents lvextend adds to a
-	// growing volume come from the same pool. Replication does not change this:
-	// what DRBD wrote to the backing device is plain data on both nodes, so the
-	// exposure exists once per copy.
-	//
-	// ENCRYPTION IS THE BETTER MITIGATION, and it is now available here: see
-	// Encrypted below. What survives in a freed extent is then ciphertext whose
-	// key went away with the LUKS header, at none of the cost — a wipe writes
-	// the whole volume, which is minutes per terabyte on rotating disks, while
-	// encryption costs nothing at delete time. This option remains the answer
-	// for a volume that is NOT encrypted, and for one that was provisioned
-	// before encryption was turned on, since the container is only ever
-	// formatted onto a device carrying nothing at all.
-	//
-	// How much the exposure bites depends on the storage. With LVM's
-	// devices/issue_discards set to 1 over a backing device that supports
-	// discard, lvremove discards the freed extents and they read back as zeroes
-	// whatever this option says. The LVM default is 0, and rotating disks do not
-	// discard at all, which is the case the option is for. Do not infer from a
-	// host where the data happens to be gone that it will be gone on the next
-	// one.
-	//
-	// What it does NOT reach is a snapshot's copy-on-write extents, which hold
-	// the pre-snapshot copies of everything the origin has overwritten since.
-	// Delete cannot encounter that here — it refuses a volume that still has
-	// snapshots, with common.ErrHasSnapshots — so on this provider the hazard is
-	// unreachable rather than merely unlikely; see Delete. A caller that removes
-	// the snapshots first and then deletes the origin has still had those CoW
-	// extents freed unwiped by the snapshot removal, and encryption is the only
-	// complete answer for a volume that has ever been snapshotted.
-	//
-	// It defaults to false, matching LVM's own behavior rather than imposing a
-	// full-volume zero-fill on every deletion in every deployment.
+	// WipeOnDelete zero-fills a volume's backing LV before removing it; default false.
+	// Without it, an unencrypted volume on non-discarding media leaves readable data in freed extents, on both nodes; encryption is the better mitigation.
 	WipeOnDelete bool
 
-	// Encrypted puts a LUKS2 container over each replicated device.
-	//
-	// The container sits ABOVE the replication, which is what makes it transit
-	// confidentiality and not merely encryption at rest: DRBD replicates the
-	// bytes of the device it is given, so the peer receives ciphertext and both
-	// nodes' backing volumes hold ciphertext. Peer AUTHENTICATION — the
-	// cram-hmac shared secret — is a separate control and neither implies the
-	// other; an authenticated peer is not a confidential link.
-	//
-	// The container's header is allocated ON TOP of the request, the way
-	// DRBD's metadata already is: common.VolumeSpec.SizeBytes is usable
-	// capacity, so an encrypted volume's DRBD device is sized at
-	// SizeBytes + internal/luks.HeaderBytes (16 MiB), its backing volume at
-	// that plus DRBD's metadata for it, and Status reports the device less
-	// the header. The filesystem inside the container has the whole of what
-	// the caller asked for, and pkg/local and this package agree on which side
-	// of the request the header falls. See dataBytes and backingBytes.
-	//
-	// RESIZING AN ENCRYPTED VOLUME IS SIZE-AT-OPEN. The dm-crypt mapping is
-	// sized from the replicated device when Promote opens it, and go-luks2
-	// exposes no table reload, so a resize grows the device and the mapping
-	// follows only when it is next opened. Resize therefore completes while
-	// the container is closed (a Secondary), recording the grow the
-	// filesystem is owed for the next Mount to perform online; grows the
-	// filesystem through an open mapping that still covers the device; and
-	// REFUSES, with ErrMappingStale, to grow one into a mapping the device
-	// has outgrown — naming the demote/promote cycle that reopens it — rather
-	// than fit the filesystem to the old size and record the new one. A
-	// restore that has to grow its destination takes the same path. See
-	// Provider.Resize and ErrMappingStale.
+	// Encrypted puts a LUKS2 container above each replicated device, so the wire and both backing volumes hold ciphertext.
+	// The 16 MiB header is added on top of SizeBytes. The mapping is sized at open, so Resize refuses with ErrMappingStale until a demote/promote reopens it.
 	Encrypted bool
 
 	// LUKSKeyFile is the path to a file holding the LUKS passphrase. Empty
@@ -275,26 +143,14 @@ type Config struct {
 	// WithKeyProvider instead.
 	LUKSKeyFile string
 
-	// Preflight selects which startup privilege checks New performs. It
-	// defaults to PreflightConfigured, which checks exactly the capabilities
-	// this configuration will exercise — a set that is NOT the local
-	// provider's; see requiredCapabilities.
+	// Preflight selects which startup privilege checks New performs; default PreflightConfigured.
 	Preflight PreflightMode
 
-	// MountPropagation selects whether Mount verifies that the mount it made is
-	// visible outside this mount namespace. It defaults to
-	// MountPropagationUnchecked; a deployment that hands these mounts to a
-	// workload in another namespace wants MountPropagationShared. See
-	// MountPropagationPolicy for why the default is off, and why off is still
-	// reported by Posture rather than being invisible.
+	// MountPropagation selects whether Mount verifies the mount is visible outside this namespace; default MountPropagationUnchecked.
 	MountPropagation MountPropagationPolicy
 }
 
-// ParseConfig validates a settings map and fills in defaults.
-//
-// Required: vg, node-address, peer-node, peer-address. node-name defaults to
-// the host's name, which is what DRBD will match anyway; every other setting
-// has a default above.
+// ParseConfig validates a settings map and fills in defaults; vg, node-address, peer-node and peer-address are required.
 func ParseConfig(settings map[string]string) (Config, error) {
 	known := map[string]struct{}{
 		SettingVolumeGroup: {}, SettingConfigDir: {}, SettingStateDir: {},
@@ -424,12 +280,7 @@ func ParseConfig(settings map[string]string) (Config, error) {
 		}
 		cfg.LUKSKeyFile = v
 	}
-	// One file cannot be both secrets. The replication secret is SHARED WITH
-	// THE PEER so DRBD can authenticate it; the LUKS passphrase decrypts the
-	// volume. Pointing both settings at one path does not configure two
-	// controls, it gives the peer-authentication secret the additional job of
-	// protecting the data — and a rotation of either one then silently changes
-	// the other.
+	// One file cannot hold both secrets: the replication secret is shared with the peer.
 	if cfg.LUKSKeyFile != "" && cfg.LUKSKeyFile == cfg.ReplicationSecretFile {
 		return Config{}, fmt.Errorf("%w: %s and %s name the same file %q: the peer-authentication secret must not also be the volume passphrase",
 			common.ErrInvalidArgument, SettingLUKSKeyFile, SettingReplicationSecretFile, cfg.LUKSKeyFile)
@@ -445,23 +296,7 @@ func ParseConfig(settings map[string]string) (Config, error) {
 	return cfg, nil
 }
 
-// resolveNodeIDs decides which DRBD node id each half of the pair carries.
-//
-// This is the one setting a two-node deployment cannot get wrong quietly. DRBD
-// identifies a node by its id, and both copies of a resource file must agree on
-// which name holds which: if node-a's copy says a=0/b=1 while node-b's copy
-// says b=0/a=1, the two never connect. A fixed default of "local 0, peer 1"
-// would produce exactly that on a pair where both sides took the default, so
-// there is none.
-//
-// With neither id given, they are derived from the two node names by sorting
-// them: the lexicographically smaller name takes 0. Both hosts compare the same
-// pair of names and so reach the same assignment without coordinating, which
-// makes the minimal configuration correct rather than merely convenient.
-//
-// Giving one id and not the other is refused. It would mix an explicit choice
-// on one side with a derived one on the other, which is how a pair ends up
-// disagreeing after somebody "fixed" a single node.
+// resolveNodeIDs assigns DRBD node IDs; with neither given, the lexicographically smaller name takes 0, and giving only one is refused.
 func resolveNodeIDs(settings map[string]string, nodeName, peerNode string) (nodeID, peerNodeID int, err error) {
 	_, haveNode := settings[SettingNodeID]
 	_, havePeer := settings[SettingPeerNodeID]
@@ -528,10 +363,7 @@ func requiredIP(settings map[string]string, key string) (net.IP, error) {
 	return ip, nil
 }
 
-// optionalBool reads a boolean setting. Only "true" and "false" are accepted:
-// a setting that turns off peer authentication is not one to reach through a
-// permissive parser that would take "yes", "1" or "TRUE" and leave an operator
-// unsure which spellings count.
+// optionalBool reads a boolean setting; only "true" and "false" are accepted.
 func optionalBool(settings map[string]string, key string) (bool, error) {
 	raw, ok := settings[key]
 	if !ok || raw == "" {

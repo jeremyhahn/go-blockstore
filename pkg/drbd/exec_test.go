@@ -25,16 +25,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// These exercise the production runner against real processes. Everything else
-// in the package runs on the scripted fake, which would happily pass over a
-// runner that lost stderr, reported the wrong exit code, or never execed at
-// all — and the exit code in particular is load-bearing: findmnt says "not
-// found" with 1 and blkid with 2, so a runner that flattened both to "error"
-// would turn an unmounted target into a failure and an empty device into an
-// unreadable one.
-//
-// /bin/sh is the only external dependency, and this package already requires a
-// Linux node with drbd-utils and LVM.
+// These exercise the production runner against real processes; /bin/sh is the only dependency.
 
 const (
 	testShell      = "/bin/sh"
@@ -58,14 +49,7 @@ func TestExecRunnerCapturesStdout(t *testing.T) {
 	}
 }
 
-// TestExecRunnerForcesTheCLocale keeps a localized host from reformatting the
-// lvs output this package parses.
-//
-// data_percent is the field that actually breaks: it goes through
-// strconv.ParseFloat, and a locale that writes "12,34" makes that read zero, so
-// ListSnapshots would report every snapshot as occupying nothing. The byte
-// counts are integers and would come through fine, which is what makes the
-// failure quiet enough to be worth pinning at the source.
+// TestExecRunnerForcesTheCLocale: a localized data_percent would parse as zero.
 func TestExecRunnerForcesTheCLocale(t *testing.T) {
 	for _, v := range []string{"LC_ALL", "LANG"} {
 		out, err := testRunner().Run(context.Background(), testShell, "-c", `printf '%s' "$`+v+`"`)

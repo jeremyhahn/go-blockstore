@@ -38,10 +38,7 @@ const enclavePackage = "github.com/jeremyhahn/go-enclave"
 // enclaveType is the type whose methods rule 1 is about.
 const enclaveType = "MemoryEnclave"
 
-// luksDir is the package that owns the custody model, as a directory relative
-// to the tree root. The rules are stated in terms of the tree's layout — "only
-// from inside internal/luks" — so this is a path and not an import path, and
-// the fixtures reproduce the layout to be scanned by the same rule.
+// luksDir is the custody-owning package, as a path relative to the tree root.
 const luksDir = "internal/luks"
 
 // backendType is the interface whose key-taking methods receive the passphrase
@@ -61,20 +58,13 @@ var keyTakingMethods = map[string]struct{}{
 	"TestKey": {},
 }
 
-// borrowedKeyNames are the parameter names rule 3 treats as a borrowed key
-// when the parameter's type is []byte. They are the names the custody model
-// uses — a WithBytes callback says `key`, the documentation says `passphrase`
-// — and the rule is stated on the name rather than on every
-// []byte because a []byte called buf that a provider fills from a descriptor
-// is not a borrowed key and has different rules.
+// borrowedKeyNames are the []byte parameter names rule 3 treats as a borrowed key.
 var borrowedKeyNames = map[string]struct{}{
 	"key":        {},
 	"passphrase": {},
 }
 
-// materialWords are the words that, as the LAST word of a parameter or result
-// name (rule 4), say the value IS the material rather than something about
-// it. See isMaterialName for the boundary rule and why it is the last word.
+// materialWords are the last words of a name that mark it as key material (rule 4).
 var materialWords = map[string]struct{}{
 	"key":        {},
 	"passphrase": {},
@@ -83,11 +73,7 @@ var materialWords = map[string]struct{}{
 	"token":      {},
 }
 
-// materialCarriers are the last words that do not change what a name means
-// when the word before them is material: keyBytes and secretData are still the
-// material. Anything else after a material word — keyPath, keyFile, tokenID,
-// secretName, passwordHash, keyLength — names a location, an identifier or a
-// derivation, not the material, and is deliberately NOT matched.
+// materialCarriers are trailing words that keep a material name material (keyBytes, secretData).
 var materialCarriers = map[string]struct{}{
 	"bytes":    {},
 	"data":     {},
@@ -100,10 +86,7 @@ type borrowWindow struct {
 	// Dir is the package directory relative to the tree root.
 	Dir string
 
-	// Func is the top-level function, in the form go doc uses: FileKeyProvider,
-	// (*Provider).writeSharedSecret. A closure inside one of these counts
-	// as being in it — the providers do their borrows inside the closure they
-	// return, and a closure is not a place a rule can be stated on.
+	// Func is the top-level function in go doc form; closures count as part of it.
 	Func string
 
 	// Why is the reason it borrows, for the reader of this table and for the
@@ -111,28 +94,7 @@ type borrowWindow struct {
 	Why string
 }
 
-// borrowWindows is the complete list of places a WithBytes call is allowed.
-//
-// It is an allowlist in the scanner and not an annotation next to the code,
-// unlike the shell scanner's guard:fail-open marker, and the difference is
-// deliberate. `|| true` has legitimate uses that a reviewer can weigh line by
-// line, so the marker's job is to make the reason travel with the code. A new
-// borrow window is a change to the custody model itself: the set of places key
-// material is exposed as bytes is small, enumerable, and reviewed as a whole,
-// so the place to add one is here, with its reason beside the others, where
-// the reviewer of a change to the model sees the model.
-//
-// The first entry is the anchor. The LUKS passphrase has NO read-out window:
-// it is lent to the Backend as an enclave and go-luks2 borrows it itself, so
-// (*Manager).withKey is deliberately not in this table and a WithBytes call in
-// it is a finding. The one place the passphrase's bytes enter the model is
-// FileKeyProvider, which fills locked pages from the key file's descriptor,
-// and that is the anchor. The other provider builds an enclave too, by a clone
-// borrow that copies locked pages into locked pages, and in neither does the
-// material reach anything but the enclave. pkg/drbd's two entries are the same
-// two shapes for the replication shared secret, which is a separate secret with
-// the same custody: read from a file into locked pages, then written from inside
-// the borrow straight to the resource file's descriptor.
+// borrowWindows lists every function allowed to call WithBytes, with FileKeyProvider as the anchor; (*Manager).withKey is deliberately absent.
 var borrowWindows = []borrowWindow{
 	{luksDir, "FileKeyProvider", "a fill borrow: the key file's bytes go from the descriptor into locked pages"},
 	{luksDir, "StaticKeyProvider", "a clone borrow: locked pages are copied into a fresh enclave's locked pages"},
@@ -144,23 +106,7 @@ var borrowWindows = []borrowWindow{
 // still looking at the right thing. See KeyMaterialCustody.
 var anchorWindow = borrowWindows[0]
 
-// custodyBuildConfigs are the build configurations every package is
-// type-checked under.
-//
-// Type information needs a consistent set of files, and this repository has
-// files that exclude each other: native_linux.go and native_other.go both
-// declare Native. So each package is checked once per configuration and the
-// findings are merged, and a file that NO configuration selects is a scan
-// failure rather than a file quietly left unread — the tag-gated file is
-// exactly where a violation would hide from a compile-based check, and the
-// text scanners in this package read everything for that reason.
-//
-// Windows is the second GOOS because it is the one Go build context that is
-// neither linux nor unix, so it selects every `!linux` stub and the
-// `!unix || aix` one in a single pass. The imports those stubs resolve are
-// still the host's — the source importer type-checks dependencies under
-// build.Default — which is fine as long as the stubs use nothing
-// platform-specific, and the type-check itself reports it if one ever does.
+// custodyBuildConfigs are the build configurations each package is type-checked under; a file none selects is a scan failure.
 var custodyBuildConfigs = []struct {
 	GOOS string
 	Tags []string
@@ -169,109 +115,9 @@ var custodyBuildConfigs = []struct {
 	{"windows", []string{"drbd"}},
 }
 
-// KeyMaterialCustody refuses code that takes key material out of the custody
-// model.
-//
-// # The model
-//
-// A LUKS passphrase in this repository is never a plain []byte or string at
-// rest. A KeyProvider returns it as a go-enclave MemoryEnclave — mlock'd,
-// guarded, kept out of core dumps, wiped on release — and it never becomes
-// bytes in this repository's own code at all: internal/luks.(*Manager).withKey
-// lends the enclave to one Backend call and destroys it, and the Backend hands
-// it straight to go-luks2, which does its own borrowing. pkg/local and pkg/drbd
-// call the Manager and never see the key. The reason the enclave rather than a
-// wiped slice is the primitive is stated on internal/luks.KeyProvider: a []byte
-// cannot be taken back, because the collector may already have copied it.
-//
-// Every word of that is a convention a future change can break without any
-// test noticing, because the tests drive the providers through fakes that do
-// not care where the bytes came from. This scanner is the convention made
-// mechanical. It runs the type checker over the whole tree so its rules are
-// about TYPES — the enclave's methods, the Backend interface — and not about
-// names: a method called Open on luks.Backend, or os.Open, must not fire, and a
-// textual scanner cannot tell them apart.
-//
-// # The rules, and why each is shaped as it is
-//
-// There is no rule against the enclave's copying exits. go-enclave v0.8.0
-// removed MemoryEnclave.Open and OpenString, so a call to either no longer
-// type-checks and the compiler states that rule better than a scanner could.
-//
-//  1. Every borrow in a named place. MemoryEnclave.WithBytes may be called only
-//     from the functions in borrowWindows; anything else is a finding, and
-//     (*Manager).withKey in particular is not in the table, so the passphrase
-//     is not read out where it is lent. The tree has four sites today and the
-//     table says what each one does: the providers fill and clone enclaves with
-//     the method, and pkg/drbd's replication secret has its own read-out
-//     window. The anchor is FileKeyProvider: if the tree borrows from enclaves
-//     at all, it must exist and contain exactly one WithBytes, or the scan
-//     reports that it has lost its anchor — a scanner that would keep passing
-//     after the window it is anchored on was removed would be passing
-//     vacuously.
-//
-//  2. The key-taking Backend methods are called only from internal/luks. A
-//     call to Format, Open or TestKey whose receiver's static type is
-//     internal/luks.Backend from any other package is a finding, whatever the
-//     receiver is called and whether it arrived by alias or embedding. Those
-//     three methods are where the passphrase enclave is handed over, and the
-//     only code that may do so is the code that owns its lifetime: Manager
-//     takes a fresh enclave from the KeyProvider for each call and destroys it
-//     after, and a caller outside the package would be lending one it does not
-//     own.
-//
-//  3. A borrowed key is argument-only. In every function or closure with a
-//     []byte parameter named key or passphrase, that parameter may appear ONLY
-//     as a direct argument of a call — not on the right of an assignment or
-//     define, not in a slice expression, not captured by a closure that is not
-//     invoked on the spot, and not as an argument of append, copy or a type
-//     conversion, which are calls that copy. One refinement: a composite
-//     literal is allowed when the literal is itself a direct argument of the
-//     call — it is built for the call and passed with it, and outlives it no
-//     more than a bare argument would. This is what makes "must not retain
-//     it" a property the build checks. It is a rule on the NAME because a
-//     []byte called buf that a provider fills from a descriptor is not a
-//     borrowed key; len(key) is the sanctioned way to inspect one.
-//
-//  4. Key-material-shaped values do not cross a package boundary in the clear.
-//     An exported function, method, interface method or func type whose
-//     parameter or named result is a string or []byte with a name ending in
-//     key, passphrase, secret, password or token is a finding. The Backend
-//     seam is not an exception: it carries an enclave, not bytes. The match is
-//     on the LAST word of the name, split at case and underscore boundaries: keyPath, luksKeyFile, tokenID,
-//     secretName and passwordHash name a location, an identifier or a
-//     derivation, not the material, and they are what this tree's exported
-//     surface actually carries. keyBytes and secretData are still material and
-//     do match.
-//
-//     Two refinements, both learned from what the first version fired on and
-//     written down here rather than tuned into silence. The bare word `key` as
-//     a STRING does not match: pkg/common.Coordinator is a key/value store
-//     whose Get, Put, Delete, CompareAndSwap and AcquireLease all take
-//     `key string`, and that is the key of a key/value pair — the sense the
-//     word has in every map in Go — not a cryptographic key, which in this
-//     tree is bytes. So `key []byte` matches, `luksKey string` and
-//     `apiKey string` match (a qualified key is whatever it says it is), and
-//     `key string` is a lookup. The other four words have no lookup sense and
-//     match as either type. And an unnamed parameter cannot match at all,
-//     because the rule is on the name; an exported `Unlock([]byte)` is the
-//     reviewer's to read.
-//
-// # What it examines, and the limit that leaves
-//
-// Every non-test Go file under the tree, type-checked under each configuration
-// in custodyBuildConfigs, with a scan failure for any file no configuration
-// selected. _test.go files are not examined: the tests hold fakes whose whole
-// job is to accept a key and look at it. A type error is a scan failure, not a
-// pass, because incomplete type information is exactly what would let a rule
-// keyed on types miss its target.
-//
-// What that leaves uncovered, stated rather than implied: rule 3 permits any
-// ordinary call, so a callee that copies its argument — slices.Clone, or a
-// function of this repository's own — is a copy the rule does not see; rule 4
-// looks at parameters and results, not at exported struct fields; and a []byte
-// key under a name other than key or passphrase is outside rule 3. Each is a
-// gap a reviewer reads for, and each is narrower than what the rules close.
+// KeyMaterialCustody type-checks the tree and refuses code that takes key material out of the enclave custody model.
+// Rules: WithBytes only in borrowWindows; key-taking Backend methods only from internal/luks; a borrowed key only as a direct call argument; no exported key, passphrase, secret, password or token string or []byte parameters.
+// Test files are not examined; a type error is a scan failure.
 func KeyMaterialCustody() Scanner {
 	return Scanner{
 		Name: "key-material-custody",
@@ -283,11 +129,7 @@ func KeyMaterialCustody() Scanner {
 	}
 }
 
-// custodyEvidence is what the scan saw of the model itself, over and above
-// the findings: which borrow windows it actually met. The scanner does not
-// report it; the package's tests use it to keep borrowWindows honest against
-// the real tree, so an entry naming a function that no longer borrows cannot
-// sit in the table as an exemption waiting for something to wear it.
+// custodyEvidence records which borrow windows the scan met, so tests keep borrowWindows honest.
 type custodyEvidence struct {
 	// windowsSeen counts WithBytes call sites per borrow window, keyed by
 	// Dir + ":" + Func.
@@ -307,11 +149,7 @@ func scanCustody(root string) (Result, custodyEvidence, error) {
 
 	modulePath := custodyModulePath(root)
 
-	// The source importer resolves dependencies through build.Default, and
-	// pkg/factory imports pkg/drbd, whose files are behind the drbd tag. Without
-	// the tag on the importer's context the import is a package with no New,
-	// and the type-check of pkg/factory fails. The context is shared package
-	// state, so it is set for the scan and put back after.
+	// pkg/factory imports the drbd-tagged pkg/drbd, so the importer context gets the tag for the scan and is restored after.
 	savedTags := build.Default.BuildTags
 	build.Default.BuildTags = append(append([]string(nil), savedTags...), "drbd")
 	defer func() { build.Default.BuildTags = savedTags }()
@@ -459,17 +297,7 @@ func scanCustody(root string) (Result, custodyEvidence, error) {
 	return result, evidence, nil
 }
 
-// custodyLoader is the one source importer every scan in a process shares.
-//
-// The importer type-checks each dependency from source the first time it is
-// asked for it and caches the result, and the dependencies are the MODULE's —
-// resolved through the go command from the process's working directory, not
-// from the tree being scanned — so they are the same packages whichever tree a
-// scan is over. Sharing them is what keeps the package's tests affordable: the
-// tests scan the repository, both fixtures and several built trees, and each
-// scan re-checking x/sys/unix and go-luks2 from source cost 81s under the race
-// detector before this and 19s after (measured 2026-09-17). The importer is not safe
-// for concurrent use, hence the lock; the scanner was never concurrent.
+// custodyLoader is the one source importer every scan in a process shares; the lock guards it.
 var custodyLoader struct {
 	sync.Mutex
 	fset *token.FileSet
@@ -491,11 +319,7 @@ type custodyAnchor struct {
 	count int
 }
 
-// custodyModulePath reads the module path from the go.mod at or above root, so
-// the packages under root are checked under the import paths the rest of the
-// module sees them by — which is what makes a fixture's internal/luks and the
-// real one answer to the same rule. A tree with no module above it gets a
-// placeholder; it can hold no custody model anyway.
+// custodyModulePath reads the module path from the go.mod at or above root, or returns a placeholder.
 func custodyModulePath(root string) string {
 	moduleRoot, err := Root(root)
 	if err != nil {
@@ -778,10 +602,7 @@ func isClearTextType(t types.Type) bool {
 	return false
 }
 
-// isMaterialName reports whether an identifier names key material, by the
-// last-word rule the scanner's documentation states. isString says whether
-// the value is a string rather than bytes, for the one word — key — whose
-// bare string form is a lookup key and not material.
+// isMaterialName reports whether an identifier names key material; a bare string key is a lookup key.
 func isMaterialName(name string, isString bool) bool {
 	words := splitWords(name)
 	if len(words) == 0 {
