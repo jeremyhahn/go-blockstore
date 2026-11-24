@@ -20,7 +20,14 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/preflight"
 )
 
-// Posture lists what this provider checks and what it does not, by name; the type is shared with pkg/drbd via internal/posture.
+// Posture is what this provider checks and what it does not, by name.
+//
+// It exists because a guard that is off is invisible: an operator who never
+// enabled the mount-propagation guard sees exactly what an operator whose
+// deployment does not need it sees — nothing. Reporting a guard as CHECKED or
+// as NOT CHECKED, both kinds in the same list, is what makes the third state
+// sayable. See internal/posture, whose type this is: pkg/drbd reports the same
+// shape, and a caller holding either provider should not need two renderers.
 type Posture = posture.Posture
 
 // GuardStatus is one guard's configured state.
@@ -33,7 +40,10 @@ var guardNames = map[preflight.Capability]string{
 	preflight.CapabilityKernelKeyring: "kernel keyring",
 }
 
-// Posture reports what this provider checks and what it does not, derived from its configuration.
+// Posture reports what this provider checks and what it does not.
+//
+// It is derived from the configuration the provider was built with, so it
+// describes this Provider rather than what the package can do in general.
 func (p *Provider) Posture() Posture {
 	report := Posture{Component: "local"}
 

@@ -15,7 +15,12 @@
 
 package mountinfo
 
-// DeviceNumber is refused off Linux, where there is no /proc/self/mountinfo.
+// DeviceNumber has no meaning off Linux, where there is no
+// /proc/self/mountinfo to match a number against.
+//
+// The package still compiles everywhere so the providers that import it do too;
+// refusing here is what keeps that from becoming a silent zero pair that
+// matches nothing and reads as "not mounted".
 func DeviceNumber(path string) (uint32, uint32, error) {
 	return 0, 0, &DeviceError{Path: path, Err: ErrUnsupportedPlatform}
 }

@@ -19,7 +19,12 @@ import (
 	"sort"
 )
 
-// Capability names one thing the storage component must be able to do; each has its own probe.
+// Capability names one thing the storage component must be able to do.
+//
+// The set is deliberately small and each member is a SEPARATE probe, because
+// the mechanisms behind them are separate: a deployment can have device-mapper
+// working and the keyring blocked, and reporting that as one "storage is
+// broken" would hide which of the three knobs to turn.
 type Capability string
 
 const (
@@ -33,23 +38,78 @@ const (
 	// this belongs to the storage component and to nothing above it.
 	CapabilityMount Capability = "mount"
 
-	// CapabilityKernelKeyring is adding and removing a kernel keyring key, needed by encrypted volumes; default seccomp profiles block it.
+	// CapabilityKernelKeyring is the ability to place a key in the kernel
+	// keyring and take it out again. Encrypted volumes require it: the volume
+	// key reaches dm-crypt as a keyring REFERENCE rather than inline in the
+	// device-mapper table, which is what keeps it out of userspace memory.
+	//
+	// It is the capability most likely to be missing on a deployment that looks
+	// correctly privileged, because a container runtime's default seccomp
+	// profile blocks add_key, keyctl and request_key and granting CAP_SYS_ADMIN
+	// does not lift that.
 	CapabilityKernelKeyring Capability = "kernel-keyring"
 
-	// CapabilityMountPropagation is a mount visible outside its namespace; it has no startup probe and Check refuses it as unknown.
+	// CapabilityMountPropagation is a mount being visible outside the namespace
+	// that made it.
+	//
+	// Unlike the three above it has NO registered probe and is never passed to
+	// Check: nothing about it can be established at startup, because it is a
+	// property of an individual mount and there is no mount yet. It is checked
+	// after each mount, by the provider that made it, and it lives here so that
+	// finding reaches an operator in the same vocabulary as the startup ones —
+	// same type, same Cause, same remedy table. Passing it to Check yields
+	// UnknownCapabilityError, which is the fail-closed direction.
 	CapabilityMountPropagation Capability = "mount-propagation"
 
-	// CapabilityNetAdmin is CAP_NET_ADMIN, needed by the replicated backend's DRBD netlink control path.
+	// CapabilityNetAdmin is the ability to perform privileged network
+	// operations — CAP_NET_ADMIN.
+	//
+	// A replicated backend needs it and a local one does not: DRBD's control
+	// path is generic netlink to the drbd kernel module, and the module's
+	// administrative operations are gated on CAP_NET_ADMIN rather than on
+	// CAP_SYS_ADMIN. The two are independent bits, so a container granted the
+	// device-mapper privilege and nothing else can create logical volumes all
+	// day and fail the moment it brings a DRBD resource up.
+	//
+	// Measured with ETHTOOL_GWOL on lo, which the kernel gates on this
+	// capability and which reads rather than writes:
+	//
+	//	container, root, no --cap-add     EPERM       (CapEff …a80425fb)
+	//	container, root, --cap-add NET_ADMIN  EOPNOTSUPP  (CapEff …a80435fb)
+	//
+	// The differing bit is 12, CAP_NET_ADMIN.
 	CapabilityNetAdmin Capability = "net-admin"
 
-	// CapabilityDRBDControl is the drbd module loaded with its generic-netlink family registered; it is fixed on the node, not a privilege.
+	// CapabilityDRBDControl is the presence of the DRBD control interface: the
+	// drbd kernel module loaded, and its generic-netlink family registered.
+	//
+	// It is NOT a privilege, which is why it is not folded into
+	// CapabilityNetAdmin. A container cannot load a kernel module for itself
+	// however it is privileged — this is fixed on the NODE — so reporting it as
+	// a missing capability would send an operator to add flags that cannot
+	// possibly help. Separating them is the difference between "modprobe drbd
+	// on the host" and "grant CAP_NET_ADMIN", which are not substitutes.
 	CapabilityDRBDControl Capability = "drbd-control"
 )
 
-// Probe checks one capability by attempting the operation, returning nil or a *CapabilityError, and removes anything it creates.
+// Probe performs one capability check by ATTEMPTING the operation.
+//
+// A probe returns nil when the capability is available and a *CapabilityError
+// when it is not. It must not infer from capability bits, kernel versions or
+// the contents of /proc: reading CapEff and reasoning about it produces
+// confident false positives in exactly the case that matters, where the
+// capability is granted and a seccomp filter refuses the syscall anyway.
+//
+// A probe that creates anything must remove it before returning, and must scope
+// what it creates to something it can prove it owns.
 type Probe func(ctx context.Context) error
 
-// Checker runs a set of injectable probes; construct one with New.
+// Checker runs a set of probes.
+//
+// The zero value is not usable; construct one with New. Probes are injectable
+// so the refusal paths can be driven in tests — most of them cannot be produced
+// for real on any one host, and a guard whose refusal paths are untested is a
+// guard whose refusal paths do not work.
 type Checker struct {
 	probes map[Capability]Probe
 }
@@ -82,7 +142,26 @@ func liveProbes() map[Capability]Probe {
 	return probes
 }
 
-// Check runs every probe and joins the failures; an empty list, an unknown capability or an unclassified error all fail.
+// Check verifies every named capability and returns nil only if all of them are
+// available.
+//
+// It runs EVERY probe rather than stopping at the first failure, and joins the
+// results: a container missing two of the three is a single configuration
+// mistake, and reporting one per restart makes an operator discover them
+// serially over three deployments.
+//
+// It fails closed in three ways that matter:
+//
+//   - An empty capability list is ErrNoCapabilities, not success.
+//   - A capability with no registered probe is an *UnknownCapabilityError, not
+//     a skip.
+//   - A probe that returns something other than a *CapabilityError has its
+//     error wrapped as CauseIndeterminate rather than passed through, so no
+//     failure can reach a caller unclassified and no unclassified failure can
+//     be mistaken for a pass.
+//
+// Duplicates are collapsed and the capabilities are checked in a stable order,
+// so the same misconfiguration produces the same message every time.
 func (c *Checker) Check(ctx context.Context, capabilities ...Capability) error {
 	if len(capabilities) == 0 {
 		return ErrNoCapabilities
@@ -163,7 +242,14 @@ func (c *Checker) Capabilities() []Capability {
 	return known
 }
 
-// Check verifies the named capabilities with the live probes; call it during initialization, before serving.
+// Check verifies the named capabilities with the live probes.
+//
+// This is what a storage component calls during initialization, BEFORE it
+// serves anything: a control-plane process, a CSI node plugin, an init
+// container. Calling it there turns a deployment mistake into a refusal to
+// start with an actionable message, instead of a failure at the first volume
+// attach — which happens under load, looks like a storage fault rather than a
+// container-configuration fault, and is discovered by a customer.
 func Check(ctx context.Context, capabilities ...Capability) error {
 	return New().Check(ctx, capabilities...)
 }

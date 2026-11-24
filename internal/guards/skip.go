@@ -37,7 +37,31 @@ var skipReceivers = map[string]struct{}{
 	"tb": {},
 }
 
-// SkipGuards refuses a runtime skip anywhere in the tree, parsing Go so tag-gated files are read and comments and strings are ignored.
+// SkipGuards refuses a runtime skip anywhere in the tree.
+//
+// # The rule
+//
+// conventions/testing-guidelines.md §No Skip Guards: a test that cannot run in
+// an environment is fixed by FIXING THE ENVIRONMENT, or gated behind a declared
+// build tag whose tier actually provides the dependency — never by a runtime
+// skip. A skipped test reports success. A suite of them reports a green run
+// that establishes nothing, and the greenness is what stops anybody looking.
+//
+// That is not a hypothetical here: this effort has had green tests turn out to
+// be false evidence repeatedly, and a skip is the mechanised form of it.
+//
+// # Why this parses Go instead of matching text
+//
+// A textual scanner fires on its own documentation. This file names t.Skip in
+// prose half a dozen times, the convention document names it, and the testing
+// guidelines quote it — so a grep-based version would report its own reasons
+// for existing as violations, and the only way to ship it would be to weaken
+// it. Parsing sees calls and nothing else.
+//
+// It also means a skip inside a string literal or a comment is correctly
+// ignored, and a skip in a file excluded by a build tag is correctly FOUND:
+// go/parser reads the file whatever its tags say, which is the whole point of a
+// whole-tree scanner. A tag-gated file is exactly where a skip hides.
 func SkipGuards() Scanner {
 	return Scanner{
 		Name: "no-runtime-skip",

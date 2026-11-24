@@ -11,7 +11,12 @@
 // 2. Commercial License
 //    Contact licensing@automatethethings.com for commercial licensing options.
 
-// Package blkdev copies, flushes and zeroes block devices directly, without dd or blkdiscard.
+// Package blkdev performs the block-device operations this repository used to
+// reach for dd and blkdiscard to do.
+//
+// Neither binary was doing anything the process cannot do itself: dd is a read
+// loop with a flush, and blkdiscard --zeroout is one ioctl. What they added was
+// a fork, a PATH lookup, and an error surface consisting of an exit status.
 package blkdev
 
 import (
@@ -25,7 +30,17 @@ import (
 // small enough to stay off the large-object heap path.
 const CopyBufferSize = 4 << 20
 
-// Copy writes the whole of src onto dst (never created) and syncs it; it stops early if ctx is canceled.
+// Copy writes the whole of src onto dst and flushes it to stable storage.
+//
+// This is what `dd if=src of=dst bs=4M conv=fsync,nocreat` did. nocreat is
+// structural here rather than a flag: dst is opened without O_CREATE, so a
+// destination that does not exist is an error instead of a new empty file
+// appearing where a device was expected. conv=fsync is the Sync at the end —
+// without it the copy is complete only as far as the page cache, and a caller
+// that goes on to detach the volume can lose the tail.
+//
+// The copy stops early if ctx is canceled. dd had no such property; a canceled
+// context simply left it running to completion.
 func Copy(ctx context.Context, src, dst string) error {
 	in, err := os.Open(src) // #nosec G304 -- caller-supplied device path, validated by the provider
 	if err != nil {
@@ -72,7 +87,18 @@ func (c *contextReader) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
-// ZeroOut zeroes a block device from offset to the end with BLKZEROOUT, which guarantees zeroes where a discard does not.
+// ZeroOut writes zeroes over a range of a block device, from offset to the end.
+//
+// This is `blkdiscard --zeroout --offset N`, which despite the command's name
+// is the BLKZEROOUT ioctl and not BLKDISCARD. The distinction is the whole
+// reason the callers use it: a discard tells the device it may forget a range,
+// and what a later read returns is up to the device — for some, the old
+// contents. BLKZEROOUT guarantees zeroes. Every caller here is destroying a
+// former tenant's data, so a guarantee is the point and the weaker ioctl would
+// quietly not provide it.
+//
+// The range runs to the end of the device, which is what the callers mean and
+// what blkdiscard did with no --length.
 func ZeroOut(ctx context.Context, device string, offset int64) error {
 	if offset < 0 {
 		return &ZeroOutError{Device: device, Offset: offset, Err: ErrNegativeOffset}
@@ -144,7 +170,11 @@ func Size(device string) (int64, error) {
 	return size, nil
 }
 
-// Operator is the seam through which a provider reaches these operations, so tests need no real device.
+// Operator is the seam through which a provider reaches these operations.
+//
+// Same reason as the other seams in this repository: the work happens on a real
+// block device, and a test that cannot substitute it can only run as root
+// against hardware it had to build first.
 type Operator interface {
 	// Copy writes the whole of src onto dst and flushes it.
 	Copy(ctx context.Context, src, dst string) error

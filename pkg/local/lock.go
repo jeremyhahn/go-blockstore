@@ -22,7 +22,10 @@ import (
 	"time"
 )
 
-// DefaultLockDir is where the per-volume lock files live; tmpfs, so they do not survive a reboot.
+// DefaultLockDir is where the per-volume lock files live unless configured
+// otherwise. /run/lock is tmpfs on a systemd host, so the files do not survive a
+// reboot — which is right for a lock whose only meaning is "an operation is in
+// flight in some live process".
 const DefaultLockDir = "/run/lock/go-blockstore"
 
 // lockRetryInterval is how long a blocked acquisition waits before trying again; polling never acquires after the context is done.

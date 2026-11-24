@@ -22,7 +22,9 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/preflight"
 )
 
-// PreflightMode selects which privilege checks New runs; same values as pkg/local, different capabilities.
+// PreflightMode selects which privilege checks New runs before it hands back a
+// Provider. See pkg/local's PreflightMode: same three values, same reasoning,
+// a DIFFERENT capability set.
 type PreflightMode int
 
 const (

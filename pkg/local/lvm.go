@@ -70,10 +70,22 @@ type lvInfo struct {
 	// volume that is not a snapshot.
 	DataPercent float64
 
-	// Tags are the LV's LVM tags; this provider sets only the header tag (encryptedTagPrefix).
+	// Tags are the LVM tags set on the logical volume. This provider sets one,
+	// the header tag described on encryptedTagPrefix; anything else here
+	// belongs to the operator or to other tooling sharing the volume group, and
+	// is read past rather than touched.
 	Tags []string
 
-	// OriginSizeBytes is, on a snapshot, its origin's size when taken; 0 otherwise, and not the origin's current size.
+	// OriginSizeBytes is, on a SNAPSHOT, the size its origin had when the
+	// snapshot was taken — the size of the image the snapshot presents. It is 0
+	// on a volume that is not a snapshot.
+	//
+	// It is not the origin's current size and must not be confused with it. LVM
+	// allows an origin with snapshots to be grown while it is inactive, which is
+	// the state this provider leaves volumes in, so the two diverge in ordinary
+	// use: measured, growing a 64 MiB origin to 192 MiB left the snapshot
+	// reporting an origin_size of 67108864 while the origin's own lv_size read
+	// 201326592, and the snapshot device kept presenting 64 MiB.
 	OriginSizeBytes int64
 }
 

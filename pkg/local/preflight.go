@@ -20,11 +20,25 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/preflight"
 )
 
-// PreflightMode selects which privilege checks New runs; see package preflight.
+// PreflightMode selects which privilege checks New runs before it hands back a
+// Provider.
+//
+// The checks exist because the privileges this provider needs are granted by
+// three independent mechanisms — capabilities, seccomp and an LSM profile — and
+// a deployment can satisfy two of them and fail the third silently until the
+// first volume is attached. See package preflight.
 type PreflightMode int
 
 const (
-	// PreflightConfigured, the zero value, checks the capabilities of every seam left at its real implementation.
+	// PreflightConfigured checks the capabilities this provider's configuration
+	// will actually exercise, for each seam left at its real implementation. It
+	// is the zero value, so a provider built for production is checked without
+	// anybody having to opt in.
+	//
+	// A seam replaced by the caller is NOT checked, and that is a derivation
+	// rather than a guess: a Provider given its own Mounter does not call
+	// mount(2), so mount(2) being unavailable would not affect it. Injecting a
+	// seam is an explicit act that replaces the real operation.
 	PreflightConfigured PreflightMode = iota
 
 	// PreflightAll checks every capability the provider could need, whatever
@@ -32,7 +46,14 @@ const (
 	// deployment is correct rather than merely that this provider will work.
 	PreflightAll
 
-	// PreflightOff runs no checks, for providers that perform no privileged operations; it must be chosen explicitly.
+	// PreflightOff runs no checks.
+	//
+	// It exists for callers that construct a Provider they will not perform
+	// privileged operations with — enumerating configuration, validating
+	// settings in a CLI, a test harness driving fakes through the factory. It
+	// is an explicit, recorded choice in configuration, never a default and
+	// never something this package infers, because the failure it re-enables is
+	// exactly the one the checks were added to remove.
 	PreflightOff
 )
 

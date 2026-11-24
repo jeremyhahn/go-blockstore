@@ -27,10 +27,16 @@ var (
 	// terminal problem and sends a reader somewhere unhelpful.
 	ErrNotBlockDevice = errors.New("blkdev: not a block device")
 
-	// ErrSizeOutOfRange reports a device size that does not fit an int64.
+	// ErrSizeOutOfRange reports a device size the kernel gave as a 64-bit
+	// unsigned value that does not fit the signed one every caller uses. No
+	// device is that large; a driver reporting it is reporting something other
+	// than a size, and an offset computed against it would be meaningless.
 	ErrSizeOutOfRange = errors.New("blkdev: the device reports a size larger than can be represented")
 
-	// ErrZeroOutUnsupported reports a driver without BLKZEROOUT; retrying will not help.
+	// ErrZeroOutUnsupported reports a device whose driver does not implement
+	// BLKZEROOUT. It is distinct from a failure: the request was well formed
+	// and this device cannot serve it, so the caller needs another way to
+	// destroy the data rather than a retry.
 	ErrZeroOutUnsupported = errors.New("blkdev: the device does not support zeroing a range")
 )
 
@@ -54,7 +60,11 @@ func (e *CopyError) Error() string {
 
 func (e *CopyError) Unwrap() error { return e.Err }
 
-// ZeroOutError reports a failed zeroing with the requested range and the device size.
+// ZeroOutError reports a failed zeroing, with the range it was asked for.
+//
+// The size travels with it because the most likely mistakes are about the
+// range: an offset past the end, or a device smaller than the caller believed.
+// An errno alone cannot distinguish those.
 type ZeroOutError struct {
 	// Device is the block device.
 	Device string

@@ -70,13 +70,70 @@ const statusSizeUnit = 1024
 // VolumeSpec with Replicas unset resolves to.
 const drbdReplicas = 2
 
-// ErrPrimary is returned by an operation that refuses to run while the local node holds Primary.
+// ErrPrimary is returned by an operation that refuses to run while the local
+// node holds Primary — tearing the device down or deleting it out from under
+// whatever has it open.
+//
+// It stays package-local, unlike its opposite. common.ErrNotPrimary is the
+// portable "promote first, then retry" branch that an HA controller acts on;
+// nothing outside this package yet needs to distinguish "refused because you
+// ARE primary" from any other refusal, and a sentinel in pkg/common with no
+// portable consumer is a contract nobody is holding up.
 var ErrPrimary = errors.New("volume is primary on this node")
 
-// ErrRoleUnknown is returned by a destructive operation that cannot establish the local role of an up resource; it carries drbdsetup's role string.
+// ErrRoleUnknown is returned by a destructive operation that cannot establish
+// what role the local node holds for a resource that is up.
+//
+// It exists because "not Primary" and "not known to be Primary" are different
+// answers, and only the first one makes a teardown safe. drbdsetup reports the
+// role as "Unknown" in some states, and a version this parser does not know
+// could report something else again; either way the mapped role is
+// common.ReplRoleUnknown, and treating that as permission to run drbdadm down
+// and lvremove is deciding the safe case by default. The refusal carries the
+// role string exactly as drbdsetup gave it, since that is the only thing that
+// makes an unrecognized value diagnosable.
+//
+// Package-local for the same reason as ErrPrimary: it is a "this provider will
+// not do that" answer with no portable consumer. An HA controller acts on
+// common.ErrNotPrimary; nothing outside needs to branch on this.
 var ErrRoleUnknown = errors.New("the resource's replication role could not be determined")
 
-// Provider is the DRBD 9 implementation of common.ReplicatedProvider; every mutating method, lookup included, holds the mutex, and only ListSnapshots, Status and ReplicationState do not.
+// Provider is the DRBD 9 implementation of common.ReplicatedProvider.
+//
+// It is safe for concurrent use. The mutex serializes the operations that both
+// read and then write the state directory — provisioning, which allocates a
+// device minor and a port, and deletion, which frees them — so two concurrent
+// Provisions cannot hand out the same minor.
+//
+// It also serializes every operation that CHECKS a condition and then acts on
+// it against every operation that can change what was checked: Snapshot's
+// Primary requirement against Promote and Demote, Delete's and Detach's
+// Secondary and no-snapshots requirements against Snapshot, Promote and Demote,
+// Delete's not-up observation against Attach, and Mount's and Unmount's whole
+// bodies against the Delete-then-Provision pair that can recycle a minor
+// underneath them.
+//
+// Every mutating method is therefore in the set, and each of the three ways of
+// deciding otherwise turned out to be wrong:
+//
+// The DIRECTION of a change is not the test. A demotion only ever makes a
+// volume less writable, which is exactly what invalidates Snapshot's check; a
+// promotion only ever makes one more writable, which is exactly what
+// invalidates Detach's.
+//
+// Whether the method has a PRECONDITION OF ITS OWN is not the test. Attach
+// checks nothing and belongs here because the check it breaks is Delete's.
+//
+// And failing closed on ROLE is not failing closed on IDENTITY. Mount was left
+// out on the argument that a demotion in its window makes the device open fail,
+// since DRBD refuses every open of a Secondary — true, and irrelevant to the
+// case where the volume is deleted and its minor reused, because the
+// replacement is perfectly willing to be Primary. The stale record then points
+// every step at a device belonging to a volume the call never looked up. That
+// is why the lookup is inside the lock in every one of these methods and not
+// merely the command that follows it.
+//
+// What is left out is read-only: ListSnapshots, Status and ReplicationState.
 type Provider struct {
 	cfg          Config
 	runner       CommandRunner
@@ -101,10 +158,22 @@ type Provider struct {
 // just the base one.
 var _ common.ReplicatedProvider = (*Provider)(nil)
 
-// Mounter is the mount and unmount seam, an alias for internal/mount's type shared with pkg/local.
+// Mounter is the seam through which mounting and unmounting happen.
+//
+// It is an alias for internal/mount's type, not a copy of it: the pinning
+// implementation is shared with pkg/local because the reason it exists — a
+// target has to be resolved to a descriptor with symlink resolution refused
+// before a privileged mount addresses it — is the same for both. The alias is
+// what lets a caller outside this module NAME the type it is handing to
+// WithMounter, which an internal package's own name would not.
 type Mounter = mount.Mounter
 
-// MountTable is the seam through which the provider reads /proc/self/mountinfo, shared with pkg/local.
+// MountTable is the seam through which the provider asks what is mounted.
+//
+// It replaced asking findmnt, and it is shared with pkg/local for the same
+// reason Mounter is: reading /proc/self/mountinfo is not a DRBD concern, and
+// two copies of a parser would be two chances to disagree about the kernel's
+// escaping.
 type MountTable = mountinfo.Table
 
 // BlockDevices is the seam through which the provider copies and zeroes block
@@ -120,7 +189,15 @@ func WithRunner(r CommandRunner) Option {
 	return func(p *Provider) { p.runner = r; p.injected.runner = true }
 }
 
-// WithSecretProvider supplies the shared secret DRBD authenticates the peer with; it overrides replication_secret_file.
+// WithSecretProvider supplies the shared secret DRBD authenticates the peer
+// with. It takes precedence over replication_secret_file.
+//
+// A caller with the secret somewhere this package should not know about — a
+// TPM-sealed blob, an operator prompt, a KMS — unseals it into an enclave and
+// hands it over here. That is the whole of this package's involvement with
+// secret management, for the same reason pkg/local's KeyProvider is: a provider
+// that knew how to talk to a TPM would drag hardware-specific dependencies into
+// a library whose other backends have no use for them.
 func WithSecretProvider(s SecretProvider) Option {
 	return func(p *Provider) { p.secrets = s }
 }
@@ -144,7 +221,11 @@ func WithBlockDevices(b BlockDevices) Option {
 	return func(p *Provider) { p.blockDevices = b; p.injected.blockDevices = true }
 }
 
-// New builds a DRBD provider from a settings map, rejecting unknown keys and creating the configuration and state directories.
+// New builds a DRBD provider from a settings map. See the Setting constants for
+// the accepted keys; an unknown key is an error rather than a no-op.
+//
+// It creates the configuration and state directories if they do not exist, so a
+// freshly imaged node needs no preparation beyond DRBD itself.
 func New(settings map[string]string, opts ...Option) (*Provider, error) {
 	cfg, err := ParseConfig(settings)
 	if err != nil {
@@ -232,7 +313,18 @@ func New(settings map[string]string, opts ...Option) (*Provider, error) {
 	return p, nil
 }
 
-// Config returns the validated configuration with the addresses cloned.
+// Config returns the provider's validated configuration.
+//
+// The addresses are CLONED. Config is a value, which looks like a copy already
+// — but net.IP is a slice, so returning the struct as it stands hands out the
+// provider's own backing arrays. A caller that inspected its configuration and
+// then wrote to the address it got back would be editing validated state from
+// outside, and every resource file generated afterwards would carry the change
+// without having gone near ParseConfig. Measured before this: the address
+// became "::" and the generated resource file carried it.
+//
+// Everything else in Config is a string, an int or a bool, and copies with the
+// struct.
 func (p *Provider) Config() Config {
 	cfg := p.cfg
 	cfg.NodeAddress = slices.Clone(p.cfg.NodeAddress)
@@ -333,7 +425,49 @@ func (p *Provider) resourceDown(ctx context.Context, res string) error {
 // VolumeProvider
 // -----------------------------------------------------------------------------
 
-// Provision creates the backing LV at backingBytes(spec.SizeBytes, encrypted), installs the resource file, writes metadata and brings it up Secondary; a filesystem is made at first Mount, and a restore copies the snapshot then grows.
+// Provision creates a backing logical volume, generates and installs the DRBD
+// resource file, initializes metadata and brings the resource up.
+//
+// The resource comes up Secondary and Inconsistent on both nodes, which is
+// where a two-node resource that has never synchronized belongs. Making one
+// side authoritative for the first time is not done here; see the package doc
+// on initial sync.
+//
+// spec.SizeBytes is USABLE capacity, per common.VolumeSpec.SizeBytes: the
+// backing logical volume is created at backingBytes(spec.SizeBytes, encrypted),
+// so DRBD's internal metadata — and, on an encrypted provider, the LUKS2
+// header — comes out of space added for it rather than out of what the caller
+// asked for. The record keeps the usable figure.
+//
+// spec.Replicas may be left unset: zero means unspecified and resolves to this
+// provider's natural count of two.
+//
+// A non-empty spec.FSType is validated and recorded but no filesystem is
+// created: mkfs needs to open the device read/write, which DRBD permits only on
+// a Primary. Mount creates the filesystem on first use instead, once the HA
+// controller has promoted the volume.
+//
+// A non-empty spec.SourceSnapshotID restores by copying the snapshot's blocks
+// into the new backing device before DRBD metadata is written. The restored
+// volume inherits the SOURCE volume's filesystem, since the copy is
+// byte-for-byte, so spec.FSType must be empty on a restore.
+//
+// spec.SizeBytes may exceed the snapshot's size. The backing volume is created
+// at the SOURCE's size — a whole-device copy into a longer device would strand
+// the source's metadata partway through the new volume's data — and the volume
+// is then grown to the requested size through the same sequence Resize runs,
+// which relocates the metadata properly. The filesystem inside it is grown only
+// where it can be, which on a freshly provisioned Secondary is nowhere: the
+// device is the requested size and the filesystem is the source's, and the
+// record says so (FSGrowPending) so that the first Mount after a promotion
+// grows it online. That is the Resize contract, reached by the same route. The
+// copy is a full one, so the restored volume has no continuing dependency on
+// the snapshot and the snapshot can be deleted afterwards.
+//
+// The VolumeSpec is taken by value because common.VolumeProvider says so; a
+// provider that took a pointer would not implement the interface. The linter's
+// hugeParam threshold is set for exactly that in .golangci.yml, so this needs
+// no suppression.
 func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (common.Volume, error) {
 	if err := validateName("volume name", spec.Name); err != nil {
 		return common.Volume{}, err
@@ -693,7 +827,20 @@ func (p *Provider) copyDevice(ctx context.Context, src, dst string) error {
 	return nil
 }
 
-// Attach brings the resource up on the local node and returns its device; the peer is ErrUnsupported, an unknown node ErrInvalidArgument.
+// Attach brings the resource up on the local node and reports the block device
+// it appears at.
+//
+// The device exists in both roles: DRBD creates it when the resource comes up,
+// and refuses to open it while the node is Secondary. Attaching is therefore
+// separate from, and a precondition of, promotion.
+//
+// node must be the local node. The peer is a host of the resource and asking to
+// attach there is well-formed, but this provider drives the local DRBD instance
+// and has no channel to the other one, so that request is ErrUnsupported and
+// the peer's own provider is what serves it. A name that is neither host is not
+// a node of this volume at all and is common.ErrInvalidArgument.
+//
+// It is serialized against Delete: see the lock below.
 func (p *Provider) Attach(ctx context.Context, volID string, node common.NodeID) (common.AttachInfo, error) {
 	if err := p.requireLocalNode(node); err != nil {
 		return common.AttachInfo{}, err
@@ -721,7 +868,17 @@ func (p *Provider) Attach(ctx context.Context, volID string, node common.NodeID)
 	return common.AttachInfo{DevicePath: devicePath(meta.Minor), Node: node}, nil
 }
 
-// Detach takes the resource down once it is affirmatively Secondary; Primary is ErrPrimary, an unknown role ErrRoleUnknown.
+// Detach takes the resource down on the local node, removing its block device.
+//
+// Replication stops until Attach brings it back up: DRBD has no way to keep a
+// device replicating without a device. The resource is taken down only once it
+// is affirmatively Secondary: a local node holding Primary is the node serving
+// writes and is refused with ErrPrimary — the HA controller demotes first — and
+// a role that cannot be established is refused with ErrRoleUnknown, on the same
+// reasoning as Delete's.
+//
+// It is serialized against the other role-changing operations: see the lock
+// below.
 func (p *Provider) Detach(ctx context.Context, volID string, node common.NodeID) error {
 	if nodeErr := p.requireLocalNode(node); nodeErr != nil {
 		return nodeErr
@@ -757,7 +914,24 @@ func (p *Provider) Detach(ctx context.Context, volID string, node common.NodeID)
 	return p.resourceDown(ctx, meta.Name)
 }
 
-// Mount mounts an attached Primary volume at a pinned target, creating the recorded filesystem only on a device blkid reports empty; a read-only mount never formats.
+// Mount mounts an attached volume.
+//
+// The volume must be Primary on this node: DRBD denies every open of a
+// Secondary's device, read-only mounts included, so MountOptions.ReadOnly does
+// not relax the requirement.
+//
+// If the device carries no filesystem signature, the recorded filesystem is
+// created on it first. That is the only circumstance in which this provider
+// runs mkfs: blkid must report the device as carrying nothing at all, and a
+// blkid that fails for any other reason leaves the device untouched. A
+// read-only mount never formats — it is refused instead, since creating a
+// filesystem is the one write a caller asking for read-only most clearly did
+// not ask for.
+//
+// The target is PINNED before it is mounted on: internal/mount resolves it to a
+// descriptor with symlink resolution refused and mounts against the descriptor,
+// so a path swapped after validation changes nothing about where the mount
+// lands. mount(8) would have canonicalized the string and followed it.
 func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.MountOptions) error {
 	if targetErr := validateMountTarget(target); targetErr != nil {
 		return targetErr
@@ -926,7 +1100,16 @@ func (p *Provider) mkfs(ctx context.Context, fsType, dev string) error {
 	return nil
 }
 
-// Unmount unmounts the volume from target, pinning its parent; a target this volume is not mounted at is not an error.
+// Unmount unmounts the volume from target.
+//
+// The target is pinned by its PARENT before the unmount, so a swapped final
+// component cannot redirect it onto somebody else's mount; see internal/mount.
+//
+// A target this volume is not mounted at is not an error, so a teardown
+// converges however far it got. That covers both shapes it takes: a path that
+// is not a mount point at all, and a path where something else has since been
+// mounted. Neither unmounts anything — this provider unmounts its own volume,
+// not whatever happens to be at the path it was given.
 func (p *Provider) Unmount(ctx context.Context, volID, target string) error {
 	if targetErr := validateMountTarget(target); targetErr != nil {
 		return targetErr
@@ -989,7 +1172,60 @@ func (p *Provider) isMounted(ctx context.Context, dev string) (bool, error) {
 	return mounted, err
 }
 
-// Resize grows the local backing LV to backingBytes(newSize, encrypted) and runs drbdadm resize, then grows the filesystem or records FSGrowPending; run on the Secondary first, the resource must be up, and shrinking is refused.
+// Resize grows the volume.
+//
+// Both halves have to happen: the backing logical volume is extended locally,
+// then drbdadm resize tells DRBD to use the new space. The peer's backing
+// volume is not touched — this provider drives one node — so the call must be
+// made on both nodes, and DRBD holds the device at the smaller of the two sizes
+// until it has been.
+//
+// The filesystem is grown too. ext4 grows mounted or not — unmounted it is
+// checked first, which is what resize2fs demands — and XFS only while mounted,
+// having no offline form. Where the filesystem cannot be grown as things stand
+// (an unmounted XFS volume, or any filesystem on a Secondary, whose device DRBD
+// will not open) the device still grows and the call still succeeds, the record
+// notes the grow it owes (FSGrowPending), and the next Mount from a Primary
+// pays it online; repeating the same request from the Primary finishes the job
+// as well. See growFilesystem.
+//
+// AN ENCRYPTED VOLUME follows the same rule with one more state in it. Its
+// filesystem lives on a dm-crypt mapping that Promote sized when it opened the
+// container, and nothing reloads that mapping (see ErrMappingStale). So:
+//
+//   - Container closed — a Secondary, or a Primary nothing has unlocked: the
+//     device grows, the record follows and owes the grow, and the next Promote
+//     opens the mapping over the device as it is by then, sized to it, for the
+//     next Mount to grow into.
+//   - Container open and the mapping still covering the device — the peer
+//     was grown first, or this is the repeat after the remedy: the filesystem
+//     is grown through the mapping, online if mounted.
+//   - Container open and the mapping STALE — the device grew under it, here or
+//     by the peer's resize landing: refused with ErrMappingStale after the
+//     device half, which stands, and before any grow tool runs. The record is
+//     not advanced. The error names the remedy — unmount, Demote, Promote,
+//     repeat — and the repeat converges.
+//
+// Grow the Secondary first, then the Primary. DRBD holds the device at the
+// smaller of the pair's two backing sizes, so a Primary grown first sees no
+// device change, grows nothing, and is left with a mapping that goes stale
+// the moment the peer catches up; the repeat from that Primary is then the
+// refused-and-cycled path above rather than the online one.
+//
+// newSize is USABLE capacity, in the same units Provision and Status use, so
+// the backing logical volume grows to backingBytes(newSize, encrypted) — by more than the
+// difference between the two sizes, since the metadata reservation grows with
+// the device. The shrink check compares usable against usable; the "is the
+// device already big enough" check compares backing against backing.
+//
+// The resource must be up. Extending the backing device of a resource that is
+// down leaves DRBD's internal metadata stranded away from the end of the device
+// with no drbdadm resize available to follow it, so this refuses with
+// ErrNotAttached before anything is extended.
+//
+// Shrinking is refused. DRBD can shrink online, but the filesystem above it has
+// to be shrunk first and this provider has no way to know whether that has
+// happened; getting the order wrong truncates live data.
 func (p *Provider) Resize(ctx context.Context, volID string, newSize int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1140,7 +1376,19 @@ func (p *Provider) checkExtFilesystem(ctx context.Context, dev string) error {
 	return fmt.Errorf("checking the filesystem on %q before growing it: %w", dev, err)
 }
 
-// Snapshot takes a crash-consistent, node-local LVM snapshot of the backing device; refused on a Secondary with common.ErrNotPrimary.
+// Snapshot takes an LVM snapshot of the backing device.
+//
+// It is refused on a Secondary with common.ErrNotPrimary. A Secondary's backing
+// device is written by the replication stream with no filesystem above it to
+// order those writes, so a snapshot of one captures a state no filesystem ever
+// had — and the condition is fixed by a Promote, which is what that sentinel
+// says. On the Primary the snapshot is crash-consistent: it is what a power cut
+// would leave, which a journaling filesystem recovers from and an application
+// with unflushed state does not.
+//
+// The snapshot exists only on this node and is not replicated.
+//
+// It is serialized against Delete: see the lock below.
 func (p *Provider) Snapshot(ctx context.Context, volID, name string) (common.SnapshotID, error) {
 	// Serialized with Delete, which refuses a volume that has snapshots.
 	p.mu.Lock()
@@ -1178,7 +1426,13 @@ func (p *Provider) Snapshot(ctx context.Context, volID, name string) (common.Sna
 	return common.SnapshotID(p.snapshotID(meta.LV, name)), nil
 }
 
-// ListSnapshots returns this node's snapshots of the volume by LVM origin; SizeBytes is what each occupies.
+// ListSnapshots returns the snapshots taken from the volume on this node.
+//
+// Snapshots are matched by their LVM origin, so an LV that merely looks like
+// one of ours but was taken from something else is not reported.
+//
+// SizeBytes is what each snapshot OCCUPIES, not the copy-on-write area it was
+// given; see lvEntry.usedBytes for what that means for an inactive one.
 func (p *Provider) ListSnapshots(ctx context.Context, volID string) ([]common.SnapshotInfo, error) {
 	meta, err := p.lookup(volID)
 	if err != nil {
@@ -1224,7 +1478,12 @@ func (p *Provider) ListSnapshots(ctx context.Context, volID string) ([]common.Sn
 	return out, nil
 }
 
-// DeleteSnapshot removes a snapshot; restored volumes do not depend on it.
+// DeleteSnapshot removes a snapshot.
+//
+// Volumes restored from it are unaffected: Provision copies the snapshot's
+// blocks rather than layering onto it, so nothing depends on the snapshot once
+// the restore has finished. A restore still IN PROGRESS does depend on it, and
+// is serialized against by the lock below.
 func (p *Provider) DeleteSnapshot(ctx context.Context, snapID common.SnapshotID) error {
 	// Serialized with Provision and Snapshot so a restore's source cannot vanish mid-copy.
 	p.mu.Lock()
@@ -1237,7 +1496,32 @@ func (p *Provider) DeleteSnapshot(ctx context.Context, snapID common.SnapshotID)
 	return p.lvRemove(ctx, entry.Name)
 }
 
-// Delete takes the resource down and removes its backing volume, resource file and record; it refuses while snapshots remain, on Primary (ErrPrimary) or an unknown role (ErrRoleUnknown), and wipes first with Config.WipeOnDelete.
+// Delete takes the resource down and removes its backing volume, resource file
+// and state record.
+//
+// It refuses while snapshots of the volume remain — lvremove would take them
+// with the origin, so that deletion stays the caller's explicit choice — and it
+// tears a running resource down only once that resource is affirmatively
+// Secondary. A local node holding Primary is refused with ErrPrimary; a role
+// that cannot be established at all is refused with ErrRoleUnknown, because
+// only "is Secondary" makes the teardown safe and "is not Primary" does not
+// mean the same thing.
+//
+// With Config.WipeOnDelete the backing volume is zero-filled before it is
+// removed, so its contents do not linger in the free extents LVM hands to the
+// next volume. See that field for what the wipe covers and what it does not.
+//
+// The snapshot refusal above is also what makes that wipe safe to run
+// unconditionally, and it is worth saying why rather than leaving it to
+// coincidence. Zeroing an origin that still has a snapshot is copy-on-write's
+// worst case: every block written pushes the block it replaced into the
+// snapshot's CoW area, so the wipe duplicates the very data it is destroying
+// into extents lvremove then frees. Measured by the local lane on LVM 2.03.16,
+// wiping a 64 MiB origin under one snapshot drove CoW occupancy from 0% to 100%
+// and overflowed the snapshot into an unreadable state. Because a volume with
+// snapshots never reaches the wipe here, that trap is unreachable rather than
+// merely avoided by ordering — but it becomes reachable the moment the refusal
+// is relaxed, so the two belong together.
 func (p *Provider) Delete(ctx context.Context, volID string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1334,7 +1618,35 @@ func (p *Provider) wipe(ctx context.Context, lv string, wasActive bool) error {
 	return nil
 }
 
-// Status reports the observed state: SizeBytes is usable capacity, from the DRBD device minus the LUKS header when up, or the recorded size when down.
+// Status reports the volume's observed state.
+//
+// The size is the DRBD device's, as drbdsetup reports it, not the backing
+// volume's: the backing volume also holds DRBD's internal metadata, and LVM
+// rounds its allocation up to the volume group's extent size, so neither number
+// is the capacity a caller can write to. On an encrypted provider the device
+// is not that capacity either — it holds the LUKS2 container, header included
+// — so the header is taken back off through usableBytes, in every state the
+// device can be measured in; the container need not be open for the figure to
+// be right, because the header's size is a constant of this package and not
+// something read from the mapping. A resource that is not up has no device to
+// measure and falls back to the size the volume was provisioned or resized to,
+// which the record keeps in usable bytes already.
+//
+// AttachedNodes lists the local node when the resource is up, and the peer when
+// the connection to it is established — a connected peer necessarily has the
+// resource up too. A peer that is unreachable is omitted rather than guessed
+// at.
+//
+// SizeBytes is USABLE capacity in both branches, per VolumeStatus.SizeBytes,
+// but they are two different flavors of it and the difference is visible. With
+// the resource DOWN it is the capacity that was REQUESTED, from the record.
+// With it UP it is the capacity DRBD actually exports, which is larger: the
+// backing volume was rounded up to a whole LVM extent and the metadata
+// reservation deliberately over-reserves, and everything left over is usable.
+// So the number rises slightly when a volume is brought up — for a 1 GiB
+// request, by about 4 MiB. It is never below what was requested in either
+// branch, which is the guarantee callers need; a caller diffing Status across
+// an attach should expect the step.
 func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatus, error) {
 	meta, err := p.lookup(volID)
 	if err != nil {
@@ -1413,7 +1725,19 @@ func (p *Provider) fsDeviceMounted(ctx context.Context, meta *resourceMeta) (boo
 // ReplicatedProvider
 // -----------------------------------------------------------------------------
 
-// Promote runs drbdadm primary, never --force, and opens the LUKS container; it is idempotent.
+// Promote makes the local copy Primary.
+//
+// It runs "drbdadm primary" and never "drbdadm primary --force". DRBD refuses
+// the promotion when the local copy is not UpToDate or the peer already holds
+// Primary, and that refusal is the point: forcing past it publishes a copy that
+// may be stale or diverged and discards the peer's. See the package doc.
+//
+// The call is idempotent — promoting a resource that is already Primary
+// succeeds — and gated by nothing here against the PEER. The HA controller
+// holds the per-volume primary lease and is what makes a promotion safe across
+// the pair; this method is the mechanism it drives. It is serialized against
+// this provider's own role- and lifecycle-changing methods, which is a
+// different concern: see the lock below.
 func (p *Provider) Promote(ctx context.Context, volID string) error {
 	// Serialized with Delete and Snapshot.
 	p.mu.Lock()
@@ -1454,7 +1778,12 @@ func (p *Provider) Promote(ctx context.Context, volID string) error {
 	return nil
 }
 
-// Demote makes the local copy Secondary; it fails while the device is open.
+// Demote makes the local copy Secondary, leaving it replicating but not
+// writable. It fails while the device is open — mounted, or held by a
+// process — which is DRBD refusing to pull a live device out from under its
+// user rather than a condition this provider can resolve.
+//
+// It is serialized against Snapshot, Promote and Delete: see the lock below.
 func (p *Provider) Demote(ctx context.Context, volID string) error {
 	// Serialized with Snapshot, whose Primary check a demotion would invalidate.
 	p.mu.Lock()
@@ -1482,7 +1811,17 @@ func downReplState() common.ReplState {
 	return common.ReplState{Conn: common.ReplStateDown, Role: common.ReplRoleUnknown}
 }
 
-// ReplicationState reports the replication state; a resource not up is ReplStateDown with an unknown role, and ErrNotReplicated means no peer is configured.
+// ReplicationState reports the volume's replication state.
+//
+// A resource that is not up reports common.ReplStateDown with an unknown role:
+// it is configured for replication, this provider knows about it, and nothing
+// is running. That is a definite answer, which is why it is not unknown, and it
+// is not standalone either — standalone means the resource IS up and has
+// stopped talking to its peer. A resource that is down holds no role at all.
+//
+// common.ErrNotReplicated is returned only when the resource is up and has no
+// peer connection configured at all. A peer that is merely unreachable still
+// appears, in StandAlone or one of the failure states, and reports as such.
 func (p *Provider) ReplicationState(ctx context.Context, volID string) (common.ReplState, error) {
 	meta, err := p.lookup(volID)
 	if err != nil {

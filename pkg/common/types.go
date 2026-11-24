@@ -85,10 +85,30 @@ const (
 	// ReplStateUpToDate indicates the volume is connected and fully synchronized.
 	ReplStateUpToDate ReplConnState = "uptodate"
 
-	// ReplStateInconsistent means replication is up but the local copy is not current; promotion is forbidden.
+	// ReplStateInconsistent indicates the volume is connected and replicating
+	// normally, but the LOCAL copy is not current — mid-resync, outdated,
+	// failed, or without a backing device at all.
+	//
+	// It is distinct from ReplStateUnknown, and the distinction is the point: a
+	// controller deciding whether to promote must tell "the local copy is known
+	// to be bad" from "the state could not be determined". Both forbid
+	// promotion, but only the first is a fact about the volume.
+	//
+	// It does not say WHY the copy is not current. A provider that can
+	// distinguish an inconsistent disk from an absent one reports the
+	// difference through VolumeStatus.State, which has VolumeStateError for a
+	// device that cannot serve reads at all.
 	ReplStateInconsistent ReplConnState = "inconsistent"
 
-	// ReplStateDown means the volume is configured for replication but replication is not running.
+	// ReplStateDown indicates the volume is configured for replication but is
+	// not running it — the resource exists and the provider knows about it, and
+	// nothing is up.
+	//
+	// It sits between the two states it is easily confused with.
+	// ReplStateStandalone means the volume IS up and has stopped talking to its
+	// peer, which is an operator-visible decision; ReplStateUnknown means the
+	// provider could not determine anything. Down is neither: it is a definite
+	// answer, and the answer is that replication is not happening.
 	ReplStateDown ReplConnState = "down"
 )
 
@@ -103,23 +123,59 @@ const (
 	EventTypeDelete EventType = "delete"
 )
 
-// VolumeSpec describes a volume to be provisioned; the provider validates Name and FSType.
+// VolumeSpec describes a volume to be provisioned.
+//
+// Name and FSType are free-form: this package constrains neither, so the
+// provider validates both before they reach a system tool. See the
+// VolumeProvider doc for the rule.
 type VolumeSpec struct {
 	// Name is a human-readable identifier for the volume. It is caller-supplied
 	// and unvalidated here; the provider validates it before using it to name a
 	// logical volume or resource.
 	Name string
 
-	// SizeBytes is the usable capacity requested; provider overhead is allocated on top, and the result is never below it.
+	// SizeBytes is the requested capacity of the volume in bytes, and it means
+	// the capacity THE CALLER CAN USE. A provider that needs room for its own
+	// per-volume structures — a LUKS2 header, DRBD's internal metadata —
+	// allocates that ON TOP, so the backing device it creates is larger than
+	// this number and the space this number describes is all available to the
+	// caller.
+	//
+	// The rule exists because the alternative cannot be written down once. If
+	// SizeBytes sized the backing device instead, every caller would have to
+	// know which backend it had reached and how much that backend skims off
+	// the front or the back — and would get it wrong silently, since a volume
+	// asked for at exactly the size of the data destined for it would come
+	// back too small only when the data arrived. Overhead is the provider's
+	// business, and the provider is the only party that knows it.
+	//
+	// Backends allocating in fixed units round up, so the usable capacity can
+	// exceed this. It is never below it.
 	SizeBytes int64
 
 	// StorageClass names the provider-specific class/tier backing the volume.
 	StorageClass string
 
-	// Replicas is the desired replica count: 0 uses the provider's natural count, negative is ErrInvalidArgument, unsupported is ErrUnsupported.
+	// Replicas is the desired number of replicas, in three branches:
+	//
+	// Zero means UNSPECIFIED, and the provider uses its natural count — one for
+	// a local volume, two for a replicated pair. It does not mean one. A caller
+	// that leaves the field alone is asking for whatever the provider it chose
+	// is for, not asserting that the volume must not be replicated.
+	//
+	// A negative value is never meaningful and returns ErrInvalidArgument.
+	//
+	// A positive value the provider cannot honor returns ErrUnsupported, not
+	// ErrInvalidArgument: asking a two-node replication backend for a single
+	// copy is a well-formed request that a different backend serves happily, so
+	// the answer is "choose another provider", which is what ErrUnsupported
+	// means and what ErrInvalidArgument would hide.
 	Replicas int
 
-	// FSType is the filesystem to create (e.g. "ext4", "xfs"); empty requests a raw block device.
+	// FSType is the filesystem to create on the volume (e.g. "ext4", "xfs").
+	// An empty value requests a raw, unformatted block device. The provider
+	// checks it against the filesystems it supports rather than passing it
+	// through to mkfs unexamined.
 	FSType string
 
 	// SourceSnapshotID provisions the volume from an existing snapshot when
@@ -149,7 +205,20 @@ type VolumeStatus struct {
 	// State is the current lifecycle state of the volume.
 	State VolumeState
 
-	// SizeBytes is the usable capacity in bytes, provider overhead already subtracted, as in VolumeSpec.SizeBytes.
+	// SizeBytes is the current capacity of the volume in bytes, in the same
+	// units VolumeSpec.SizeBytes is requested in: the capacity the CALLER CAN
+	// USE, with the provider's own overhead already subtracted. It is
+	// comparable against the size the volume was provisioned or resized to, and
+	// is at least that much.
+	//
+	// Reporting the backing device here instead would make Status disagree with
+	// Provision about what one volume's size is — a caller that asked for a
+	// gibibyte would read back a gibibyte plus a header and have no way to tell
+	// that apart from a volume somebody had grown.
+	//
+	// A provider that cannot determine its overhead for a volume in the state
+	// it is currently in documents what it reports instead; see the provider's
+	// own Status doc.
 	SizeBytes int64
 
 	// AttachedNodes lists the nodes the volume is currently attached to.
@@ -201,7 +270,10 @@ type MountOptions struct {
 	// uses the volume's provisioned filesystem.
 	FSType string
 
-	// Flags carries additional mount flags (e.g. "noatime"); the provider validates each against its allowlist.
+	// Flags carries additional mount flags (e.g. "noatime"). They are
+	// free-form and unvalidated here; because they end up as arguments to
+	// mount, the provider validates each against the flags it allows before
+	// passing them on. See the VolumeProvider doc for the rule.
 	Flags []string
 }
 

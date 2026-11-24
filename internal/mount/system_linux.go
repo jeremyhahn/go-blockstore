@@ -70,7 +70,20 @@ func pinDirectory(path string) (int, error) {
 	}
 }
 
-// Check reports whether a target can be pinned using the same resolution as Mount, then releases it.
+// Check reports whether a target can be pinned, using exactly the resolution a
+// Mount would — the same openat2 call, the same refusals — and then lets it go.
+//
+// It exists so a caller can find out that a target is unusable BEFORE doing
+// something it cannot take back. A provider that formats a raw volume on its
+// first mount needs to fail a doomed request before the mkfs, and a check that
+// merely resembled the real one would pass for a path the mount then refuses:
+// an Lstat, for instance, says nothing about a symlink at a PARENT, which the
+// pin rejects. Sharing the call is what keeps the two from ever disagreeing.
+//
+// A target that passes here can still fail at Mount — the path may be swapped
+// in between, which is the race the pin exists to survive. That is not a
+// weakness of this function: Mount resolves again, from scratch, and mounts
+// against what IT pinned.
 func Check(target string) error {
 	fd, err := pinDirectory(target)
 	if err != nil {
@@ -94,7 +107,15 @@ func (systemMounter) Mount(_ context.Context, source, target, fsType string, fla
 	return nil
 }
 
-// Unmount detaches what is mounted at target, pinning the parent and using UMOUNT_NOFOLLOW for the final component.
+// Unmount detaches whatever is mounted at target.
+//
+// The PARENT is pinned here, not the target. A descriptor on the target resolves
+// to the root of the mounted filesystem and holds it open, so the unmount that
+// follows fails with EBUSY — measured. Pinning the parent fixes every directory
+// above the mount point, and UMOUNT_NOFOLLOW covers the one component left:
+// the kernel refuses rather than following a symlink in the final position, so
+// a swapped final component cannot redirect the unmount onto somebody else's
+// mount.
 func (systemMounter) Unmount(_ context.Context, target string) error {
 	parent, name := filepath.Dir(target), filepath.Base(target)
 

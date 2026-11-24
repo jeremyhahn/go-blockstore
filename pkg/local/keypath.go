@@ -25,10 +25,25 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// ErrKeyFileInsideVolume reports a LUKS key file inside a path this provider hands to a workload.
+// ErrKeyFileInsideVolume reports a LUKS key file that lives inside a path this
+// provider hands to a workload.
+//
+// The whole point of the privilege-separated deployment is that ONLY THE MOUNT
+// crosses the boundary and never the key. A shared volume is exactly where
+// somebody would think to put a key file, and if they do it WORKS: the volume
+// unlocks, nothing errors, and the credential is published to the container
+// that was specifically designed never to see it. Nothing downstream can detect
+// that, because from the workload's side it is an ordinary file in its own
+// filesystem.
 var ErrKeyFileInsideVolume = errors.New("the LUKS key file is inside a path handed to the workload")
 
-// ErrKeyFileUnresolvable reports a key path that could not be resolved, so containment is refused.
+// ErrKeyFileUnresolvable reports a key path that could not be resolved to a
+// real location, so containment could not be established.
+//
+// It fails closed. A path this provider cannot resolve is one it cannot prove
+// is outside the volume, and "could not check" must not read as "checked and
+// fine" for a credential — that is the same substitution the mount-propagation
+// guard refuses one layer up.
 var ErrKeyFileUnresolvable = errors.New("the LUKS key file path could not be resolved, so it cannot be shown to be outside the volume")
 
 // resolveKeyFile resolves symlinks in the key path, resolving a missing file against its deepest existing ancestor; see checkKeyFileAgainstMountedFilesystem.

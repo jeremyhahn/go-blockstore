@@ -23,30 +23,64 @@ import (
 // Package error sentinels. They classify outcomes a caller branches on; the
 // wrapped detail says which volume and why.
 var (
-	// ErrAlreadyManaged is returned by Manage when the volume already has a manager; one goroutine per volume is the serialization.
+	// ErrAlreadyManaged is returned by Manage when the volume already has a
+	// manager on this controller.
+	//
+	// One goroutine per volume is not a convenience, it is the serialization:
+	// the controller's check-then-act sequences — read the replication state,
+	// then promote; check the remaining lease, then act — are safe because
+	// exactly one goroutine per volume performs them. A second manager would
+	// interleave two of those sequences against one device, and the lease
+	// cannot prevent it, because both would be running under the same node's
+	// single lease.
 	ErrAlreadyManaged = errors.New("volume already managed by this controller")
 
 	// ErrNotManaged is returned by Status for a volume with no manager.
 	ErrNotManaged = errors.New("volume not managed by this controller")
 
-	// ErrNotPromotable reports a local replication state the controller will not promote; it retries next reconcile.
+	// ErrNotPromotable reports that the local replication state is not one the
+	// controller will promote. It is wrapped with the state and the reason.
+	// It is a refusal, not a failure: the volume is intact and the controller
+	// retries on the next reconcile.
 	ErrNotPromotable = errors.New("replication state is not safe to promote")
 
-	// ErrNotServiceable reports an already-Primary copy in a state the controller will not announce; it does not demote.
+	// ErrNotServiceable reports that the local copy ALREADY holds the primary
+	// role, and is in a state this controller will not announce as serving.
+	//
+	// It is the counterpart to ErrNotPromotable and asks a different question —
+	// see [adoptEligibility]. The controller does not demote in this case: the
+	// copy is already in service, and pulling it out from under a running
+	// workload is not a decision a refusal to announce should make.
 	ErrNotServiceable = errors.New("the local copy is primary but not in a state safe to serve")
 
 	// ErrLeaseTooShort reports that too little of the acknowledged lease
 	// remained for the controller to initiate a promotion under it.
 	ErrLeaseTooShort = errors.New("insufficient acknowledged lease remaining to promote")
 
-	// ErrRenewFailed reports an unacknowledged renewal; the lease is not lost, and a later successful renewal clears it.
+	// ErrRenewFailed reports a renewal the backend did not acknowledge. The
+	// lease is NOT lost — Done decides that, not this — but the deadline did
+	// not move, so the controller has less of it left than the cadence assumes.
+	//
+	// It is a sentinel rather than a bare wrap because a renewal succeeding is
+	// allowed to clear exactly this and nothing else: a refusal standing from
+	// the last reconcile is a fact about the VOLUME, and no amount of talking
+	// to the Coordinator resolves it.
 	ErrRenewFailed = errors.New("lease renewal was not acknowledged")
 
 	// ErrFenced reports that the lease was lost. Once it is set the controller
 	// initiates no promotion for that volume until it is elected again.
 	ErrFenced = errors.New("fenced: primary lease lost")
 
-	// ErrRoleNotYielded reports a failed demote after a fence, so the copy may still be writable; always wrapped with ErrFenced.
+	// ErrRoleNotYielded reports that the best-effort demote after a fence did
+	// not take, so the local copy may still be writable with no lease behind
+	// it. It is always wrapped alongside [ErrFenced].
+	//
+	// It is a separate sentinel because it marks an UNRESOLVED hazard, and that
+	// is a different thing from the fence itself. A fence is an event and stays
+	// in the record; this is a condition that persists until somebody acts on
+	// it, so it survives the controller moving on — a retry loop that replaced
+	// it with a contender's error would stop reporting the unsafe state exactly
+	// when nobody is watching.
 	ErrRoleNotYielded = errors.New("the local copy could not be demoted after the lease was lost")
 )
 
@@ -57,7 +91,10 @@ const (
 	// PhaseIdle is the phase before the first acquisition attempt.
 	PhaseIdle Phase = "idle"
 
-	// PhaseCampaigning means this controller does not hold the lease; Status.Err says why.
+	// PhaseCampaigning means this controller does not hold the volume's lease.
+	// It covers both reasons — another node holds it, or the Coordinator could
+	// not answer — because the controller's behavior is identical in each: it
+	// promotes nothing and retries. Status.Err says which.
 	PhaseCampaigning Phase = "campaigning"
 
 	// PhaseLeading means this controller holds the volume's lease.
@@ -91,17 +128,44 @@ type Status struct {
 	// elected again": a promotion belongs to the epoch it was issued under.
 	Epoch uint64
 
-	// Primary is the controller's announcement that this node may serve the volume under the current epoch; Repl.Role is the device's actual role.
+	// Primary is the controller's ANNOUNCEMENT that this node holds the primary
+	// role for the volume under the current epoch and its copy is safe to
+	// serve. Because Config.Observer is what an orchestrator mounts on, this is
+	// an authorization and not merely an observation, and the two eligibility
+	// tables in the package documentation are what stand behind it — one for
+	// promoting a copy into service, a broader one for announcing a copy that
+	// is already primary.
+	//
+	// It is not the same as "the device is Primary". A node whose copy is
+	// Primary but not safe to serve reports Primary false with
+	// [ErrNotServiceable], and Repl below still carries the role the provider
+	// actually reported. A consumer that wants the device's role rather than
+	// this controller's authorization reads Repl.Role.
+	//
+	// It is dropped on fencing, before any demote is attempted, because the
+	// authorization expires with the lease whether or not the device could be
+	// demoted.
 	Primary bool
 
 	// Repl is the replication state observed at the last reconcile. The zero
 	// value means none has been observed yet.
 	Repl common.ReplState
 
-	// LeaseDeadline is when the last acknowledged acquire or renew expires, never later than the real deadline.
+	// LeaseDeadline is when the last ACKNOWLEDGED acquire or renew expires. It
+	// is computed from the configured LeaseTTL, which the Coordinator rounds
+	// up, so the real deadline is never earlier than this one.
 	LeaseDeadline time.Time
 
-	// Err is the reason for the current phase; in PhaseStopped only the shutdown's own reason or a fence survives.
+	// Err is the reason for the current phase, or the most recent refusal or
+	// failure. A nil Err in PhaseLeading with Primary set is the healthy state.
+	//
+	// In PhaseStopped it carries the reason the shutdown itself had, when it
+	// had one, and otherwise only a condition that OUTLIVES the shutdown — a
+	// fence, which is how "the lease was lost and the demote afterwards failed,
+	// so this node may still be writable" survives into the last status anyone
+	// will see for the volume. A refusal or a renewal warning is resolved by no
+	// longer trying, so a clean stop reports nil rather than making itself look
+	// like a failed one.
 	Err error
 
 	// UpdatedAt is when this status was last written.

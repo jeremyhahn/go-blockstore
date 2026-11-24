@@ -11,7 +11,23 @@
 // 2. Commercial License
 //    Contact licensing@automatethethings.com for commercial licensing options.
 
-// Package luks holds the LUKS2 machinery the storage providers share: pinned parameters, the key borrow window and the mapping ownership check.
+// Package luks holds the LUKS2 machinery the storage providers share.
+//
+// It exists because there are now two providers that put a dm-crypt layer over
+// a block device — pkg/local over a logical volume, pkg/drbd over a replicated
+// device — and the parts that are the same for both are all the parts that are
+// easy to get subtly wrong: the pinned cryptographic parameters, the borrow
+// window a passphrase is allowed to exist in, and the ownership check that
+// refuses a mapping under this software's deterministic name which turns out to
+// be over somebody else's device. Two copies of those would be two chances to
+// diverge, and the divergence would be silent.
+//
+// What is NOT here is anything about how a provider finds its backing device or
+// what it does with the plaintext one. The mapping name's scope, the device
+// path, and where in a volume's lifecycle the container is opened and closed are
+// each provider's own: pkg/local opens on Attach because that is where its
+// device becomes usable, and pkg/drbd opens on Promote because that is where
+// DRBD lets the device be opened at all.
 package luks
 
 import (
@@ -41,7 +57,44 @@ const (
 	keySizeBits = 512
 )
 
-// HeaderBytes is the 16 MiB a container formatted here reserves before the data: 32768 + 16744448 bytes of keyslots area. Existing containers are read with DataOffset.
+// HeaderBytes is the space a LUKS2 container formatted here reserves in front
+// of the caller's data: 16 MiB, of which two 16 KiB metadata copies and a
+// 16744448-byte keyslots area account for every byte.
+//
+// It is a constant rather than something read back per volume because every
+// parameter that determines it is PINNED above, so the figure is a property of
+// this package and of go-luks2's layout, not of whatever a host happens to ship.
+// It is measured rather than taken from folklore, and it has now been measured
+// against two independent formatters that agree to the byte:
+//
+//   - cryptsetup 2.7.0 (measured on a loopback volume group).
+//     Formatting with exactly these parameters at 32 MiB, 64 MiB, 128 MiB,
+//     300 MiB and 1200 MiB put the data segment at offset 16777216 every time,
+//     and the plaintext mapping came back exactly that much smaller than the
+//     logical volume under it.
+//   - go-luks2 (measured formatting sparse files at
+//     the same five sizes and reading the segment offset back out of the header
+//     it wrote). Offset 16777216 at every size, keyslot area at 32768 with
+//     258048 bytes used.
+//
+// It does not scale with the device, and the arithmetic behind it is not a
+// coincidence of two implementations: go-luks2 computes the offset as the
+// keyslots area start plus the keyslots area size (pkg/luks2/format.go), the
+// area starts at 0x8000 = 32768 because two 16 KiB metadata copies precede it,
+// and the area is the cryptsetup-compatible LUKS2DefaultKeyslotsSize of
+// 16 MiB - 2*16 KiB = 16744448, which is larger than the 258048 bytes a single
+// 512-bit keyslot needs. 32768 + 16744448 = 16777216.
+//
+// Where go-luks2 and cryptsetup DIVERGE is a device too small to hold a header
+// and any data at all. cryptsetup shrinks the keyslots area to fit; go-luks2
+// does not, and writes a segment offset past the end of the device, which then
+// fails to open. Sizing always adds this figure to a capacity that is already
+// positive, so no backing device this software creates lands in that range
+// either way.
+//
+// It sizes containers this package CREATES. What an existing container's header
+// actually costs is read from that header — see Manager.DataOffset — because a
+// volume restored from a snapshot carries whatever header its source had.
 const HeaderBytes = 16 << 20
 
 // Mapping name prefixes per provider; neither may be a prefix of the other.
@@ -53,7 +106,27 @@ const (
 	ReplicatedMappingPrefix = "bsr-"
 )
 
-// Manager binds a Backend, a KeyProvider and a mapping namespace (built by the provider with a separator its names forbid). errScope names the package errors are attributed to.
+// Manager binds a Backend, a KeyProvider and a mapping namespace into the
+// per-volume operations a provider performs.
+//
+// The namespace is everything the mapping name carries in front of the volume
+// ID: one of the prefixes above, whatever the provider scopes by — a volume
+// group, say — and a separator. Device-mapper names are a single flat namespace
+// for the whole host while a volume ID is only unique within its provider, so
+// two providers each holding an encrypted volume called "data" would otherwise
+// both claim one name and the second open would find the first one's mapping
+// already there.
+//
+// THE NAMESPACE IS THE PROVIDER'S TO BUILD, and the separator is why. It has to
+// be a character that provider's own name validation forbids in a scope and in
+// a volume ID, or the concatenation is ambiguous: pkg/local rejects underscores
+// in both and separates with one, while pkg/drbd ACCEPTS underscores in a
+// resource name — DRBD does — and separates with a dot, which its name regexp
+// rejects. A separator chosen here could only be right for one of them, and
+// being wrong would mean two different volumes spelling one mapping name.
+//
+// The errScope is the package name errors are attributed to, so a refusal
+// reaching an operator says which provider produced it.
 type Manager struct {
 	backend   Backend
 	keys      KeyProvider
@@ -119,7 +192,32 @@ func (m *Manager) withKey(ctx context.Context, volID string, op func(key *enclav
 	return opErr
 }
 
-// Format writes a LUKS2 header with every cryptographic parameter pinned; the PBKDF2 iteration count comes from go-luks2's benchmark.
+// Format writes a LUKS2 header onto the device.
+//
+// Every cryptographic parameter is stated rather than defaulted. A container
+// formatted here is the same on every host and in every build, which matters
+// because the library's defaults are not FIPS-approved: go-luks2 formats with
+// argon2id and derives with SHA-256 when it is not told otherwise. Nothing here
+// depends on a cryptsetup binary being installed, being a particular version, or
+// being compiled with a particular set of defaults — there is no cryptsetup
+// involved at all.
+//
+// The iteration count is left to go-luks2's benchmark rather than pinned, for
+// the reason a pinned count is worse: a fixed number cannot rise on faster
+// hardware. That reasoning did not hold until go-luks2 v0.2.0-alpha, and the
+// history is kept because it is what makes the current number credible: the
+// benchmark timed 1000 PBKDF2-SHA-512 iterations at millisecond resolution, a
+// derivation that finishes in well under a millisecond, so the elapsed time
+// rounded to zero and every container came out with a hard-coded 100000 —
+// against the 3,344,740 cryptsetup 2.7.0 chose on the same hardware. go-luks2
+// now calibrates correctly.
+//
+// With the pinned parameters the count tracks the hardware (about 4 million
+// iterations, 2.4s of derivation), and pbkdfIterTime is consulted. The cost is
+// paid on every container created, and it is the cost of the work being done.
+//
+// The passphrase never leaves the process: it stays in its enclave and is lent
+// to go-luks2, which borrows it for the derivation, with no file descriptor.
 func (m *Manager) Format(ctx context.Context, volID, device string) error {
 	err := m.withKey(ctx, volID, func(key *enclave.MemoryEnclave) error {
 		return m.backend.Format(ctx, device, key)
@@ -149,14 +247,25 @@ func (m *Manager) Close(ctx context.Context, volID string) error {
 	return nil
 }
 
-// TestPassphrase checks that the key held for volID opens the container on device, without unlocking it.
+// TestPassphrase checks that the key held for volID opens the container on
+// device, WITHOUT unlocking it.
+//
+// The check derives the keyslot's key and verifies it against the header's
+// digest, and creates no device-mapper mapping at all. So a restore can
+// establish that the volume it is about to produce will be openable before it
+// creates anything, rather than after it has copied the image.
 func (m *Manager) TestPassphrase(ctx context.Context, volID, device string) error {
 	return m.withKey(ctx, volID, func(key *enclave.MemoryEnclave) error {
 		return m.backend.TestKey(ctx, device, key)
 	})
 }
 
-// DataOffset reports where a container's data starts, read from its header.
+// DataOffset reports where a container's data starts — the space its header
+// occupies, and so the difference between the backing device's size and the
+// usable capacity of the mapping over it.
+//
+// See Backend.DataOffset for why it is read from the header rather than assumed
+// to be HeaderBytes, and for what an unreadable answer means.
 func (m *Manager) DataOffset(ctx context.Context, device string) (int64, error) {
 	offset, err := m.backend.DataOffset(ctx, device)
 	if err != nil {
@@ -165,7 +274,28 @@ func (m *Manager) DataOffset(ctx context.Context, device string) (int64, error) 
 	return offset, nil
 }
 
-// IsOpen reports whether the volume's mapping exists and is over backing (compared by major:minor); a foreign mapping under the name is an error.
+// IsOpen reports whether the volume's plaintext mapping exists AND is the one
+// this provider would have made over backing.
+//
+// The mapping name is deterministic, which makes it findable and also makes it
+// claimable: a stale mapping left by an earlier run, or one an operator opened
+// by hand, sits under exactly the name a provider looks for. Treating the name
+// as proof would have an unlock return that mapping as this volume's plaintext
+// device — handing the caller some other volume's decrypted contents to mount —
+// and a teardown close it, and a resize grow it.
+//
+// So the backing device is checked, and the comparison is by major:minor rather
+// than by path, because the same device answers to several paths: the kernel
+// names the mapping's backing device in sysfs as a dm-canonical
+// /dev/mapper/<vg>-<lv>, whatever path the mapping was opened against. A
+// mapping under our name over some other device is an error, not something to
+// adopt: it is a conflict a human has to resolve, and continuing would act on
+// the wrong volume.
+//
+// Only "there is no mapping under that name" is the negative answer. Anything
+// else is reported, because guessing "not open" would make an unlock try to
+// open a volume that is already open, or a teardown skip a mapping it should
+// have closed.
 func (m *Manager) IsOpen(ctx context.Context, volID, backing string) (bool, error) {
 	_, open, err := m.ownMapping(ctx, volID, backing)
 	return open, err
@@ -202,7 +332,10 @@ type MappingSize struct {
 	// fixed when the mapping was loaded.
 	MappingBytes int64
 
-	// DataBytes is the backing device's current size less the data offset.
+	// DataBytes is the backing device's current size less the container's
+	// data offset — the length a mapping opened NOW would be given. It is what
+	// MappingBytes was equal to at the moment the mapping was opened, and it
+	// moves when the device does.
 	DataBytes int64
 }
 
@@ -211,7 +344,25 @@ type MappingSize struct {
 // A filesystem grown "to fit" a stale mapping grows to the OLD size.
 func (s MappingSize) Stale() bool { return s.MappingBytes < s.DataBytes }
 
-// MeasureMapping reports how the volume's open mapping relates to the device under it; anything it cannot account for is an error.
+// MeasureMapping reports how the volume's open mapping relates to the device
+// under it.
+//
+// It exists because this seam has no resize — see Backend — so the one thing a
+// provider CAN do about a device that grew under an open mapping is notice.
+// go-luks2 sizes a "dynamic" segment's mapping from the backing device at the
+// moment it opens it and never again; after the device grows, the plaintext
+// device is still the size it was, and a filesystem grown to fill it fills
+// the old size while every layer above reports the new one. That is the silent
+// wrong answer this measurement exists to turn into a refusal.
+//
+// The mapping must be open and must be this volume's; the same ownership check
+// IsOpen makes is made here, and a name held by a mapping over some other
+// device is an error rather than a measurement. Everything else that cannot
+// be accounted for is an error too, fail-closed: a data offset the header does
+// not state, a backing device no larger than its own header, or a mapping
+// LONGER than the device's data area — which is a device that shrank under a
+// live mapping, a state nothing here can size correctly and one whose writes
+// past the end will fail.
 func (m *Manager) MeasureMapping(ctx context.Context, volID, backing string) (MappingSize, error) {
 	info, open, err := m.ownMapping(ctx, volID, backing)
 	if err != nil {

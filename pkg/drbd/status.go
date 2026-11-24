@@ -58,7 +58,11 @@ type connectionStatus struct {
 	Congested  bool   `json:"congested"`
 	PeerRole   string `json:"peer-role"`
 
-	// drbdsetup spells this key with an underscore; the hyphenated form is accepted too. See UnmarshalJSON.
+	// drbdsetup spells this key with an underscore while every neighboring key
+	// is hyphenated. The hyphenated alternative is accepted too so that a
+	// drbd-utils build which normalises the key does not silently produce a
+	// connection with no peer devices — which would read as "volume missing"
+	// rather than as a parse problem. See UnmarshalJSON.
 	PeerDevices []peerDeviceStatus `json:"-"`
 }
 

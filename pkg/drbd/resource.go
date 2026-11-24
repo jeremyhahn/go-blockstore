@@ -175,14 +175,45 @@ type resourceMeta struct {
 	// VG is the volume group the backing LV was carved from.
 	VG string `json:"vg"`
 
-	// SizeBytes is the usable capacity the volume was provisioned or resized to, not the backing LV size; convert through backingBytes.
+	// SizeBytes is the USABLE capacity the volume was provisioned or resized to
+	// — common.VolumeSpec.SizeBytes as the caller gave it, in the units that
+	// field defines. It is NOT the size of the backing logical volume, which is
+	// larger by the LUKS2 header on an encrypted provider (dataBytes), larger
+	// by DRBD's internal metadata (backingBytes) and larger again by LVM's
+	// rounding up to the volume group's extent size.
+	//
+	// Every comparison against this field is therefore in usable bytes and
+	// every comparison against an lv_size is in backing bytes; the two are
+	// converted through backingBytes and never mixed. Status reports the DRBD
+	// device's real size brought back to usable through usableBytes.
 	SizeBytes int64 `json:"size_bytes"`
 
 	// FSType is the filesystem recorded for the volume, or empty for a raw
 	// device. Mount uses it when MountOptions.FSType does not override it.
 	FSType string `json:"fs_type,omitempty"`
 
-	// FSGrowPending records a filesystem grow owed after a Secondary-side resize or restore; Mount pays it with an idempotent online grow. Absent means nothing owed.
+	// FSGrowPending records that the device reached SizeBytes while the
+	// filesystem on it could not be reached from this node's state — a
+	// Resize, or a restore that grew, run while the volume was Secondary,
+	// where DRBD will not open the device and an encrypted volume's container
+	// is closed. The device half of a resize is done and recorded; this says
+	// the filesystem half is owed, and Mount pays it: once the volume is
+	// mounted both filesystems this package manages grow online, resize2fs
+	// without a check and xfs_growfs by its only route.
+	//
+	// IT IS THIS NODE'S BOOKKEEPING, NOT THE PAIR'S. The filesystem is
+	// replicated and the record is not, so the peer may have grown the
+	// filesystem online after this node's Resize deferred it — the ordinary
+	// order, Secondary first and then the mounted Primary. That is why the
+	// debt is paid with an ONLINE grow that is idempotent and cheap when there
+	// is nothing to do, and never with the offline route, which begins with a
+	// forced e2fsck of the whole filesystem: a flag that can over-report must
+	// not cost a full check each time it does.
+	//
+	// It is absent from a record that owes nothing, so a record written before
+	// this field existed reads as owing nothing — which is what such a record
+	// was promised: its filesystem is grown by the next Resize from the
+	// Primary, as before.
 	FSGrowPending bool `json:"fs_grow_pending,omitempty"`
 
 	// Minor is the DRBD device minor, which fixes the device path.
@@ -197,7 +228,19 @@ type resourceMeta struct {
 	// CreatedAt is when the volume was provisioned.
 	CreatedAt time.Time `json:"created_at"`
 
-	// Incomplete marks a record reserving Minor and Port before the volume is built; loadMeta hides it, listMeta counts it.
+	// Incomplete marks a record written to reserve Minor and Port while the
+	// volume is still being built, before its backing device, resource file and
+	// DRBD metadata exist.
+	//
+	// The reservation has to be visible to the allocator — that is the whole
+	// reason the record is written first — but the half-built volume must not
+	// be visible to anything else, or a concurrent Status would report a volume
+	// that is not there and a concurrent Mount would run commands against a
+	// device that has not been created. loadMeta therefore hides an incomplete
+	// record, while listMeta counts it.
+	//
+	// It is absent from a finished record, so a record written before this
+	// field existed reads as complete.
 	Incomplete bool `json:"incomplete,omitempty"`
 }
 

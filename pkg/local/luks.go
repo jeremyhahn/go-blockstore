@@ -55,7 +55,9 @@ type KeyProvider = luks.KeyProvider
 // restarting the process.
 func FileKeyProvider(path string) KeyProvider { return luks.FileKeyProvider(errScope, path) }
 
-// StaticKeyProvider returns a KeyProvider backed by a fixed passphrase; it takes ownership of stored.
+// StaticKeyProvider returns a KeyProvider backed by a fixed passphrase, held in
+// the enclave it is given for the returned provider's lifetime. It TAKES
+// OWNERSHIP of stored.
 func StaticKeyProvider(stored *enclave.MemoryEnclave) (KeyProvider, error) {
 	return luks.StaticKeyProvider(errScope, stored)
 }
@@ -69,8 +71,32 @@ func encryptedTagFor(headerBytes int64) string {
 	return encryptedTagPrefix + strconv.FormatInt(headerBytes, 10)
 }
 
-// ErrResizeWhileAttached is returned by Resize for an encrypted volume whose mapping is open on this node; detach and resize again.
-// go-luks2 has no table reload, so an attached resize would mean tearing down the mapping. The detached path is safe.
+// ErrResizeWhileAttached is returned by Resize for an encrypted volume whose
+// plaintext mapping is open on this node. Detach it and resize again.
+//
+// It exists because growing a dm-crypt mapping in place means reloading the
+// device-mapper table underneath the live device, and that needs the
+// container's master key. go-luks2 v1.0.0-rc.2 exposes no resize and no table
+// reload (pkg/dmcrypt has Activate, Lookup and Deactivate), so the only
+// mechanism available through it is to REMOVE the mapping and unlock again. That is a destructive shape wearing a resize's name: the
+// teardown is unconditional and the rebuild can fail — a KeyProvider rotated
+// since the volume was attached, a damaged header, any device-mapper refusal —
+// and what the caller is left with is not an unresized volume but no plaintext
+// device at all. Validating the key first narrows the window and does not close
+// it, so the operation is refused rather than attempted.
+//
+// It is NOT wrapped around common.ErrUnsupported, and the difference is the
+// whole value of the sentinel. ErrUnsupported tells a caller this backend
+// cannot serve the request and that retrying or reconfiguring is pointless;
+// this request is served perfectly well one Detach later, which is the opposite
+// advice. A caller holding the attachment acts on that distinction — it is the
+// same shape as common.ErrNotPrimary, "the request is fine, the volume is in
+// the wrong state at the moment" — so the sentinel says so in its own right.
+//
+// The detached path has no such hazard and is not restricted: Resize over a
+// detached volume unlocks the container itself, grows the filesystem and locks
+// it again, and a failure anywhere in that leaves the volume exactly as
+// detached as it started. See growDetachedEncryptedFilesystem.
 var ErrResizeWhileAttached = errors.New("cannot resize an encrypted volume while it is attached")
 
 // The methods below delegate to internal/luks.Manager; only the logical-volume backing check is this provider's.

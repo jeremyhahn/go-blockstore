@@ -11,7 +11,33 @@
 // 2. Commercial License
 //    Contact licensing@automatethethings.com for commercial licensing options.
 
-// Package posture reports which guards a provider checks and which it does not, for the caller to print at startup.
+// Package posture is what a provider checks and what it does not, by name.
+//
+// It exists because a guard that is off is invisible. The startup privilege
+// checks announce themselves by refusing construction, so an operator learns
+// about them the moment they are wrong; the mount-propagation guard defaults to
+// off, so an operator who never enabled it sees exactly what an operator whose
+// deployment does not need it sees — nothing. That is the failure the guard was
+// added to remove, one level up: not a wrong answer, an absent one.
+//
+// So the third state is made sayable. A guard is reported as CHECKED or as NOT
+// CHECKED, always both kinds in the same list, rather than the unchecked ones
+// being omitted and inferred. An operator reading
+//
+//	mount propagation: NOT CHECKED
+//
+// beside three that are checked can act on it. An operator reading a list of
+// three cannot tell it from a list of four.
+//
+// This library writes nothing to a log — every other result it produces is a
+// returned value — so this is returned too, and the component that builds a
+// Provider is expected to print it once at startup, next to where it reports a
+// preflight failure.
+//
+// The type is shared across providers rather than declared in each, so a caller
+// holding one of several providers can print or inspect its posture without
+// knowing which it built. The provider is named in Component rather than in the
+// type.
 package posture
 
 import "strings"
@@ -41,7 +67,11 @@ type GuardStatus struct {
 	Detail string
 }
 
-// String renders the posture, one guard per line; NOT CHECKED is upper case so gaps stand out.
+// String renders the whole posture, one guard per line, for a component to print
+// at startup.
+//
+// NOT CHECKED is upper case and CHECKED is not, deliberately: the eye finds the
+// gaps in a list of a dozen lines, which is the reading this exists to support.
 func (p Posture) String() string {
 	var b strings.Builder
 	b.WriteString("go-blockstore")

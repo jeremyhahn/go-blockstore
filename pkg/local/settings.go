@@ -36,23 +36,66 @@ const (
 	// containers. It requires SettingLUKSKeyFile.
 	SettingEncrypted = "encrypted"
 
-	// SettingLUKSKeyFile is the path to a file holding the LUKS passphrase, never the passphrase itself.
+	// SettingLUKSKeyFile is the path to a file holding the LUKS passphrase.
+	//
+	// The setting is a path, never the passphrase itself. Settings come from
+	// configuration files and process environments that get logged, copied into
+	// support bundles and printed by diagnostic endpoints; a key in that map is
+	// a key in all of those. A deployment whose keys live somewhere a file path
+	// cannot reach — sealed to a TPM, say — builds the provider with New and an
+	// Options.KeyProvider of its own rather than going through settings.
 	SettingLUKSKeyFile = "luks_key_file"
 
 	// SettingSnapshotCoWPercent sizes a snapshot's copy-on-write area as a
 	// percentage of its origin.
 	SettingSnapshotCoWPercent = "snapshot_cow_percent"
 
-	// SettingWipeOnDelete ("true"/"false", default false) zero-fills a volume before removing it; see Options.WipeOnDelete.
+	// SettingWipeOnDelete ("true"/"false") zero-fills a volume before removing
+	// it.
+	//
+	// It defaults to false, and an unencrypted volume on non-discarding media
+	// retains readable data after deletion unless it is set. Setting
+	// SettingEncrypted is the recommended answer to that and costs far less;
+	// see Options.WipeOnDelete for the whole picture.
+	//
+	// It covers the volume's current contents only. A snapshot's exception
+	// store holds the origin's overwritten history and is freed unwiped, by a
+	// measured impossibility rather than an omission — see the package doc.
 	SettingWipeOnDelete = "wipe_on_delete"
 
-	// SettingLockDir holds the per-volume lock files, default DefaultLockDir; every provider over one volume group must share it.
+	// SettingLockDir holds the per-volume lock files that serialize
+	// state-changing operations. It defaults to DefaultLockDir.
+	//
+	// Every provider over one volume group must be given the SAME directory —
+	// on one host, and on a local filesystem. That is what the serialization
+	// rests on, and two providers pointed at different directories do not
+	// serialize against each other at all.
 	SettingLockDir = "lock_dir"
 
-	// SettingPreflight selects New's startup privilege checks: "configured" (default), "all" or "off". See PreflightMode.
+	// SettingPreflight selects which startup privilege checks New performs:
+	// "configured" (the default), "all", or "off".
+	//
+	// It is spelled out in configuration rather than inferred because "off" is
+	// the setting that re-enables a silent failure — a provider that constructs
+	// happily in a container which cannot attach a volume — and a choice with
+	// that consequence should appear in the deployment's own configuration
+	// where a reviewer can see it. See PreflightMode.
 	SettingPreflight = "preflight"
 
-	// SettingMountPropagation selects whether Mount verifies visibility outside this namespace: "unchecked" (default) or "shared". See MountPropagationPolicy.
+	// SettingMountPropagation selects whether Mount verifies that the mount it
+	// made is visible outside this mount namespace: "unchecked" (the default)
+	// or "shared".
+	//
+	// Set it to "shared" in the deployment this library was built for — a
+	// storage component mounting on behalf of a workload that lives in another
+	// mount namespace. Left unchecked, a wrong propagation setting is the
+	// quietest failure in that model: the mount succeeds here, the workload
+	// finds an empty directory, and nothing anywhere reports an error.
+	//
+	// It is not the default because a mount is private on an ordinary host and
+	// that is correct there; requiring propagation everywhere would refuse the
+	// deployments that have no workload namespace to reach. See
+	// MountPropagationPolicy.
 	SettingMountPropagation = "mount_propagation"
 )
 
@@ -69,7 +112,12 @@ var knownSettings = map[string]struct{}{
 	SettingMountPropagation:   {},
 }
 
-// NewFromSettings builds a Provider from the factory's settings map; an unrecognized key is an error.
+// NewFromSettings builds a Provider from the string map the factory passes to a
+// registered provider creator.
+//
+// An unrecognized key is an error rather than something ignored: a misspelled
+// "encrypted" that silently provisions plaintext volumes is the kind of
+// misconfiguration nobody discovers until the disk is in someone else's hands.
 func NewFromSettings(settings map[string]string) (*Provider, error) {
 	var unknown []string
 	for key := range settings {

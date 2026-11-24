@@ -67,7 +67,19 @@ type Provider struct {
 	crypt *luks.Manager
 }
 
-// ErrMountedBeneathAnother reports a volume mounted at a path where something else was mounted on top; the other mount must go first.
+// ErrMountedBeneathAnother reports a volume still mounted at a path where
+// something else has since been mounted on top of it.
+//
+// It is its own sentinel because the advice it carries is specific and is not
+// the advice any other failure here carries: the volume cannot be unmounted
+// from this side. umount(2) takes a path and detaches whatever is visible at
+// it, so unmounting that path would take down the filesystem on top — which
+// belongs to somebody else and was never this provider's to touch — and leave
+// this volume mounted underneath it anyway. Whoever mounted over it unmounts
+// theirs first; then the delete goes through unchanged.
+//
+// Like ErrResizeWhileAttached, it says "the request is fine, the volume is in
+// the wrong state at the moment" rather than "this cannot be done".
 var ErrMountedBeneathAnother = errors.New("volume is mounted beneath another filesystem")
 
 // excluding returns the items of all that are not in keep, in order.
@@ -84,16 +96,48 @@ func excluding(all, keep []string) []string {
 // Ensure the provider satisfies the contract at compile time.
 var _ common.VolumeProvider = (*Provider)(nil)
 
-// Mounter is the seam through which mounting and unmounting happen; an alias for internal/mount's type.
+// Mounter is the seam through which mounting and unmounting happen.
+//
+// It is an alias for internal/mount's type, not a copy of it: the
+// implementation is shared with every other provider that mounts, because the
+// reason it exists — a target has to be pinned to a descriptor before a
+// privileged mount addresses it — is the same for all of them.
+//
+// The alias is what keeps that sharing from reaching the API. Options.Mounter
+// is settable from outside this module either way, since Go satisfies an
+// interface structurally, but without a name here a caller could not DECLARE
+// one: no "var m local.Mounter", no function returning one. The type was
+// exported at v0.1.0-alpha and stays nameable.
 type Mounter = mount.Mounter
 
 // MountTable is the seam through which the provider asks what is mounted.
+//
+// It replaced asking findmnt, and the reason it is a seam rather than a direct
+// read is the reason Mounter is one: the answer comes from the running kernel,
+// so a test that cannot substitute it can only run on a host that happens to
+// have the right things mounted.
 type MountTable = mountinfo.Table
 
-// MountPropagationReader is the optional half of the mount-table seam; a table without it is refused when the guard is on.
+// MountPropagationReader is the optional half of the mount-table seam: the
+// question of whether a mount is visible outside this namespace.
+//
+// A MountTable that also implements it enables the mount-propagation guard; one
+// that does not is refused by a provider configured to require propagation,
+// rather than being quietly waved through. It is separate from MountTable so
+// that a caller injecting its own table is not forced to implement a method for
+// a guard it never turns on.
 type MountPropagationReader = mountinfo.PropagationReader
 
-// LivenessOracle is the seam through which the provider asks whether an attachment still has a live owner; an alias for pkg/common's.
+// LivenessOracle is the seam through which the provider asks whether an
+// attachment still has a live owner.
+//
+// It is an alias for the contract declared in pkg/common, so that a deployment
+// implementing it once — pkg/ha from the lease it already holds, a CSI node
+// plugin from the pod that consumes the staged volume — can hand the same value
+// to every provider that asks, without any of them importing the other. The
+// alias makes it nameable here, on the same reasoning as Mounter: Options.
+// LivenessOracle is settable either way, and without a name in this package a
+// caller could not declare a variable of the type it is setting.
 type LivenessOracle = common.LivenessOracle
 
 // BlockDevices is the seam through which the provider copies and zeroes block
@@ -120,7 +164,12 @@ type Options struct {
 	// described on the Mounter interface; tests substitute a fake.
 	Mounter Mounter
 
-	// MountPropagation selects whether Mount verifies the mount is visible outside this namespace; default MountPropagationUnchecked.
+	// MountPropagation selects whether Mount verifies that the mount it made is
+	// visible outside this mount namespace. It defaults to
+	// MountPropagationUnchecked; a deployment that hands mounts to a workload in
+	// another namespace sets MountPropagationShared, which is the only way this
+	// provider can learn that a private mount is a failure rather than the
+	// ordinary state of a mount on a host.
 	MountPropagation MountPropagationPolicy
 
 	// bootID reads this boot's identifier. It is unexported, like luks, because
@@ -136,11 +185,67 @@ type Options struct {
 	// syscalls; tests substitute a fake.
 	BlockDevices BlockDevices
 
-	// LivenessOracle answers whether an attachment still has a live owner; nil is valid. Supply one where an owner can exit while the host stays up. Options only.
+	// LivenessOracle answers whether an attachment still has a live owner, for
+	// the one question this provider cannot decide on its own.
+	//
+	// It has no default and nil is a legitimate configuration: a deployment
+	// where an attachment has no owner to outlive — a host running one
+	// component over local disks — supplies none, and the reaper then reports a
+	// mapping made on the running boot as live, exactly as it did before this
+	// seam existed. Posture says so in as many words, because a guard that is
+	// off is otherwise invisible.
+	//
+	// Supply one where the attachment DOES have an owner that can exit while
+	// the host stays up. That is the case the reaper's boot-ID criterion cannot
+	// see at all — a device-mapper mapping does not survive a reboot, so a
+	// record naming an ended boot describes a state the kernel does not
+	// normally produce, while an init container that attaches, mounts and exits
+	// leaves a mapping on the boot that is still running. The oracle is what
+	// distinguishes that from a workload holding the block device open right
+	// now, and nothing this package can observe does: the dm open count is
+	// identical for a live job mid-run (go-luks2 #96), and a volume can be held
+	// raw without ever being mounted.
+	//
+	// It is reachable only through Options and has no settings key. Settings are
+	// a map of strings and an oracle is an implementation; a key that named one
+	// would have to select from a fixed list this package shipped, which is the
+	// deployment coupling the seam exists to avoid. KeyProvider is configured
+	// the same way and for the same reason.
 	LivenessOracle LivenessOracle
 
-	// Encrypted provisions new volumes as LUKS2 (PBKDF2-SHA-512, AES-256-XTS, FIPS-approved, no cryptsetup) and requires KeyProvider; existing volumes are detected by probing.
-	// SizeBytes stays usable capacity: the header is added on top.
+	// Encrypted provisions new volumes as LUKS2 containers. It requires
+	// KeyProvider. Volumes already on disk are detected by probing rather than
+	// by this flag, so a provider with Encrypted false still attaches and
+	// mounts an encrypted volume as long as KeyProvider is set.
+	//
+	// The container is LUKS2 with every cryptographic parameter pinned:
+	// PBKDF2-SHA-512, AES-256-XTS, and a 512-bit key. Nothing is left to the
+	// library's defaults, which are not FIPS-approved — go-luks2 formats with
+	// argon2id and derives with SHA-256 when it is not told otherwise. Every
+	// volume this provider creates is therefore identical on every host and in
+	// every build, and deployable where FIPS 140-3 is required.
+	//
+	// No cryptsetup binary is involved, and none needs to be installed: the
+	// header is written and parsed in this process by go-luks2, and the
+	// plaintext mapping is created with device-mapper ioctls.
+	//
+	// PBKDF2 rather than argon2id is the one choice that looks like a
+	// downgrade and is not. Argon2's memory-hardness defends a LOW-ENTROPY
+	// secret against parallel guessing, and there is no such secret here: the
+	// KDF stretches KeyProvider material, which comes from a file or an enclave
+	// and is machine-generated, never an interactive human passphrase. What is
+	// required fleet-wide is FIPS approval, which argon2id does not have. A
+	// caller with a human-chosen passphrase should stretch it where it is
+	// entered and hand this provider the result — feeding it in raw uses the
+	// wrong layer for the job, whichever KDF sits here.
+	//
+	// VolumeSpec.SizeBytes is USABLE capacity, and encryption does not change
+	// that: the logical volume is created luksHeaderBytes larger than the
+	// request so the plaintext mapping Attach hands back is at least the size
+	// that was asked for. Resize works the same way, and VolumeStatus.SizeBytes
+	// reports the usable figure. An encrypted volume is sized exactly like a
+	// plain one, and the header is this provider's problem rather than the
+	// caller's.
 	Encrypted bool
 
 	// luksKeyFile is the path SettingLUKSKeyFile named, when the KeyProvider was built from it; used to keep it out of workload paths.
@@ -155,14 +260,68 @@ type Options struct {
 	// defaultSnapshotCoWPercent.
 	SnapshotCoWPercent int
 
-	// LockDir holds the per-volume lock files; default DefaultLockDir, created 0700. Providers over one volume group must share it, on a local filesystem.
+	// LockDir holds the per-volume lock files that serialize state-changing
+	// operations. It defaults to DefaultLockDir and is created 0700 on first
+	// use.
+	//
+	// Two Providers over one volume group must share it, and that is the whole
+	// point: the lock is what keeps their operations from interleaving. Put it
+	// on a filesystem local to the host — the guarantee is between processes on
+	// one machine, and a network filesystem's locking is not something to build
+	// this on.
 	LockDir string
 
-	// WipeOnDelete zero-fills a volume before removing it; default false.
-	// Without it, an unencrypted volume on non-discarding media leaves readable data in freed extents; Encrypted is the better mitigation, and the only complete one with snapshots.
+	// WipeOnDelete zero-fills a volume before removing it, so its contents do
+	// not survive in the volume group's free extents.
+	//
+	// Read this before leaving it at its default: AN UNENCRYPTED VOLUME ON
+	// NON-DISCARDING MEDIA RETAINS READABLE DATA AFTER Delete UNLESS
+	// WipeOnDelete IS SET. Its extents go back to the volume group holding
+	// whatever was written to them, and the next volume to be allocated those
+	// extents can read it — lvcreate zeroes only the first few kilobytes of a
+	// new volume, enough that a stale filesystem signature is not detected, not
+	// enough that the last tenant's data is gone. The extents lvextend adds to a
+	// growing volume come from the same pool.
+	//
+	// THE RECOMMENDED MITIGATION IS Encrypted, not this option. What survives in
+	// a freed extent is then ciphertext whose key went away with the LUKS header,
+	// at none of the cost: a wipe writes the whole volume, which is minutes per
+	// terabyte on rotating disks, while encryption costs nothing at delete time.
+	// Reach for WipeOnDelete when encryption is not available — volumes that must
+	// stay readable by something that cannot unlock them, or a migration off
+	// plaintext volumes that already exist.
+	//
+	// How much the exposure bites depends on the storage. With LVM's
+	// devices/issue_discards set to 1 over a backing device that supports
+	// discard, lvremove discards the freed extents and they read back as zeroes
+	// whatever this option says. The LVM default is 0, and rotating disks do not
+	// discard at all, which is the case the option is for. Do not infer from a
+	// host where the data happens to be gone that it will be gone on the next
+	// one.
+	//
+	// ONE LIMIT WORTH KNOWING BEFORE RELYING ON THIS: a volume that has been
+	// snapshotted keeps some of its history in the volume group even after a
+	// wiping delete. A snapshot's copy-on-write area holds the pre-snapshot
+	// copies of everything the origin has overwritten since, Delete frees those
+	// extents when it removes the snapshot, and there is no way to clear them
+	// first — writing through the snapshot device overflows the CoW area rather
+	// than clearing it, and the underlying <vg>-<snap>-cow device refuses to
+	// open for writing while the snapshot exists. Encrypted is the only complete
+	// answer for a volume with snapshots.
+	//
+	// It defaults to false, matching LVM's own behavior rather than imposing a
+	// full-volume zero-fill on every deletion in every deployment.
 	WipeOnDelete bool
 
-	// Preflight selects which privilege checks New performs; default PreflightConfigured. See package preflight.
+	// Preflight selects which privilege checks New performs before it returns a
+	// Provider. It defaults to PreflightConfigured, which checks exactly the
+	// capabilities this configuration will exercise.
+	//
+	// The checks are not a formality. The privileges this provider needs are
+	// granted by three INDEPENDENT mechanisms — capabilities, the seccomp
+	// profile and the LSM profile — and a container can satisfy two of them and
+	// fail the third with no symptom until the first volume is attached. See
+	// package preflight for what is probed and what each refusal means.
 	Preflight PreflightMode
 
 	// luks performs the LUKS2 operations; nativeLUKS by default, a fake in tests. Unexported on purpose.
@@ -313,7 +472,13 @@ func (p *Provider) volumeOverhead(ctx context.Context, volID string, lv lvInfo) 
 	return p.luksDataOffset(ctx, p.lvPath(volID))
 }
 
-// Provision creates a logical volume, optionally LUKS2 and a filesystem, and leaves it inactive; a failure removes it again.
+// Provision creates a logical volume, optionally wrapping it in a LUKS2
+// container and creating a filesystem on it.
+//
+// The volume is left inactive: Provision produces an available volume, and it
+// takes Attach to turn it into a block device on this host. A failure partway
+// through removes the logical volume again rather than leaving a half-built one
+// behind for the next Provision to trip over with ErrAlreadyExists.
 func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (common.Volume, error) {
 	if err := validateName("volume", spec.Name); err != nil {
 		return common.Volume{}, err
@@ -820,7 +985,17 @@ func (p *Provider) reconcileHeaderTag(ctx context.Context, volID string, lv lvIn
 	return retagErr
 }
 
-// Detach locks the volume's LUKS container, if any, and deactivates the LV; unmount first. The header tag is reconciled before deactivating.
+// Detach locks the volume's LUKS container, if it has one, and deactivates the
+// logical volume. A volume still mounted cannot be deactivated; unmount first.
+//
+// It also reconciles the volume's recorded header, and this is the transition
+// where that matters most. Detach is the moment a volume enters the state in
+// which the tag is the ONLY source of its capacity, and the last moment the
+// container is readable — so a wrong tag surviving here is not latent, it is
+// load-bearing on the very next Status with no probe left to contradict it. The
+// reconcile therefore happens BEFORE the deactivation, and its failure fails
+// the Detach: leaving the volume active is a better outcome than putting it
+// away misdescribed.
 func (p *Provider) Detach(ctx context.Context, volID string, node common.NodeID) error {
 	if err := validateName("volume", volID); err != nil {
 		return err
@@ -974,7 +1149,10 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 	return nil
 }
 
-// Unmount unmounts the volume from target; not attached, not a mountpoint, or another device there all return nil.
+// Unmount unmounts the volume from target, converging rather than failing when
+// the volume is not mounted there: an unattached volume, a target that is not a
+// mountpoint, and a target mounted from some other device all return nil, so a
+// teardown path can call this without first working out how far setup got.
 func (p *Provider) Unmount(ctx context.Context, volID, target string) error {
 	if err := validateName("volume", volID); err != nil {
 		return err
@@ -1020,8 +1198,41 @@ func (p *Provider) umount(ctx context.Context, target string) error {
 	return p.mounter.Unmount(ctx, target)
 }
 
-// Resize grows the volume to newSize usable bytes and, where it can, the filesystem; it converges on repetition.
-// An attached encrypted volume is refused with ErrResizeWhileAttached; a shrink is ErrUnsupported; the result may round up to a whole extent.
+// Resize grows the volume to newSize bytes and, where it can, grows the
+// filesystem on top of it — when one is present and its tooling can grow it in
+// the volume's current state.
+//
+// AN ENCRYPTED VOLUME THAT IS ATTACHED IS REFUSED, with ErrResizeWhileAttached,
+// and refused before anything moves. Growing its plaintext mapping would mean
+// removing that mapping and unlocking again, and a failure between the two
+// leaves the caller with no device at all rather than with an unresized one.
+// Detaching first costs one call and removes the hazard entirely: a detached
+// resize opens the container itself, grows the filesystem inside it and locks
+// it again, so there is no mapping belonging to anyone else to lose. See
+// ErrResizeWhileAttached for why this is not ErrUnsupported.
+//
+// Shrinking returns ErrUnsupported. LVM can shrink a logical volume, but doing
+// so under a filesystem that has not been shrunk first destroys data, and a
+// provider that cannot verify the filesystem was prepared has no business
+// making that call.
+//
+// newSize is USABLE capacity, matching VolumeSpec.SizeBytes: an encrypted
+// volume's logical volume is grown by newSize plus its LUKS header, so the
+// plaintext mapping ends up the size that was asked for. Whether the volume is
+// encrypted is discovered by probing it, which a DETACHED volume has to be
+// activated for — so a resize of one activates it briefly to look, and again to
+// grow its filesystem, leaving it detached either way.
+//
+// LVM allocates in whole extents, so the volume can end up slightly larger than
+// newSize. It is never smaller. The shrink test is made against newSize plus
+// the overhead and rounded up the same way, so repeating a request LVM has
+// already rounded is a no-op rather than a rejected shrink.
+//
+// Resize is written to converge on repetition. It grows the mapping and the
+// filesystem even when the block device is already large enough, because that
+// is the state a previous call leaves behind when lvextend succeeded and the
+// filesystem growth after it did not; returning early there would report
+// success over a filesystem still at its old size.
 func (p *Provider) Resize(ctx context.Context, volID string, newSize int64) error {
 	if err := validateName("volume", volID); err != nil {
 		return err
@@ -1175,7 +1386,12 @@ func (p *Provider) checkExtFilesystem(ctx context.Context, device string) error 
 	return fmt.Errorf("go-blockstore/local: checking the filesystem on %s before growing it: %w", device, err)
 }
 
-// Snapshot takes a CoW snapshot named "<volume>_snap_<name>", which is its ID.
+// Snapshot takes a copy-on-write snapshot of the volume.
+//
+// The snapshot's ID is the logical volume name it was created under,
+// "<volume>_snap_<name>", which is what makes the volume/snapshot pairing
+// recoverable from a bare LVM listing — including by a later process that never
+// saw the Snapshot call.
 func (p *Provider) Snapshot(ctx context.Context, volID, name string) (common.SnapshotID, error) {
 	if err := validateName("volume", volID); err != nil {
 		return "", err
@@ -1217,7 +1433,15 @@ func (p *Provider) Snapshot(ctx context.Context, volID, name string) (common.Sna
 	return common.SnapshotID(snapLV), nil
 }
 
-// ListSnapshots returns the volume's snapshots in no guaranteed order, without a lock; SizeBytes is the space each occupies.
+// ListSnapshots returns the volume's snapshots, newest-first order not
+// guaranteed. A volume with none yields an empty slice and a nil error.
+//
+// Like Status it takes no lock and reports a moment: it is one lvs read and
+// changes nothing.
+//
+// SizeBytes is the space each snapshot occupies — its copy-on-write area scaled
+// by how much of that area has been written — and so grows as the origin
+// diverges. It is not the origin's capacity.
 func (p *Provider) ListSnapshots(ctx context.Context, volID string) ([]common.SnapshotInfo, error) {
 	if err := validateName("volume", volID); err != nil {
 		return nil, err
@@ -1279,7 +1503,30 @@ func (p *Provider) DeleteSnapshot(ctx context.Context, snapID common.SnapshotID)
 	return p.removeLV(ctx, string(snapID))
 }
 
-// Delete unmounts, locks and removes the volume; a failed unmount stops it. Snapshots are refused with common.ErrHasSnapshots. WipeOnDelete zero-fills first.
+// Delete destroys the volume, unmounting and locking it first so that a caller
+// tearing down does not have to sequence the teardown itself. An unmount that
+// fails stops the delete: a filesystem still in use is a better outcome than a
+// removed volume underneath it.
+//
+// It REFUSES a volume that still has snapshots, with common.ErrHasSnapshots
+// naming them. lvremove would take them with it — they are copy-on-write areas
+// over an origin that cannot outlive it — and destroying a restore point as a
+// side effect of destroying something else is not a default worth having in a
+// stack whose volumes are the ones people restore from. A caller that means it
+// deletes the snapshots first, which is one more call and an explicit one.
+//
+// The refusal also removes a hazard that used to need careful ordering here.
+// Zeroing an origin that still has a snapshot is copy-on-write's worst case:
+// every block written pushes the block it replaced into the snapshot's CoW
+// area, so the wipe duplicates the very data it is destroying into extents
+// lvremove then frees. Measured on LVM 2.03.16, wiping a 64 MiB origin under
+// one snapshot drove CoW occupancy from 0% to 100% and overflowed the snapshot
+// into an unreadable state. With snapshots refused outright, a wipe can no
+// longer run under one.
+//
+// With Options.WipeOnDelete the volume is zero-filled first, so its contents do
+// not linger in the free extents LVM hands to the next volume. See the package
+// doc for exactly what that covers and what it does not.
 func (p *Provider) Delete(ctx context.Context, volID string) error {
 	if err := validateName("volume", volID); err != nil {
 		return err
@@ -1379,8 +1626,39 @@ func (p *Provider) wipe(ctx context.Context, volID string, wasActive bool) error
 	return nil
 }
 
-// Status reports usable capacity and attachment state without a lock.
-// An active volume's header is discovered by probing; a detached one's comes from its LVM tag; an untagged detached legacy volume reports its backing size.
+// Status reports the volume's usable capacity and how far along the
+// available/attached/mounted progression it currently is.
+//
+// It takes NO lock, and so reports a moment rather than a guarantee. It changes
+// nothing, and a caller that acted on the answer would be racing whatever
+// happened next regardless of how this read were synchronized — the lock a
+// transition needs is the one the transition itself takes. A caller that needs
+// a volume to still be in the state it just read has to hold something of its
+// own at a higher level; nothing this method could do would provide it.
+//
+// SizeBytes is USABLE capacity, per VolumeStatus.SizeBytes: for an encrypted
+// volume the header is subtracted, and it is subtracted whether the volume is
+// attached or not.
+//
+// Getting that right while holding no lock takes two sources, and they are not
+// equals. While a volume is ACTIVE the header is DISCOVERED — blkid, then the
+// container's own header — which is exact even for a volume restored verbatim
+// from an outside snapshot, whose header this package did not write. A DETACHED
+// volume cannot be probed at all: an inactive logical volume is absent from
+// /dev, and blkid answers a path that does not exist with the same status it
+// uses for a device carrying no signature, so probing one would report every
+// encrypted volume as plain. Activating it to look is not available here —
+// this method holds no lock, and moving a volume while another operation owns
+// it is what the locking exists to prevent. So the fact is REMEMBERED as an LVM
+// tag when it becomes true, and read back from the same lvs listing this method
+// already fetches. See encryptedTagPrefix.
+//
+// Two consequences worth stating. A tag that CONTRADICTS what blkid can see on
+// an active volume is an error rather than a tiebreak, because a tag that lies
+// should not outlive the one moment something could catch it. And a volume
+// provisioned before the tag existed carries none, so while detached it still
+// reports its backing size — the old behavior, now scoped to legacy volumes and
+// self-healing, since its next Attach tags it. reportedSize has the detail.
 func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatus, error) {
 	if err := validateName("volume", volID); err != nil {
 		return common.VolumeStatus{}, err

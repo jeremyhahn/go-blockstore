@@ -27,11 +27,43 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// SecretProvider supplies a resource's peer authentication secret as a locked enclave, fresh on each call; both nodes must return the same secret.
-// The provider destroys it after writing; the copy in the resource file is not protected.
+// SecretProvider supplies the shared secret DRBD authenticates a peer with, as
+// a locked enclave rather than as bytes.
+//
+// It is called with the resource name whenever a resource file is generated, so
+// an implementation may hold a distinct secret per resource. Both nodes of a
+// pair must produce the SAME secret for a resource or they will not
+// authenticate, which is a deployment property this package cannot check from
+// one side.
+//
+// The provider TAKES OWNERSHIP of what it is handed and destroys the enclave as
+// soon as the secret has been written, so every call returns a fresh enclave
+// rather than one the implementation intends to reuse.
+//
+// The type is an enclave and not a []byte for the reason go-enclave exists: a
+// []byte cannot be taken back. Go's collector may copy a heap slice while it
+// lives, zeroing the slice a caller still holds reaches neither those copies nor
+// anything the scheduler moved, and the bytes are swappable and land in core
+// dumps. An enclave's pages are mlock'd, guarded and wiped on release.
+//
+// WHAT THIS DOES NOT DO, stated plainly because the alternative is implying
+// otherwise: it bounds the secret's life in THIS process. It does not protect
+// the copy in the resource file. DRBD reads the shared secret from the
+// configuration drbdadm parses, so the secret reaches disk by design and no
+// amount of care in this process changes that. See the package doc on what the
+// .res file is worth.
 type SecretProvider func(ctx context.Context, resource string) (*enclave.MemoryEnclave, error)
 
-// FileSecretProvider returns a SecretProvider that reads the file into locked pages on each call, minus one trailing newline.
+// FileSecretProvider returns a SecretProvider that reads the secret from a
+// file, re-reading it on each call so a rotated file takes effect without
+// restarting the process. The file's bytes are the secret, minus trailing
+// newline: an operator writing one with a text editor gets a newline they did
+// not intend, and unlike a LUKS key file — where the bytes are the passphrase
+// and cryptsetup says so — DRBD's shared secret is a string in a config file
+// that cannot hold a newline anyway.
+//
+// The bytes go from the descriptor into locked pages directly, so there is no
+// intermediate slice for the collector to have copied first.
 func FileSecretProvider(path string) SecretProvider {
 	return func(_ context.Context, _ string) (*enclave.MemoryEnclave, error) {
 		f, err := os.Open(path) // #nosec G304 -- path is operator configuration, not caller input

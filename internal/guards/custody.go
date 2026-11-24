@@ -86,7 +86,10 @@ type borrowWindow struct {
 	// Dir is the package directory relative to the tree root.
 	Dir string
 
-	// Func is the top-level function in go doc form; closures count as part of it.
+	// Func is the top-level function, in the form go doc uses: FileKeyProvider,
+	// (*Provider).writeSharedSecret. A closure inside one of these counts
+	// as being in it — the providers do their borrows inside the closure they
+	// return, and a closure is not a place a rule can be stated on.
 	Func string
 
 	// Why is the reason it borrows, for the reader of this table and for the
@@ -115,9 +118,108 @@ var custodyBuildConfigs = []struct {
 	{"windows", []string{"drbd"}},
 }
 
-// KeyMaterialCustody type-checks the tree and refuses code that takes key material out of the enclave custody model.
-// Rules: WithBytes only in borrowWindows; key-taking Backend methods only from internal/luks; a borrowed key only as a direct call argument; no exported key, passphrase, secret, password or token string or []byte parameters.
-// Test files are not examined; a type error is a scan failure.
+// KeyMaterialCustody refuses code that takes key material out of the custody
+// model.
+//
+// # The model
+//
+// A LUKS passphrase in this repository is never a plain []byte or string at
+// rest. A KeyProvider returns it as a go-enclave MemoryEnclave — mlock'd,
+// guarded, kept out of core dumps, wiped on release — and it never becomes
+// bytes in this repository's own code at all: internal/luks.(*Manager).withKey
+// lends the enclave to one Backend call and destroys it, and the Backend hands
+// it straight to go-luks2, which does its own borrowing. pkg/local and pkg/drbd
+// call the Manager and never see the key. The reason the enclave rather than a
+// wiped slice is the primitive is stated on internal/luks.KeyProvider: a []byte
+// cannot be taken back, because the collector may already have copied it.
+//
+// Every word of that is a convention a future change can break without any
+// test noticing, because the tests drive the providers through fakes that do
+// not care where the bytes came from. This scanner is the convention made
+// mechanical. It runs the type checker over the whole tree so its rules are
+// about TYPES — the enclave's methods, the Backend interface — and not about
+// names: a method called Open on luks.Backend, or os.Open, must not fire, and a
+// textual scanner cannot tell them apart.
+//
+// # The rules, and why each is shaped as it is
+//
+// There is no rule against the enclave's copying exits: go-enclave has no
+// MemoryEnclave.Open or OpenString, so the compiler states that rule.
+//
+//  1. Every borrow in a named place. MemoryEnclave.WithBytes may be called only
+//     from the functions in borrowWindows; anything else is a finding, and
+//     (*Manager).withKey in particular is not in the table, so the passphrase
+//     is not read out where it is lent. The tree has four sites today and the
+//     table says what each one does: the providers fill and clone enclaves with
+//     the method, and pkg/drbd's replication secret has its own read-out
+//     window. The anchor is FileKeyProvider: if the tree borrows from enclaves
+//     at all, it must exist and contain exactly one WithBytes, or the scan
+//     reports that it has lost its anchor — a scanner that would keep passing
+//     after the window it is anchored on was removed would be passing
+//     vacuously.
+//
+//  2. The key-taking Backend methods are called only from internal/luks. A
+//     call to Format, Open or TestKey whose receiver's static type is
+//     internal/luks.Backend from any other package is a finding, whatever the
+//     receiver is called and whether it arrived by alias or embedding. Those
+//     three methods are where the passphrase enclave is handed over, and the
+//     only code that may do so is the code that owns its lifetime: Manager
+//     takes a fresh enclave from the KeyProvider for each call and destroys it
+//     after, and a caller outside the package would be lending one it does not
+//     own.
+//
+//  3. A borrowed key is argument-only. In every function or closure with a
+//     []byte parameter named key or passphrase, that parameter may appear ONLY
+//     as a direct argument of a call — not on the right of an assignment or
+//     define, not in a slice expression, not captured by a closure that is not
+//     invoked on the spot, and not as an argument of append, copy or a type
+//     conversion, which are calls that copy. One refinement: a composite
+//     literal is allowed when the literal is itself a direct argument of the
+//     call — it is built for the call and passed with it, and outlives it no
+//     more than a bare argument would. This is what makes "must not retain
+//     it" a property the build checks. It is a rule on the NAME because a
+//     []byte called buf that a provider fills from a descriptor is not a
+//     borrowed key; len(key) is the sanctioned way to inspect one.
+//
+//  4. Key-material-shaped values do not cross a package boundary in the clear.
+//     An exported function, method, interface method or func type whose
+//     parameter or named result is a string or []byte with a name ending in
+//     key, passphrase, secret, password or token is a finding. The Backend
+//     seam is not an exception: it carries an enclave, not bytes. The match is
+//     on the LAST word of the name, split at case and underscore boundaries: keyPath, luksKeyFile, tokenID,
+//     secretName and passwordHash name a location, an identifier or a
+//     derivation, not the material, and they are what this tree's exported
+//     surface actually carries. keyBytes and secretData are still material and
+//     do match.
+//
+//     Two refinements, both learned from what the first version fired on and
+//     written down here rather than tuned into silence. The bare word `key` as
+//     a STRING does not match: pkg/common.Coordinator is a key/value store
+//     whose Get, Put, Delete, CompareAndSwap and AcquireLease all take
+//     `key string`, and that is the key of a key/value pair — the sense the
+//     word has in every map in Go — not a cryptographic key, which in this
+//     tree is bytes. So `key []byte` matches, `luksKey string` and
+//     `apiKey string` match (a qualified key is whatever it says it is), and
+//     `key string` is a lookup. The other four words have no lookup sense and
+//     match as either type. And an unnamed parameter cannot match at all,
+//     because the rule is on the name; an exported `Unlock([]byte)` is the
+//     reviewer's to read.
+//
+// # What it examines, and the limit that leaves
+//
+// Every non-test Go file under the tree, type-checked under each configuration
+// in custodyBuildConfigs, with a scan failure for any file no configuration
+// selected. _test.go files are not examined: the tests hold fakes whose whole
+// job is to accept a key and look at it. A type error is a scan failure, not a
+// pass, because incomplete type information is exactly what would let a rule
+// keyed on types miss its target.
+//
+// What that leaves uncovered, stated rather than implied: rule 3 permits any
+// ordinary call, so a callee that copies its argument — slices.Clone, or a
+// function of this repository's own — is a copy the rule does not see; rule 4
+// looks at parameters and results, not at exported struct fields; and a []byte
+// key under a name other than key or passphrase is outside rule 3. Each is a
+// gap a reviewer reads for, and each is narrower than what the rules close.
 func KeyMaterialCustody() Scanner {
 	return Scanner{
 		Name: "key-material-custody",

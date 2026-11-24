@@ -11,7 +11,11 @@
 // 2. Commercial License
 //    Contact licensing@automatethethings.com for commercial licensing options.
 
-// No build tag: the local provider is the always-present backend and needs only the standard library.
+// This file carries NO build tag. The local provider is the fundamental
+// backend — tagging it would leave a binary built with no tags with no
+// providers at all — and it pulls in nothing beyond the standard library, so
+// there is nothing to gate. Backends that link kernel tooling or network
+// libraries get a tag; this one does not. See the package documentation.
 
 package factory
 

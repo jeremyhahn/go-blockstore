@@ -32,7 +32,40 @@ const errScope = "go-blockstore/drbd"
 // fsTypeLUKS is what blkid reports for a LUKS container.
 const fsTypeLUKS = luks.FSType
 
-// ErrMappingStale is returned when a filesystem would grow into a plaintext mapping smaller than its grown device; Demote and Promote, then retry.
+// ErrMappingStale is returned by an operation that would have to grow a
+// filesystem into a plaintext mapping that no longer covers the device it
+// decrypts.
+//
+// The dm-crypt mapping over /dev/drbdN is sized from the replicated device AT
+// THE MOMENT Promote opens it — go-luks2 computes a "dynamic" segment's length
+// once, at Unlock, from the device's size then — and nothing reachable through
+// internal/luks.Backend reloads it; that seam has no resize, and the comment
+// on it says why that absence is deliberate. So after a drbdadm resize has
+// grown the device under an open mapping, the plaintext device is still the
+// size it was unlocked at, and a resize2fs "to fit" it grows the filesystem
+// to the OLD size and exits 0. Recording the new size over that is the silent
+// wrong answer this package refuses to give; this error is the loud one.
+//
+// The remedy is the one this provider already owns, and the error names it:
+// Demote closes the mapping and Promote opens one over the device as it is
+// now, sized to it, after which the same Resize grows the filesystem through
+// it. The device half of the refused Resize — lvextend, drbdadm resize — is
+// not undone, because it is idempotent, is not what is wrong, and is what the
+// repeat converges on.
+//
+// It deliberately does NOT wrap common.ErrUnsupported, for the reason
+// pkg/local's ErrResizeWhileAttached does not: ErrUnsupported tells a caller
+// that no retry and no state change will serve the request, and here one role
+// cycle serves it exactly. It is the same shape as common.ErrNotPrimary — the
+// request is fine, the volume is in the wrong state at the moment.
+//
+// This provider does NOT close and re-open the mapping itself, although the
+// two calls exist on the seam. The mapping is Promote's, held for the caller,
+// and tearing it down inside a Resize is the destructive operation wearing a
+// resize's name that internal/luks.Backend declines to offer: the teardown is
+// unconditional, the rebuild can fail, and a Resize that failed halfway would
+// have taken the caller's plaintext device rather than left its filesystem
+// unresized. pkg/local made the same call for the same reason.
 var ErrMappingStale = errors.New("the volume's plaintext mapping is smaller than the device it decrypts")
 
 // KeyProvider supplies the passphrase that unlocks a volume's LUKS container,
@@ -45,12 +78,26 @@ type KeyProvider = luks.KeyProvider
 // restarting the process. It is what luks_key_file installs.
 func FileKeyProvider(path string) KeyProvider { return luks.FileKeyProvider(errScope, path) }
 
-// StaticKeyProvider returns a KeyProvider holding a fixed passphrase in the given enclave; it takes ownership of stored.
+// StaticKeyProvider returns a KeyProvider backed by a fixed passphrase, held in
+// the enclave it is given for the returned provider's lifetime. It TAKES
+// OWNERSHIP of stored.
 func StaticKeyProvider(stored *enclave.MemoryEnclave) (KeyProvider, error) {
 	return luks.StaticKeyProvider(errScope, stored)
 }
 
-// WithKeyProvider supplies the LUKS passphrase and overrides luks_key_file; it must not be the replication secret.
+// WithKeyProvider supplies the passphrase that unlocks the LUKS container over
+// each replicated device. It takes precedence over luks_key_file.
+//
+// It is the same arrangement WithSecretProvider is, and for the same reason: a
+// caller holding the key somewhere this package should not know about — a
+// TPM-sealed blob, an operator prompt, a KMS — unseals it into an enclave and
+// hands it over here.
+//
+// The two secrets are NOT interchangeable and must not be the same material.
+// The replication secret authenticates the peer and is known to both nodes'
+// DRBD; this one decrypts the volume. A deployment that fed one file to both
+// would have given its peer-authentication secret the job of protecting the
+// data as well.
 func WithKeyProvider(k KeyProvider) Option {
 	return func(p *Provider) { p.keyProvider = k }
 }
@@ -60,7 +107,19 @@ func withLUKSBackend(b luks.Backend) Option {
 	return func(p *Provider) { p.luks = b; p.injected.luks = true }
 }
 
-// ErrNotUnlocked reports an encrypted volume whose plaintext mapping is not open on this node; Promote opens it.
+// ErrNotUnlocked reports an encrypted volume whose plaintext mapping is not
+// open on this node.
+//
+// It is its own sentinel because the advice it carries is specific: the volume
+// is fine and the node is fine, and what is missing is a Promote. The container
+// is opened there — see Promote — so an operation that needs the plaintext
+// device on a node that has not promoted is asking too early rather than asking
+// for something impossible.
+//
+// It is NOT reported as a pass. An encrypted volume whose crypt state cannot be
+// established is refused, on the reasoning pkg/preflight states for the same
+// shape: a condition that could not be verified is reported as a failure rather
+// than assumed to be fine.
 var ErrNotUnlocked = errors.New("the volume's LUKS container is not open on this node")
 
 // mappingNamespace prefixes a mapping name; the dot separator cannot appear in a resource name, so names stay unambiguous.

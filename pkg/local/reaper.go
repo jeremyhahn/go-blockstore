@@ -30,7 +30,12 @@ const (
 	// something may be using it right now. Never touched.
 	VerdictLive MappingVerdict = "live"
 
-	// VerdictForeignNode means the record names a different node; on shared storage that is not an orphan.
+	// VerdictForeignNode means the record names a DIFFERENT node.
+	//
+	// On shared storage the volume group is visible to every node, so this is
+	// an ordinary state and emphatically not an orphan: the other node's
+	// workload is using it. Reaping on the boot ID alone would tear it down,
+	// because another node's live boot never matches this node's.
 	VerdictForeignNode MappingVerdict = "another node's"
 
 	// VerdictOrphaned means this node made the mapping on a boot that has
@@ -43,7 +48,18 @@ const (
 	// volume its name claims. Reported, never removed.
 	VerdictUnattributable MappingVerdict = "unattributable"
 
-	// VerdictLivenessUnknown means this node and running boot own the mapping and the liveness oracle could not answer.
+	// VerdictLivenessUnknown means ownership WAS established — this node, the
+	// boot that is still running — and the configured liveness oracle could not
+	// say whether the attachment's owner is still there.
+	//
+	// It is its own verdict rather than being folded into either neighbor,
+	// because both neighbors would be a lie told by a broken instrument. Read
+	// as live, an oracle outage makes a fleet of abandoned mappings look
+	// healthy; read as orphaned, it points anything acting on these verdicts at
+	// volumes live workloads are using. Naming the third state is what lets an
+	// operator see that the check itself is what failed — the same trade
+	// preflight makes with CauseIndeterminate, and the same one Posture makes
+	// by reporting NOT CHECKED beside checked.
 	VerdictLivenessUnknown MappingVerdict = "liveness unknown"
 )
 
@@ -106,7 +122,22 @@ func Orphaned(findings []MappingFinding) []MappingFinding {
 	return orphans
 }
 
-// InspectMappings reports every plaintext mapping this provider owns, by name and backing device, without changing anything; it never enumerates device-mapper.
+// InspectMappings finds every plaintext mapping this provider owns and says
+// what it concluded about each, without changing anything.
+//
+// It never enumerates device-mapper. The candidate set is derived from the
+// volumes in THIS provider's own volume group, and for each one it asks whether
+// a mapping exists under the name this provider itself would have chosen. A
+// mapping belonging to anything else is not in the candidate set at all, which
+// is a stronger property than filtering an enumeration by a name pattern: a
+// name is not evidence of ownership, and treating it as such is how a reaper
+// destroys state it did not create (go-luks2 #96).
+//
+// Ownership then has to be POSITIVE and it takes two independent facts that
+// agree: the deterministic name, and the mapping's backing device being the
+// very volume that name encodes. Both come from mechanisms that already fail
+// closed — Mapping and Identity refuse a mapping whose backing device cannot be
+// established rather than guessing.
 func (p *Provider) InspectMappings(ctx context.Context) ([]MappingFinding, error) {
 	lvs, err := p.listLVs(ctx)
 	if err != nil {
@@ -222,7 +253,18 @@ func (p *Provider) sameBootVerdict(ctx context.Context, volID string) (MappingVe
 	}
 }
 
-// RunReaper sweeps once per tick until ctx is done, sending findings to report; a failed sweep does not stop the loop.
+// RunReaper sweeps once for every tick, until the context is done.
+//
+// The caller supplies the tick, so this holds no timer of its own and never
+// sleeps: a test drives it by sending on a channel and gets a deterministic
+// sweep rather than a wall-clock wait, and a component in production supplies a
+// time.Ticker. Each sweep's findings go to report, which is what makes a reaped
+// mapping an audit event rather than a silent removal.
+//
+// A sweep that fails is reported and does not stop the loop. The condition that
+// broke one sweep — an LVM tool that failed, a mapping whose identity could not
+// be read — is very often gone by the next, and a reaper that exits on the
+// first failure stops being a guard at the moment something is wrong.
 func (p *Provider) RunReaper(ctx context.Context, tick <-chan struct{}, report func([]MappingFinding, error)) error {
 	sweep := func() {
 		findings, err := p.InspectMappings(ctx)

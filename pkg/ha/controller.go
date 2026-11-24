@@ -25,7 +25,13 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// Controller campaigns for per-volume primary leases and drives the local replication role to match, one goroutine per volume.
+// Controller campaigns for per-volume primary leases and drives the local
+// copy's replication role to match what it holds.
+//
+// One Controller runs per node. It manages any number of volumes, each with its
+// own lease and its own goroutine, and it refuses to manage the same volume
+// twice — see [ErrAlreadyManaged] for why that refusal is the serialization
+// this package relies on.
 type Controller struct {
 	provider common.ReplicatedProvider
 	coord    common.Coordinator
@@ -35,7 +41,16 @@ type Controller struct {
 	managed map[string]*volume
 }
 
-// New returns a Controller driving provider through coord; a missing dependency or unsafe configuration wraps common.ErrInvalidArgument.
+// New returns a Controller driving provider, coordinating through coord.
+//
+// Both dependencies are passed explicitly rather than resolved from
+// pkg/factory. The factory builds providers, which are mechanical and need no
+// Coordinator; this controller is the library's only Coordinator consumer, so a
+// Coordinator seam in the factory would put a lease behind a name lookup and
+// give every provider a dependency exactly one caller uses.
+//
+// It returns common.ErrInvalidArgument, wrapped, for a missing dependency or a
+// configuration that could not hold a lease safely.
 func New(provider common.ReplicatedProvider, coord common.Coordinator, cfg Config) (*Controller, error) {
 	if provider == nil {
 		return nil, fmt.Errorf("%w: a common.ReplicatedProvider is required", common.ErrInvalidArgument)
@@ -84,7 +99,22 @@ func (c *Controller) Status(volID string) (Status, error) {
 	return v.snapshot(), nil
 }
 
-// Manage campaigns for volID's lease and keeps the role in step until ctx is canceled, then demotes within ActionTimeout; it blocks, and returns an error only for a request it would not start.
+// Manage campaigns for volID's primary lease and keeps the local replication
+// role in step with it until ctx is canceled. It BLOCKS; run it in its own
+// goroutine, one per volume.
+//
+// Canceling ctx starts a shutdown; it does not return at once. A manager that
+// holds the lease gives the role back first, and that work runs on its own
+// budget — up to Config.ActionTimeout — because the context asking it to stop
+// is the same one it would otherwise be using to stop safely. Callers with
+// their own deadline should size it above ActionTimeout.
+//
+// It returns nil for a clean stop, and an error only for a request it would not
+// start: an invalid volume id, or a volume this controller already manages
+// ([ErrAlreadyManaged]). A stop that could not complete cleanly — a demote or a
+// release the backend refused — is reported through the final [Status] and the
+// logger, not through this return value, because by then the caller has already
+// asked for a shutdown and there is nothing left for it to decide.
 func (c *Controller) Manage(ctx context.Context, volID string) error {
 	if err := validateVolumeID(volID); err != nil {
 		return err

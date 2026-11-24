@@ -18,7 +18,14 @@ import (
 	"strings"
 )
 
-// Cause classifies why a capability is unavailable, such as a missing privilege versus a blocked syscall.
+// Cause classifies WHY a capability is unavailable, because the remedies are
+// different and an operator handed "permission denied" cannot tell them apart.
+//
+// The distinction that matters most in a container is between a missing
+// PRIVILEGE and a blocked SYSCALL. They are independent mechanisms enforced by
+// different subsystems, they both surface as EPERM, and granting the first does
+// not lift the second — which is the trap this package exists to catch. See the
+// package documentation.
 type Cause string
 
 const (
@@ -30,10 +37,22 @@ const (
 	// filter, whatever capabilities the process holds.
 	CauseSyscallBlocked Cause = "syscall-blocked"
 
-	// CausePrivilegeOrPolicy means mount(2) answered EPERM and a missing CAP_SYS_ADMIN could not be told apart from a seccomp denial.
+	// CausePrivilegeOrPolicy means the operation was refused with EPERM and the
+	// two mechanisms that produce it could not be told apart.
+	//
+	// mount(2) answers EPERM both when CAP_SYS_ADMIN is absent and when a
+	// seccomp filter denies the syscall, and the errno is identical. This
+	// package resolves it where it can, by asking the kernel to demonstrate the
+	// capability through a device-mapper ioctl — see the mount probe. Where that
+	// witness is unavailable, the ambiguity is REPORTED rather than resolved by
+	// guessing: naming one mechanism confidently would send an operator to fix
+	// the wrong one, which costs the outage rather than ending it.
 	CausePrivilegeOrPolicy Cause = "privilege-or-policy"
 
-	// CauseLSMDenied means a Linux Security Module (AppArmor or SELinux) denied the operation.
+	// CauseLSMDenied means a Linux Security Module — AppArmor or SELinux —
+	// denied the operation. It is a third independent mechanism: Docker's
+	// default AppArmor profile denies mount(2) even for a
+	// container granted CAP_SYS_ADMIN with the syscall permitted by seccomp.
 	CauseLSMDenied Cause = "lsm-denied"
 
 	// CauseDeviceMissing means the device node the operation needs is not
@@ -41,10 +60,23 @@ const (
 	// never had the device passed in.
 	CauseDeviceMissing Cause = "device-missing"
 
-	// CauseDeviceAccessDenied means the device node is present and open(2) was refused with EPERM, typically by the device cgroup.
+	// CauseDeviceAccessDenied means the device node is PRESENT and the kernel
+	// refused to open it with EPERM — the container was allowed to see the node
+	// without being allowed to use it.
+	//
+	// Bind-mounting /dev/mapper/control into a container
+	// without a device-cgroup allowance produces exactly this, and no capability
+	// grant changes it. It is a different fix from every other refusal here, and
+	// it is the one a hostPath in Kubernetes walks straight into.
 	CauseDeviceAccessDenied Cause = "device-access-denied"
 
-	// CauseDeviceNotReadable means the device node's own permissions refused it (EACCES); CAP_SYS_ADMIN does not override them.
+	// CauseDeviceNotReadable means the device node is present, reachable, and
+	// refused by its own permissions (EACCES) rather than by any policy.
+	//
+	// /dev/mapper/control is root-owned and mode 0600, so a storage component
+	// running as a non-root uid is refused here before the kernel ever consults
+	// a capability — and CAP_SYS_ADMIN does not imply CAP_DAC_OVERRIDE, so
+	// granting it fixes nothing.
 	CauseDeviceNotReadable Cause = "device-not-readable"
 
 	// CauseKernelUnsupported means the kernel cannot do this at all: the module
@@ -59,10 +91,23 @@ const (
 	// CausePlatformUnsupported means the probe cannot run on this GOOS.
 	CausePlatformUnsupported Cause = "platform-unsupported"
 
-	// CauseIndeterminate means the probe could not establish an answer; the check fails.
+	// CauseIndeterminate means the probe could not establish an answer.
+	//
+	// It is a FAILURE, not a shrug. A guard that reports success when its own
+	// check broke is worse than no guard, because it converts an unknown into a
+	// green light; every path in this package that cannot decide ends here and
+	// refuses.
 	CauseIndeterminate Cause = "indeterminate"
 
-	// CauseMountNotPropagated means a mount succeeded and is not visible outside the namespace that made it; the parent mount's propagation is the fix.
+	// CauseMountNotPropagated means a mount succeeded and is not visible
+	// outside the namespace that made it.
+	//
+	// It is its own cause because nothing else in this package describes a
+	// SUCCESSFUL operation whose result does not reach the consumer, and
+	// because its remedy is unlike every other one here: no capability, no
+	// seccomp rule and no LSM profile changes it. The propagation of the parent
+	// mount does, and that is set on the node and in the container's own mount
+	// configuration.
 	CauseMountNotPropagated Cause = "mount-not-propagated"
 )
 
@@ -131,7 +176,14 @@ var causeSentinels = map[Cause]error{
 	CauseMountNotPropagated:  ErrMountNotPropagated,
 }
 
-// CapabilityError reports that one needed capability is unavailable: which, what was attempted, the cause, the kernel's error and the remedy.
+// CapabilityError reports that one capability this deployment needs is not
+// available, and says what to do about it.
+//
+// It carries the four things an operator staring at a crashed container has to
+// have: WHICH capability, WHAT was attempted, WHY it failed classified into a
+// cause with its own fix, and the kernel's own answer underneath. Error()
+// renders all four plus the remedy, because this message is very often the only
+// artifact anybody sees.
 type CapabilityError struct {
 	// Capability is the capability that is unavailable.
 	Capability Capability
@@ -171,7 +223,11 @@ func (e *CapabilityError) Error() string {
 // Unwrap exposes the kernel's own error so a caller can match an errno.
 func (e *CapabilityError) Unwrap() error { return e.Err }
 
-// Is matches ErrUnavailable and the sentinel for this error's Cause; Unwrap covers the wrapped error.
+// Is matches ErrUnavailable for every failure and the one sentinel that
+// corresponds to this failure's Cause.
+//
+// It does NOT fall through to the wrapped error — Unwrap already does that, and
+// errors.Is walks the chain itself.
 func (e *CapabilityError) Is(target error) bool {
 	if target == ErrUnavailable {
 		return true
@@ -180,7 +236,13 @@ func (e *CapabilityError) Is(target error) bool {
 	return ok && target == sentinel
 }
 
-// Remedy returns the fix for this capability and cause, falling back to a per-cause answer; it never suggests --privileged.
+// Remedy returns the specific fix for this capability and cause.
+//
+// It is looked up per (capability, cause) first and falls back to a per-cause
+// answer, so a new capability inherits something useful rather than nothing.
+// NOTHING here ever suggests --privileged: that grants every capability, drops
+// the seccomp profile AND the LSM confinement, and exposes every host device,
+// which is the opposite of the deployment this package is guarding.
 func (e *CapabilityError) Remedy() string {
 	if specific, ok := remedies[remedyKey{e.Capability, e.Cause}]; ok {
 		return specific
@@ -276,6 +338,12 @@ var causeRemedies = map[Cause]string{
 }
 
 // UnknownCapabilityError reports a capability name no probe is registered for.
+//
+// It is an error rather than something skipped for the same reason the
+// provider rejects an unrecognized settings key: a caller that asked for a
+// capability by a name nothing answers to believes it checked something, and
+// silently checking nothing is the exact failure mode this package exists to
+// remove.
 type UnknownCapabilityError struct {
 	Capability Capability
 	Known      []Capability
@@ -296,7 +364,16 @@ func (e *UnknownCapabilityError) Error() string {
 		string(e.Capability) + "; known capabilities are " + strings.Join(known, ", ")
 }
 
-// ErrNoCapabilities is returned by Check when asked to verify nothing; it matches ErrUnavailable.
+// ErrNoCapabilities is returned by Check when it is asked to verify nothing.
+//
+// An empty request returns success under every reasonable reading, and a caller
+// whose capability list came out empty by accident would take that as proof its
+// deployment is fine. Refusing is the fail-closed answer.
+//
+// It matches ErrUnavailable, because a caller that built its capability list
+// dynamically and got an empty one is exactly the caller whose only branch is
+// the catch-all — and a fail-closed condition that slips past the catch-all is
+// a fail-closed condition nobody handles.
 var ErrNoCapabilities error = noCapabilitiesError{}
 
 // noCapabilitiesError exists only so ErrNoCapabilities can match ErrUnavailable

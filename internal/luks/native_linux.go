@@ -34,7 +34,19 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Native is the Backend on a real host: go-luks2 in process, Linux-only because it uses device-mapper ioctls; it holds no state.
+// Native is the Backend the providers run on a real host: every
+// operation is performed in this process by go-luks2 rather than by forking
+// cryptsetup.
+//
+// It is Linux-only, and the build tag is not a formality. go-luks2 reaches the
+// kernel through device-mapper ioctls (github.com/anatol/devmapper.go), which
+// exist nowhere else, and it carries no build constraints of its own — importing
+// it from a file with no tag would stop the packages importing it compiling for darwin and
+// windows, which it does today. See native_other.go for what the other
+// platforms get.
+//
+// It holds no state. Everything it needs is on the device or in the kernel, in
+// keeping with the rest of the provider.
 type Native struct{}
 
 // Ensure the backend satisfies the seam at compile time.
@@ -82,7 +94,13 @@ func withVolume(ctx context.Context, device string, op func(v *luks2.Volume) err
 	return opErr
 }
 
-// Open unlocks the container; go-luks2 sizes the dynamic segment's mapping from the backing device at open.
+// Open unlocks the container and creates its plaintext mapping.
+//
+// The mapping's length is not passed in and is not this package's to choose:
+// the data segment a Format here writes is "dynamic", so go-luks2 sizes the
+// mapping from the backing device at the moment it opens it. That is what makes
+// growing a container a matter of growing the logical volume and re-opening —
+// see each provider's resize path.
 func (Native) Open(ctx context.Context, device, name string, key *enclave.MemoryEnclave) error {
 	return withVolume(ctx, device, func(v *luks2.Volume) error {
 		volumeKey, err := v.Unlock(ctx, key)
@@ -101,7 +119,11 @@ func (Native) Close(ctx context.Context, name string) error {
 	return dmcrypt.Deactivate(ctx, name)
 }
 
-// TestKey checks a passphrase against the keyslots without creating a mapping.
+// TestKey checks a passphrase against the container's keyslots without
+// unlocking it: go-luks2 derives the key and verifies it against the header's
+// digest, and no device-mapper mapping is created. So a restore can establish
+// that the volume it is about to produce will be openable before it creates
+// anything, rather than after it has copied the image.
 func (Native) TestKey(ctx context.Context, device string, key *enclave.MemoryEnclave) error {
 	return withVolume(ctx, device, func(v *luks2.Volume) error {
 		volumeKey, err := v.Unlock(ctx, key)
@@ -113,7 +135,26 @@ func (Native) TestKey(ctx context.Context, device string, key *enclave.MemoryEnc
 	}, luks2.WithReadOnly())
 }
 
-// DataOffset reads where the data starts from the header, without a passphrase; anything but exactly one data segment is refused.
+// DataOffset reports where a container's data starts — the space its header
+// occupies, and so the difference between the logical volume's size and the
+// usable capacity of the mapping over it.
+//
+// It is read from the header rather than assumed to be HeaderBytes because
+// not every container handled here was formatted here. A
+// volume restored from an encrypted snapshot carries its SOURCE's header
+// verbatim, and that source may have been made by an older version of this
+// package or by an operator's own cryptsetup with different parameters.
+// Assuming the constant there would misreport such a volume's capacity by
+// however much the two headers differ.
+//
+// No passphrase is involved: the segment table is unencrypted metadata, and
+// go-luks2 reads it with an ordinary open(2). The device does have to exist —
+// an inactive logical volume has no device node at all.
+//
+// A container with anything other than exactly one data segment is refused
+// rather than guessed at. More than one means a reencryption is in progress,
+// and picking a segment out of that state would produce a capacity that is true
+// of neither the old layout nor the new one.
 func (Native) DataOffset(ctx context.Context, device string) (int64, error) {
 	var offset int64
 	err := withVolume(ctx, device, func(v *luks2.Volume) error {
@@ -140,7 +181,23 @@ func (Native) DataOffset(ctx context.Context, device string) (int64, error) {
 	return offset, nil
 }
 
-// Mapping reports whether a mapping exists under name, its backing device and both sizes, all from sysfs without opening either device.
+// Mapping reports whether a plaintext mapping exists under name, what it is
+// stacked on, and how large each of the two is.
+//
+// The backing device comes from sysfs rather than from device-mapper, because
+// the dm ioctls go-luks2 uses expose the table only to whoever loaded it: there
+// is no "what is this mapping over" call to make. The kernel publishes the
+// stack in /sys/dev/block/<major>:<minor>/slaves, one symlink per device
+// underneath, and reading it needs no privilege and no passphrase.
+//
+// The sizes come from the same tree, for the same reason and one more: the
+// BLKGETSIZE64 ioctl needs the device opened, and DRBD refuses every open of a
+// Secondary's device, so a measurement that opened would fail on exactly the
+// node where the question "has this device outgrown its mapping" is asked
+// after a resize. sysfs answers for any block device the kernel has, opened or
+// not, and it answers with the kernel's own current capacity — the number
+// set_capacity() published, which is the number a fresh Unlock would size the
+// mapping from.
 func (n Native) Mapping(ctx context.Context, name string) (MappingInfo, bool, error) {
 	mapping, err := dmcrypt.Lookup(ctx, name)
 	if errors.Is(err, dmcrypt.ErrNotActive) {

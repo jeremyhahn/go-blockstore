@@ -27,7 +27,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// DeviceMapperControl is the control node every device-mapper ioctl goes through.
+// DeviceMapperControl is the control node every device-mapper ioctl goes
+// through. It is exported because an operator reading a refusal needs the exact
+// path to pass into the container, and because the deployment documentation and
+// the probe must not be able to drift apart.
 const DeviceMapperControl = "/dev/mapper/control"
 
 // deviceMapperSteps is the device-mapper probe split into its three operations, so tests can drive each refusal.

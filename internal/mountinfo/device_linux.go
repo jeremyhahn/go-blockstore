@@ -19,7 +19,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// DeviceNumber returns the major:minor of the block device at path, following symlinks; a non-block path is refused.
+// DeviceNumber returns the major:minor of the block device at path.
+//
+// Symlinks are followed, deliberately: /dev/<vg>/<lv> and
+// /dev/mapper/<vg>-<lv> are both symlinks to the /dev/dm-N that carries the
+// number, and the number is the whole point — it is what makes a mount
+// identifiable regardless of which of those names it was mounted under.
+//
+// A path that is not a block device is refused rather than reported with the
+// zero pair, which would match nothing and read as "not mounted".
 func DeviceNumber(path string) (uint32, uint32, error) {
 	var st unix.Stat_t
 	if err := unix.Stat(path, &st); err != nil {

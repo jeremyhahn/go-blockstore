@@ -24,16 +24,26 @@ import (
 
 // Defaults applied by [Config.withDefaults] to a zero-valued field.
 const (
-	// DefaultLeaseTTL is the primary lease duration and the floor on failover latency.
+	// DefaultLeaseTTL is the lease duration a volume's primary key is held
+	// for. It is also the worst-case time a dead holder's key stays bound, so
+	// it is the floor on failover latency; shortening it makes takeover faster
+	// and makes a transient coordinator stall likelier to fence a healthy
+	// leader.
 	DefaultLeaseTTL = 15 * time.Second
 
 	// DefaultKeyPrefix namespaces the per-volume primary lease keys.
 	DefaultKeyPrefix = "blockstore/ha/primary/"
 
-	// DefaultActionTimeout bounds an out-of-band provider call, such as the demote after the lease ended.
+	// DefaultActionTimeout bounds a provider call the controller makes OUT OF
+	// BAND — the demote on the fenced and stopping paths, which cannot use the
+	// lease context because the lease is what just ended.
 	DefaultActionTimeout = 30 * time.Second
 
-	// DefaultReleaseAttempts is how many times a release is retried before the lease is left to expire.
+	// DefaultReleaseAttempts is how many times a release is retried before the
+	// controller gives up and lets the deadline expire the lease. A revoke the
+	// backend did not acknowledge is not a release, so one attempt is not
+	// enough; retrying forever on a dead backend is not better than the
+	// deadline.
 	DefaultReleaseAttempts = 3
 )
 
@@ -60,24 +70,72 @@ func (SystemClock) Now() time.Time { return time.Now() }
 // After returns time.After(d).
 func (SystemClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
-// Observer is called synchronously, one goroutine at a time, on every Status transition; a blocking observer stalls renewal, so hand slow work off.
+// Observer is notified of every transition in a managed volume's [Status].
+//
+// It is called SYNCHRONOUSLY, and by exactly one goroutine at a time, which is
+// what makes the notifications ordered: an observer sees "leading" before it
+// sees "fenced" for the same epoch, so an orchestrator can mount and unmount
+// against them. Almost always that is the volume's own manager goroutine; the
+// one exception is a lease lost while a shutdown demote blocks, where the
+// manager is parked inside the provider and writes nothing until the goroutine
+// that noticed has finished — so there is still one writer, and the fence does
+// not have to wait out a stuck demote to be announced.
+//
+// An observer that blocks therefore stalls that volume's renewal loop. That is a real hazard, and the direction it fails in is the safe one —
+// a stalled loop stops renewing, the lease expires, and the controller fences
+// itself — but it is still a bug in the observer. Hand slow work to a
+// goroutine or a queue.
 type Observer func(Status)
 
-// Config configures a Controller; zero durations take their defaults and NodeID is required.
+// Config configures a [Controller].
+//
+// The zero value of every duration field takes the documented default; the
+// only field with no default is NodeID.
 type Config struct {
-	// NodeID names this node in every error and log line; it does not address the provider.
+	// NodeID names the node this controller runs on. It is required: it
+	// appears in every error and log line the controller produces, and a
+	// controller that cannot say which node refused a promotion is not worth
+	// reading. It is NOT used to address the provider — a provider drives the
+	// local node and no other.
 	NodeID common.NodeID
 
-	// LeaseTTL is the primary lease duration, default DefaultLeaseTTL, at least one second.
+	// LeaseTTL is the duration each primary lease is acquired and renewed for.
+	// Defaults to DefaultLeaseTTL. It must be at least one second, which is the
+	// Coordinator's lease granularity: anything shorter is rounded up to a
+	// second by the backend, leaving a renewal cadence derived from the
+	// configured value churning against a deadline that does not move with it.
 	LeaseTTL time.Duration
 
-	// RenewInterval is the renewal cadence, default LeaseTTL/3, and must satisfy RenewInterval*3 <= LeaseTTL.
+	// RenewInterval is how often the holder renews. Defaults to LeaseTTL/3.
+	//
+	// It must satisfy RenewInterval*3 <= LeaseTTL. The acknowledged deadline is
+	// hard and an unacknowledged renewal does not extend it, so a cadence is
+	// only a cadence if a renewal can fail and still be retried before the
+	// deadline arrives.
+	//
+	// At the default third of the TTL, attempts land at T/3, 2T/3 and T: two
+	// strictly before the deadline, so one failure is survivable. Set it lower
+	// for more retries; the rule is a floor on safety, not a target.
 	RenewInterval time.Duration
 
-	// RetryInterval is how long a follower waits before campaigning again; defaults to RenewInterval.
+	// RetryInterval is how long a follower waits before campaigning again,
+	// after a refused acquisition or a Coordinator that could not answer.
+	// Defaults to RenewInterval.
 	RetryInterval time.Duration
 
-	// PromoteGuard is the acknowledged lease that must remain to start a promotion; defaults to RenewInterval and must be below LeaseTTL.
+	// PromoteGuard is the minimum acknowledged lease that must remain before
+	// the controller will INITIATE a promotion. Defaults to RenewInterval.
+	//
+	// It is defense in depth and not the fencing mechanism: what actually
+	// aborts a promotion whose lease died is the lease context, which is
+	// canceled the moment Done closes. This only avoids starting one that is
+	// already unlikely to finish inside the lease it was authorized by. It must
+	// be less than LeaseTTL, or no promotion would ever be initiated.
+	//
+	// It bites when an acquisition or renewal took most of the TTL to be
+	// acknowledged, because the deadline is measured from when that request was
+	// ISSUED. In a healthy loop nearly the whole TTL remains at each reconcile
+	// and the guard is silent.
 	PromoteGuard time.Duration
 
 	// KeyPrefix namespaces the per-volume lease keys, which are KeyPrefix +
@@ -138,7 +196,12 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
-// Validate reports whether the defaulted configuration can hold a lease safely; rejections wrap common.ErrInvalidArgument.
+// Validate reports whether the configuration describes a controller that can
+// hold a lease safely. It is called by [New] AFTER defaults are applied, so it
+// judges the values the controller will actually run with.
+//
+// Every rejection is common.ErrInvalidArgument wrapped with the offending
+// value, because these are settings someone typed and someone has to correct.
 func (c Config) Validate() error {
 	if c.NodeID == "" {
 		return fmt.Errorf("%w: NodeID is required", common.ErrInvalidArgument)

@@ -31,7 +31,32 @@ var fleetManagedFiles = map[string]struct{}{
 // a successful one.
 var failOpenPatterns = []string{"|| true", "||true", "|| :", "||:"}
 
-// FailOpenShell refuses `|| true` in shell unless the line or the one above carries `guard:fail-open <reason>`.
+// FailOpenShell refuses a swallowed exit status in shell without a stated
+// reason.
+//
+// # The rule
+//
+// `cmd || true` makes a FAILING command indistinguishable from a succeeding
+// one, and when its output is then consumed, an unreadable answer becomes an
+// empty answer. That is not a hypothetical here: a host-safety guard in this
+// repository used `... | grep -c ... || true`, so a failing dmsetup read
+// reported "no mappings" — the guard passed by being unable to look.
+//
+// # It requires an annotation rather than forbidding the construction
+//
+// Plenty of uses are correct. `grep ... || true` around a list that is
+// legitimately empty is right, and a scanner that refused it outright would be
+// suppressed within a week — which is the real failure mode of a strict guard,
+// and worse than not having one, because a suppressed guard still looks like
+// coverage.
+//
+// So the rule is: swallow the exit if you mean to, and say why on the line or
+// the one above it:
+//
+//	vgs --noheadings -o vg_name 2>/dev/null || true  # guard:fail-open an absent vgs means no groups
+//
+// The annotation is greppable, travels with the code, and turns a silent
+// decision into a reviewable one.
 func FailOpenShell() Scanner {
 	return Scanner{
 		Name: "no-unexplained-fail-open",

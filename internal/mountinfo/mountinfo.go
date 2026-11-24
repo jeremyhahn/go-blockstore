@@ -11,7 +11,33 @@
 // 2. Commercial License
 //    Contact licensing@automatethethings.com for commercial licensing options.
 
-// Package mountinfo reads the mount table from /proc/self/mountinfo, identifying devices by number and visibility by the mount tree.
+// Package mountinfo reads the kernel's mount table from /proc/self/mountinfo.
+//
+// It replaces asking findmnt. findmnt is a formatter over this same file, so
+// going to the file directly removes a process, a JSON round trip, and a
+// dependency on which util-linux is installed — the last of which mattered:
+// findmnt's escaping of a path varies by flag and version, and a mount point
+// that came back spelled differently than it went in silently failed to match.
+//
+// It also removes a worse ambiguity. findmnt has exactly one non-zero exit and
+// its manual gives that status to "nothing matched" and "any other error"
+// alike, so a findmnt that could not read the mount table at all was
+// indistinguishable from a device that is not mounted — and "not mounted" is
+// the answer a teardown acts on immediately before destroying a volume. Reading
+// the file has no such gap: it opens and parses, or it fails and says why.
+//
+// Identity here is the device number rather than a path. Field 3 of each record
+// is the mounted device's major:minor, which is the same whichever of a
+// device's several names was used to mount it — /dev/<vg>/<lv>,
+// /dev/mapper/<vg>-<lv>, or the /dev/dm-N underneath. Comparing those strings
+// was the source of the spelling problem; comparing device numbers does not
+// have one.
+//
+// The table is a TREE, not a list. Each record names its own mount id and its
+// parent's, and which mounts a walk to a path crosses is a fact about that tree
+// — not about the mount-point strings, and not about the order of the records.
+// Both of those shortcuts were measured against a running kernel and both give
+// wrong answers; see VisibleMountPointsFor.
 package mountinfo
 
 import (
@@ -23,15 +49,41 @@ import (
 	"strings"
 )
 
-// ProcPath is the kernel file this package reads, for this process's mount namespace.
+// ProcPath is the kernel file this package reads.
+//
+// self rather than a pid: the table is per mount namespace, and the one this
+// process sees is the one its mounts land in.
 const ProcPath = "/proc/self/mountinfo"
 
 // Entry is one mounted filesystem.
 type Entry struct {
-	// ID is the kernel's identity for this mount, distinct for a second mount of the same device at the same path.
+	// ID is the kernel's identity for this MOUNT — not for the filesystem and
+	// not for the device, both of which several mounts can share.
+	//
+	// It is what distinguishes one mount of a device at a path from a SECOND
+	// mount of the same device at the same path, which (device, path) cannot.
+	// A mount that has been unmounted and remade has a different ID, so an ID
+	// that still matches is evidence the mount is the same one and not a
+	// replacement made in the meantime.
 	ID uint32
 
-	// ParentID is the ID of the mount this one is mounted on; a ParentID naming no record is the namespace root.
+	// ParentID is the ID of the mount this one is mounted ON — the mount owning
+	// the directory it covers. It is the edge that makes the table a tree, and
+	// the tree is the only thing that says which mounts a walk to a path
+	// crosses.
+	//
+	// It is not recoverable from the mount points. A parent's mount point is a
+	// path prefix of its child's, but so are the mount points of many records
+	// that are not the parent, and prefix matching cannot tell them apart —
+	// measured on an ordinary 28-record host, a prefix rule flags 6 pairs as
+	// covered with nothing overmounted at all. Reading the edge the kernel
+	// wrote has no such failure mode.
+	//
+	// A record whose ParentID names no record in the table is the root of what
+	// this table can see: the file shows one mount namespace, and that
+	// namespace's root mount hangs off a mount outside it. That is normal, not
+	// an error — an ordinary host's root record reads "562 438 ..." with no
+	// record 438 anywhere in the file.
 	ParentID uint32
 
 	// Major and Minor identify the mounted device. They are the stable identity
@@ -59,7 +111,15 @@ type Entry struct {
 	Propagation Propagation
 }
 
-// Propagation is a mount's propagation state, from the optional fields before the "-" separator.
+// Propagation is a mount's propagation state — the optional fields between the
+// mount options and the "-" separator.
+//
+// It decides whether a mount made here is VISIBLE anywhere else. A mount under
+// a private parent exists only in the namespace that made it: a workload in
+// another mount namespace walks to the path and finds the directory it was
+// before anything was mounted on it, with no error at any layer. That is why
+// the fields are parsed rather than skipped — they are the difference between
+// a working handoff and an empty directory nobody is told about.
 type Propagation struct {
 	// Shared reports the "shared:N" field: this mount belongs to a peer group
 	// and propagates its events to the rest of it. This is what a handoff to
@@ -69,7 +129,8 @@ type Propagation struct {
 	// PeerGroup is the N of "shared:N", meaningful only when Shared is set.
 	PeerGroup uint32
 
-	// Slave reports the "master:N" field: this mount receives events from peer group N.
+	// Slave reports the "master:N" field: this mount RECEIVES events from peer
+	// group N. A mount can be both shared and a slave.
 	Slave bool
 
 	// MasterGroup is the N of "master:N", meaningful only when Slave is set.
@@ -81,6 +142,9 @@ type Propagation struct {
 }
 
 // Private reports a mount that propagates nothing: no peer group, no master.
+//
+// It is the default state of a mount in most namespaces and the one that fails
+// silently, so it is named rather than left as the absence of the others.
 func (p Propagation) Private() bool { return !p.Shared && !p.Slave && !p.Unbindable }
 
 // String renders the propagation the way /proc/self/mountinfo spells it, which
@@ -113,7 +177,13 @@ func Load() ([]Entry, error) {
 	return Parse(f)
 }
 
-// Parse reads a mount table in /proc/self/mountinfo format; fields after the variable-position separator are counted from it.
+// Parse reads a mount table in /proc/self/mountinfo format.
+//
+// The format is positional up to a "-" separator whose position varies, because
+// the optional fields between the mount options and the separator are a
+// variable-length list. Everything before the separator is counted from the
+// left, everything after it from the separator — which is why this cannot be a
+// fixed field split.
 func Parse(r io.Reader) ([]Entry, error) {
 	var entries []Entry
 
@@ -411,7 +481,49 @@ func visibility(entries []Entry) []bool {
 	return reachableAt(entries, byID, topAtOwnMountPoint(entries, byID))
 }
 
-// VisibleMountPointsFor returns the paths where the device is currently visible, decided from the mount tree; use it before unmounting by path.
+// VisibleMountPointsFor returns the paths where the device is the filesystem
+// that is CURRENTLY VISIBLE, which is a smaller set than MountPointsFor.
+//
+// A mount can stop being what a path resolves to without going anywhere. Mount
+// over an occupied directory and both records stay in the table; the one a
+// process walking there reaches is the new one. The earlier mount is still
+// mounted and still this device's — MountPointsFor is right to report it — but
+// it is hidden, and that distinction decides who gets unmounted: umount(2)
+// takes a path and detaches whatever is visible at it. Handing it a path where
+// this device has been covered unmounts SOMEBODY ELSE'S filesystem while
+// leaving this one exactly where it was.
+//
+// So anything that unmounts by path asks this, and anything asking "is it
+// mounted at all" — a teardown deciding whether the volume is busy, a status —
+// asks MountPointsFor, where a hidden mount still counts.
+//
+// Visibility is decided from the mount TREE, which catches two cases that
+// comparing mount points cannot:
+//
+//   - An ANCESTOR overmount. This volume at /mnt/base/vol, another filesystem
+//     later mounted at /mnt/base. The volume is no longer reachable by that
+//     path and no second record names it, so no comparison of mount-point
+//     strings can see it.
+//   - A mount re-parented by mount --move, which leaves the record where it was
+//     in the file. The covering mount can then be listed FIRST, and "the last
+//     record on a path wins" names the wrong filesystem.
+//
+// The shortcut this deliberately does not take is treating a later record whose
+// mount point is a path PREFIX of this one as covering it. That was measured
+// against an ordinary host's 28-record table: it flags 6 pairs with nothing
+// overmounted at all, and 4 of the host's records list their parent after
+// themselves, so order does not rescue it either. Every one of those is a
+// volume Delete would refuse to remove with no way for an operator past it. The
+// tree rule flags exactly one pair on that same host — a real double mount of
+// /proc/sys/fs/binfmt_misc, which the old string rule found too.
+//
+// A bind mount is a separate record with its own place in the tree, so it gets
+// its own answer; binding a path reaches whatever is visible there, so a bind
+// of a covered mount is a mount of the COVERING device, and this reports it
+// under that device rather than this one. A mount that was moved is reported
+// where it is now, because the table describes the tree as it stands.
+//
+// The paths returned are the kernel's, in the kernel's order.
 func VisibleMountPointsFor(entries []Entry, major, minor uint32) []string {
 	visible := visibility(entries)
 
@@ -424,7 +536,17 @@ func VisibleMountPointsFor(entries []Entry, major, minor uint32) []string {
 	return targets
 }
 
-// EntryAt returns the mount a path resolves to, or nothing when every record there is hidden.
+// EntryAt returns the mount that a path resolves to.
+//
+// It answers from the mount tree, for the reasons VisibleMountPointsFor does:
+// the record a path reaches is the one that is top at that mount point with an
+// unbroken chain of top mounts above it, which is neither "the last record
+// naming the path" nor "the last record whose path is a prefix".
+//
+// A path whose every record is hidden behind an overmounted ancestor reports
+// NOTHING found, which is the honest answer: a walk to that path does not reach
+// any of them. It lands inside the covering filesystem, where either something
+// else is mounted — with its own record, which this would find — or nothing is.
 func EntryAt(entries []Entry, mountPoint string) (Entry, bool) {
 	visible := visibility(entries)
 
@@ -438,25 +560,88 @@ func EntryAt(entries []Entry, mountPoint string) (Entry, bool) {
 	return match, found
 }
 
-// Table is the seam through which a provider asks what is mounted; System reads /proc/self/mountinfo. Signatures use only universal types.
+// Table is the seam through which a provider asks what is mounted.
+//
+// It exists for the same reason the mount and command seams do: the answers
+// come from the running kernel, and a test that cannot substitute them can only
+// run on a host that happens to have the right things mounted. Behind it,
+// System reads /proc/self/mountinfo.
+// Every method takes and returns universal types on purpose. The providers
+// alias this interface into their public API (local.MountTable,
+// drbd.MountTable), and an interface whose signatures name a type from an
+// internal package is one no caller outside this module can implement — the
+// seam would be exported and unusable.
 type Table interface {
-	// MountPointsFor returns every path the device is mounted at, hidden ones included; only an unreadable table is an error.
+	// MountPointsFor returns every path the block device is mounted at, in the
+	// order the kernel lists them, INCLUDING paths where it has since been
+	// over-mounted and is no longer what is visible there. A device that is not
+	// mounted yields no paths and no error; only a table that could not be read
+	// is an error.
+	//
+	// This is the question "is it mounted at all", which is what a teardown
+	// deciding whether a volume is busy has to ask.
 	MountPointsFor(ctx context.Context, device string) ([]string, error)
 
-	// VisibleMountPointsFor returns the paths where the device is visible, excluding paths covered at or above them.
+	// VisibleMountPointsFor returns the paths where the device is the
+	// filesystem currently visible, which is the question anything unmounting
+	// by path has to ask: umount(2) detaches what is visible at the path it is
+	// given, so a path where this device has been over-mounted would unmount
+	// somebody else's filesystem.
+	//
+	// Covered means covered by anything on the way: a mount over the path
+	// itself, or a mount over any DIRECTORY ABOVE it, which takes the path out
+	// of reach without leaving a second record naming it.
 	VisibleMountPointsFor(ctx context.Context, device string) ([]string, error)
 }
 
-// PropagationReader is the optional half of the seam: whether a mount is visible outside its namespace.
+// PropagationReader is the OPTIONAL half of the mount-table seam: it answers
+// whether a mount can be seen outside the namespace that made it.
+//
+// It is separate from Table rather than another method on it because a caller
+// that injects its own mount table should not have to implement a method for a
+// guard it never turns on. Adding it to Table would stop such a caller
+// compiling over a feature left at its default. A provider that needs it asks
+// for it with a type assertion, and REFUSES when the table it was given cannot
+// answer — an optional interface that silently degraded would be the
+// guard-that-passes-when-it-cannot-check, which is the failure the guard exists
+// to remove.
 type PropagationReader interface {
-	// PropagationOf reports whether the device's visible mount at mountPoint is shared, and its mount ID; nothing mounted is ErrNotMounted.
+	// PropagationOf reports the propagation of the mount that DEVICE has
+	// visible at mountPoint, and the kernel's identity for that mount instance.
+	//
+	// It asks about a specific device at a specific path rather than about
+	// whatever is at the path, because those are different questions in exactly
+	// the case that matters. Another process can mount over the path in the
+	// window after mount(2) returns, and a guard that read "the propagation at
+	// this path" would then read the INTERLOPER's propagation — so a private
+	// mount passes because something shared landed on top of it. Naming the
+	// device makes that a refusal instead: ErrNotVisibleThere.
+	//
+	// The returned id identifies the mount instance. A caller that will act on
+	// this mount later — to unmount it — compares the id it saw then against
+	// the id it sees now, which is the only way to tell its own mount from a
+	// SECOND mount of the same device stacked on the same path.
+	//
+	// A path with nothing mounted at it is ErrNotMounted rather than a false:
+	// absence is not an answer about propagation, and a guard that read it as
+	// one would pass the case where the mount is missing entirely. A path whose
+	// mounts are all behind an overmounted ancestor reports ErrNotMounted too,
+	// because a walk to that path reaches none of them.
+	//
+	// The DECISION about what counts as propagating is made here rather than by
+	// the caller, because two call sites deciding it separately is how they end
+	// up with two answers to one question.
 	PropagationOf(ctx context.Context, device, mountPoint string) (id uint32, propagates bool, spelling string, err error)
 }
 
 // System is the Table backed by the running kernel.
 type System struct{}
 
-// MountPointsFor reads the mount table and returns this device's mount points, matched by major:minor.
+// MountPointsFor reads the mount table and returns this device's mount points.
+//
+// The device is resolved to its major:minor first, so a mount made under any of
+// the device's names is found: /dev/<vg>/<lv>, /dev/mapper/<vg>-<lv> and the
+// /dev/dm-N beneath them are one device and the kernel records the number.
 func (System) MountPointsFor(ctx context.Context, device string) ([]string, error) {
 	entries, major, minor, err := readFor(ctx, device)
 	if err != nil {
@@ -475,7 +660,19 @@ func (System) VisibleMountPointsFor(ctx context.Context, device string) ([]strin
 	return VisibleMountPointsFor(entries, major, minor), nil
 }
 
-// PropagationOf reports whether this device's visible mount at mountPoint is shared; something else on top is ErrNotVisibleThere.
+// PropagationOf reads the mount table and reports how this device's mount at
+// mountPoint propagates, and which mount instance it is.
+//
+// "Propagates" means shared: the mount belongs to a peer group and its events
+// reach the other members. A private mount is invisible outside the namespace
+// that made it, and an unbindable one cannot be handed over at all. A mount
+// that is only a slave RECEIVES events and does not send them, so it does not
+// carry a handoff either — which is why the answer is not "has any optional
+// field".
+//
+// The VISIBLE mount at the path is the one asked about, and it must be this
+// device's. A path where something else is on top is ErrNotVisibleThere rather
+// than an answer about that other thing.
 func (System) PropagationOf(ctx context.Context, device, mountPoint string) (uint32, bool, string, error) {
 	entries, major, minor, err := readFor(ctx, device)
 	if err != nil {
