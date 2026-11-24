@@ -151,15 +151,7 @@ func TestLVEntryExtentSize(t *testing.T) {
 	}
 }
 
-// TestLVEntryUsedBytes covers the difference between the space a snapshot was
-// GIVEN and the space it OCCUPIES, which is what SnapshotInfo.SizeBytes means,
-// and the line between an absent measurement and an unreadable one.
-//
-// Absent is a real answer: LVM populates data_percent only while the kernel has
-// the device mapped, so an inactive snapshot reporting nothing is its ordinary
-// state — measured on 2.03.16 — and this provider leaves snapshots inactive.
-// Unreadable is not an answer at all, and coercing it to 0 would hand a caller
-// a fabricated occupancy to size a restore against.
+// TestLVEntryUsedBytes: an absent data_percent on an inactive snapshot is 0, an unreadable one is an error.
 const (
 	attrActiveSnapshot   = "swi-a-s---"
 	attrInactiveSnapshot = "swi---s---"
@@ -181,15 +173,11 @@ func TestLVEntryUsedBytes(t *testing.T) {
 		{name: "nothing written yet", size: "1000000", percent: "0.00", origin: "vol1", attr: attrActiveSnapshot},
 		{name: "full", size: "1000000", percent: "100.00", origin: "vol1", attr: attrActiveSnapshot, want: 1000000},
 
-		// The declined half of the review: empty on an INACTIVE snapshot is
-		// the normal state, and erroring would break every listing of a volume
-		// group holding one — and diverge from pkg/local, which reports 0 here
-		// for the same measured reason.
+		// Empty on an inactive snapshot is the normal state and reads as 0.
 		{name: "inactive snapshot has no figure to report", size: "1000000", percent: "", origin: "vol1", attr: attrInactiveSnapshot},
 		{name: "a plain volume never reports one", size: "1000000", percent: "", attr: attrActiveVolume},
 
-		// Empty on an ACTIVE snapshot is different: the kernel has a figure and
-		// lvs failed to render it.
+		// Empty on an active snapshot means lvs failed to render it.
 		{name: "active snapshot with no figure", size: "1000000", percent: "", origin: "vol1", attr: attrActiveSnapshot, wantErr: true},
 
 		// Unreadable in any form, active or not. These used to read as 0.

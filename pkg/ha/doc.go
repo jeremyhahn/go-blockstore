@@ -205,7 +205,7 @@
 // When a lease ends in the same instant the manager is stopped, fencing wins
 // the tie deliberately. Both exits demote, so nothing unsafe turns on it, but
 // only one of them records that this node was fenced — and on a node that was,
-// that is the fact the incident turns on.
+// that is the fact an investigation turns on.
 //
 // # This is a control-plane fence, not a data-plane fence
 //
@@ -320,8 +320,8 @@
 //  3. It keeps the fenced path cheap and total. On lease loss the controller
 //     has a single role to hand back, not a stack to unwind under a deadline
 //     that has already passed.
-//  4. It decides issue #13 in advance. When the drbd provider grows LUKS
-//     layering there is no open question about where luksOpen goes: a LUKS
+//  4. It decides LUKS layering in advance: when the drbd provider grows it,
+//     luksOpen goes with Mount, because a LUKS
 //     mapping is a namespace object with the mount's lifetime, not the role's,
 //     so it belongs with Mount on the workload side. Promote stays the one
 //     operation whose success means "this node may write".
@@ -330,12 +330,8 @@
 // every phase transition, so an orchestrator mounts when it is told the node
 // became primary and unmounts when it is told the node was fenced.
 //
-// This is a deliberate DEVIATION from issue #4's body, which asked that the
-// lease holder "Promotes + Mounts". That text predates issue #13, which
-// surfaced the question the boundary turns on — does Promote open the LUKS
-// mapping, or does Mount? — and forced it to be decided rather than assumed.
-// Once it was, the mount could not stay on this side of it, and reason 2 above
-// is what settles it: the controller would own an operation it could not
+// The lease holder therefore promotes but does not mount. Reason 2 above
+// settles it: the controller would own an operation it could not
 // complete, because the demote it owes on the way back out is blocked by a
 // mount held by processes it does not control.
 //
@@ -394,14 +390,14 @@
 //
 // # Deployment caveat: lease reaping on embedded go-qrdb
 //
-// go-qrdb #174: an EMBEDDED qrdb node (sdk/go/node) never reaps an expired
+// An embedded qrdb node (sdk/go/node) never reaps an expired
 // lease's bound key, because the leader-side expiry sweeper is started only by
 // cmd/qrdbd. Done still closes on the deadline, so FENCING works — the holder
 // stops acting — but the key stays present, every contender's AcquireLease
 // keeps returning common.ErrLeaseHeld, and the volume is never re-elected.
 //
 // The controller is written against the contract, which says the key is freed;
-// it is correct as soon as the backend reaps. Until go-qrdb #174 is fixed, a
+// it is correct as soon as the backend reaps. Until embedded nodes reap, a
 // clustered HA deployment must run its coordinator against a qrdb backend that
 // runs the sweeper, and an embedded one fences without failing over.
 package ha

@@ -22,10 +22,7 @@ import (
 // privilegedFlag is the thing no document, comment or script may recommend.
 const privilegedFlag = "--privileged"
 
-// warningMarkers are the ways this repository says "not that".
-//
-// A mention accompanied by one of these is a warning, which is the only form a
-// mention may take. They are matched case-insensitively.
+// warningMarkers turn a mention of --privileged into a warning; matched case-insensitively.
 var warningMarkers = []string{
 	"do not use",
 	"do not",

@@ -47,12 +47,7 @@ const (
 	exitCannotScan = 2
 )
 
-// run is main with its edges handed in, so every exit status is reachable from
-// a test. main() itself is the one line that cannot be.
-//
-// The scanner list is a parameter for the same reason: the dirty path is not
-// reachable over a repository that passes its own guards, and an exit status no
-// test has ever produced is an exit status nobody knows is right.
+// run is main with its edges handed in, so every exit status is testable.
 func run(out, errOut io.Writer, dir string, scanners []guards.Scanner) int {
 	root, err := guards.Root(dir)
 	if err != nil {

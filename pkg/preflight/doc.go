@@ -65,8 +65,8 @@
 //
 // Capabilities, seccomp and LSM confinement are enforced by different
 // subsystems. Granting one does not lift another, and all three surface as a
-// bare "operation not permitted". Measured on 2026-09-01, in a container with
-// --cap-add SYS_ADMIN and --device /dev/mapper/control under Docker's DEFAULT
+// bare "operation not permitted". Measured in a container with
+// --cap-add SYS_ADMIN and --device /dev/mapper/control under Docker's default
 // profiles:
 //
 //	device-mapper   works — DM_VERSION returns interface version 4.48.0
@@ -76,8 +76,8 @@
 // So an operator grants CAP_SYS_ADMIN, watches device-mapper work, and concludes
 // the container is correctly privileged. The keyring failure then arrives later,
 // under load, in a code path that looks like a storage fault rather than a
-// container-configuration fault. That is the specific outage this package moves
-// to startup, which is why each mechanism is probed SEPARATELY and each refusal
+// container-configuration fault. This package moves that failure to startup,
+// which is why each mechanism is probed separately and each refusal
 // names which one is missing.
 //
 // # Probe, do not infer

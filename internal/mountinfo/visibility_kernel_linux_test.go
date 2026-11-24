@@ -13,45 +13,7 @@
 
 //go:build kernel_mountinfo
 
-// The frozen tables in visibility_test.go were copied from a kernel, but they
-// were copied ONCE. This file makes the mounts again, here, now, and checks the
-// answer against the kernel this test is running on — so a table that a future
-// kernel writes differently is caught rather than passing against a snapshot of
-// an older one.
-//
-// It needs a mount namespace, which needs privilege. Rather than requiring
-// root, the test re-executes itself inside a user namespace where it is root:
-// tmpfs is one of the filesystems a user namespace may mount, which is why the
-// mounts below are tmpfs and not something block-backed.
-//
-//	make test-kernel-mountinfo
-//
-// # Why a build tag and not the runtime skip this file used to have
-//
-// Where a user namespace is refused, this used to SKIP. That was measured on
-// 2026-09-04 and it is not a hypothetical cost: inside `golang:1.26.7` — the
-// image `make test-container` uses and the shape CI runs in — all three tests
-// below skipped and the package printed `ok` in 0.002s. On a developer host
-// they pass in a fresh namespace. So the only three tests that check this
-// package against a REAL kernel had silently stopped running exactly where it
-// mattered, and nothing said so.
-//
-// conventions/testing-guidelines.md §No Skip Guards prescribes the fix for a
-// genuinely optional capability: a declared build tag whose tier actually
-// provides the dependency. Selecting `kernel_mountinfo` is an operator stating
-// that this host will create an unprivileged user + mount namespace, so a
-// refusal is now a hard FAILURE of a suite that promised the capability, and an
-// unselected tag is a visible, greppable absence rather than a green run.
-//
-// The honest consequence, stated rather than hidden: these tests do not run in
-// CI, because the CI container cannot run them and could not before this change
-// either. What changed is that the absence is now legible.
-//
-// It never touches the caller's mounts. The child makes / recursively private
-// before mounting anything, so nothing it does propagates out, and every mount
-// it makes disappears with the namespace when it exits.
-//
-// Found by internal/guards' no-runtime-skip scanner (#47).
+// These remake the frozen tables' mounts in a user and mount namespace and check the live kernel; run with make test-kernel-mountinfo (tag kernel_mountinfo).
 
 package mountinfo
 
@@ -87,13 +49,7 @@ func TestAgainstARunningKernelAnAncestorOvermountHidesTheVolume(t *testing.T) {
 	relaunchInMountNamespace(t, "base", "base/vol")
 }
 
-// relaunchInMountNamespace runs this same test again, by name, inside a user +
-// mount namespace where the child is root — and reports a host that will not
-// create one as a SKIP naming the step that was refused, never as a pass.
-//
-// The directories are made in the PARENT's temp dir, which the child inherits
-// through baseDirEnv: the child is a fresh process with its own T and no
-// t.TempDir of the parent's.
+// relaunchInMountNamespace reruns this test by name inside a user and mount namespace; directories come from the parent through baseDirEnv.
 func relaunchInMountNamespace(t *testing.T, dirs ...string) {
 	t.Helper()
 
@@ -125,11 +81,7 @@ func relaunchInMountNamespace(t *testing.T, dirs ...string) {
 		return
 	}
 
-	// A namespace this host will not create is a FAILURE, because selecting the
-	// kernel_mountinfo tag is the operator's statement that it will. The reason
-	// is still separated from a wrong answer, and still reported with the
-	// child's own message, so the two failure modes stay distinguishable — what
-	// changed is that neither of them reports success.
+	// A refused namespace fails the test, reported with the child's own message.
 	if reason := unsupportedReason(string(output)); reason != "" {
 		t.Fatalf("this host refused the namespace the kernel_mountinfo tag says it provides: %s\n"+
 			"Either run this on a host where an unprivileged user namespace can be created, or drop the tag —\n"+
@@ -154,8 +106,7 @@ func childBase(t *testing.T) string {
 	return base
 }
 
-// mountTmpfs mounts a tmpfs, marking a refusal as UNSUPPORTED so the parent
-// reports it as a skip rather than as a wrong answer.
+// mountTmpfs mounts a tmpfs, marking a refusal as UNSUPPORTED.
 func mountTmpfs(t *testing.T, source, target string) {
 	t.Helper()
 	if err := unix.Mount(source, target, "tmpfs", 0, "size=1m"); err != nil {
@@ -199,7 +150,7 @@ func runKernelOvermountChild(t *testing.T) {
 			volMajor, volMinor, got, volPath)
 	}
 
-	// Cover the ANCESTOR. Note the path being mounted over is base, not vol.
+	// Cover the ancestor: mount over base, not vol.
 	mountTmpfs(t, "tmpOVER", basePath)
 
 	entries, err = Load()
@@ -227,10 +178,7 @@ func runKernelOvermountChild(t *testing.T) {
 			volMajor, volMinor, got, basePath)
 	}
 
-	// And the kernel agrees, independently of anything this package computed:
-	// the volume's path no longer reaches the volume. tmpOVER is empty, so the
-	// path does not resolve at all — which is the ENOENT a caller acting on the
-	// old answer would get back from umount(2), instead of an unmounted volume.
+	// The kernel agrees: the volume's path does not resolve under the empty tmpOVER.
 	var st unix.Stat_t
 	switch err := unix.Stat(volPath, &st); {
 	case err == unix.ENOENT:
@@ -268,14 +216,7 @@ func indent(s string) string {
 	return "\t" + strings.ReplaceAll(strings.TrimRight(s, "\n"), "\n", "\n\t")
 }
 
-// TestAgainstARunningKernelASiblingOnTheCoveredPathIsSeparatedByItsAncestor is
-// the composite case on the live kernel: two mounts whose mount points render
-// as the SAME string, neither the other's parent, told apart only by which of
-// them hangs off a mount that has been covered.
-//
-// The kernel is the oracle here, not the expected values: the marker file read
-// back through the path is the filesystem a process actually reaches, and the
-// device stat reports is the one umount(2) would detach.
+// TestAgainstARunningKernelASiblingOnTheCoveredPathIsSeparatedByItsAncestor checks two same-path mounts told apart by their covered ancestor.
 func TestAgainstARunningKernelASiblingOnTheCoveredPathIsSeparatedByItsAncestor(t *testing.T) {
 	if os.Getenv(inNamespaceEnv) != "" {
 		runKernelCompositeChild(t)
@@ -298,9 +239,7 @@ func runKernelCompositeChild(t *testing.T) {
 	writeMarker(t, volPath, "in-tmpVOL")
 	volMajor, volMinor := deviceOfMount(t, volPath)
 
-	// Cover the ancestor, then mount a SECOND filesystem at the very same path
-	// string — this one inside the covering filesystem, so its parent is the
-	// covering mount and not the covered one.
+	// Cover the ancestor, then mount a second filesystem at the same path inside the covering one.
 	mountTmpfs(t, "tmpOVER", basePath)
 	if err := os.MkdirAll(volPath, 0o755); err != nil {
 		t.Fatalf("creating %s inside the covering tmpfs: %v", volPath, err)
@@ -354,15 +293,7 @@ func runKernelCompositeChild(t *testing.T) {
 	}
 }
 
-// TestAgainstARunningKernelAMovedMountIsOnTopOfTheRecordAfterIt pins the
-// ordering fact the frozen movedOnTopTable rests on, against the kernel running
-// now: MS_MOVE re-parents a mount and leaves its record where it already was,
-// so the mount ON TOP can be the record listed FIRST.
-//
-// The assertion that must hold whatever the kernel does with record order is
-// the last one: this package's answer equals the device the kernel resolves the
-// path to. The inversion itself is reported rather than required, so a kernel
-// that stopped inverting would relax this test instead of breaking it.
+// TestAgainstARunningKernelAMovedMountIsOnTopOfTheRecordAfterIt requires the answer to match the device the kernel resolves after MS_MOVE.
 func TestAgainstARunningKernelAMovedMountIsOnTopOfTheRecordAfterIt(t *testing.T) {
 	if os.Getenv(inNamespaceEnv) != "" {
 		runKernelMovedChild(t)
@@ -385,7 +316,7 @@ func runKernelMovedChild(t *testing.T) {
 	writeMarker(t, to, "in-tmpLATE")
 	lateMajor, lateMinor := deviceOfMount(t, to)
 
-	// Move the FIRST-created mount on top of the second.
+	// Move the first-created mount on top of the second.
 	if err := unix.Mount(from, to, "", unix.MS_MOVE, ""); err != nil {
 		t.Fatalf("UNSUPPORTED: moving %s onto %s: %v", from, to, err)
 	}
@@ -432,10 +363,7 @@ func runKernelMovedChild(t *testing.T) {
 	}
 }
 
-// writeMarker and readMarker are how these tests ask the KERNEL which
-// filesystem a path reaches, rather than believing the answer under test. Each
-// tmpfs gets a file naming itself, and the name read back through the path is
-// the filesystem actually there.
+// writeMarker and readMarker ask the kernel which tmpfs a path reaches through a file naming each one.
 func writeMarker(t *testing.T, dir, name string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "marker"), []byte(name), 0o644); err != nil {

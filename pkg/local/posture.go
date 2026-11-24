@@ -33,10 +33,7 @@ type Posture = posture.Posture
 // GuardStatus is one guard's configured state.
 type GuardStatus = posture.GuardStatus
 
-// guardNames maps a preflight capability onto the words this report uses for
-// it. A capability absent from the map is reported under its own name rather
-// than dropped: an unnamed guard is still a guard, and omitting it would be the
-// silence this type exists to remove.
+// guardNames maps preflight capabilities to report names; unmapped capabilities are reported under their own name.
 var guardNames = map[preflight.Capability]string{
 	preflight.CapabilityDeviceMapper:  "device-mapper access",
 	preflight.CapabilityMount:         "mount(2) privilege",
@@ -50,8 +47,7 @@ var guardNames = map[preflight.Capability]string{
 func (p *Provider) Posture() Posture {
 	report := Posture{Component: "local"}
 
-	// The startup checks, named individually: "preflight ran" says nothing
-	// about WHICH capabilities it covered, and the mode makes that vary.
+	// The startup checks, named individually.
 	checked := make(map[preflight.Capability]struct{}, len(p.preflightChecked))
 	for _, capability := range p.preflightChecked {
 		checked[capability] = struct{}{}
@@ -83,23 +79,14 @@ func (p *Provider) Posture() Posture {
 			Active: p.keyFile != "",
 			Detail: keyPathDetail(p.keyFile != "", p.keyProvider != nil),
 		},
-		// The orphan inspection is always available and never acts, so it is
-		// reported as what it is rather than as on or off. Saying "checked"
-		// would imply something watches continuously — it runs when a component
-		// calls it — and omitting it would leave an operator to discover by
-		// reading the code that nothing cleans up an abandoned mapping.
+		// The orphan inspection runs only when called and never acts; it is reported as such.
 		GuardStatus{
 			Name:   "orphaned dm-crypt mappings",
 			Active: false,
 			Detail: "REPORTED, NEVER REMOVED — InspectMappings names what this provider owns and " +
 				"cannot account for; nothing here tears one down, and a component that acts on a finding owns that decision",
 		},
-		// Reported beside the inspection rather than inside it, because it is
-		// what decides how much of the report is worth anything. The oracle is
-		// injected and defaults to absent, which makes it the second guard in
-		// this list that an operator can leave off without ever seeing a symptom
-		// — and the symptom, when it comes, is a report full of "live" lines
-		// over mappings nothing has held for weeks.
+		// The liveness oracle decides how much of the orphan report is reliable; it defaults to absent.
 		GuardStatus{
 			Name:   "attachment liveness",
 			Active: p.liveness != nil,
@@ -128,14 +115,7 @@ func propagationDetail(policy MountPropagationPolicy) string {
 		SettingMountPropagation + "=shared where a workload elsewhere consumes these mounts"
 }
 
-// keyPathDetail says whether the key file can be checked against the paths this
-// provider hands over, and why not when it cannot.
-//
-// The distinction is not on/off, it is KNOWABLE or not. A KeyProvider supplied
-// as a func closes over whatever it reads, so this package cannot see a path to
-// check — and reporting that as an unchecked guard would suggest a setting
-// somebody could turn on, when the honest statement is that the check does not
-// apply to how this provider was built.
+// keyPathDetail says whether the key file path can be checked; a func KeyProvider has no path to check.
 func keyPathDetail(haveKeyPath, haveProvider bool) string {
 	switch {
 	case haveKeyPath:
@@ -148,14 +128,7 @@ func keyPathDetail(haveKeyPath, haveProvider bool) string {
 	}
 }
 
-// livenessDetail says what the liveness oracle is asked, or what is not asked
-// without one.
-//
-// The absent case spells out the CONSEQUENCE and not merely the configuration,
-// because the operator who most needs this line is the one who does not know
-// the question exists: "no oracle" reads as a feature nobody turned on, while
-// "a mapping made on this boot is reported as live whether or not anything
-// still holds it" reads as the report being partly blind, which is what it is.
+// livenessDetail describes the liveness oracle, or the consequence of having none.
 func livenessDetail(configured bool) string {
 	if configured {
 		return "a mapping made on the boot that is still running is put to the injected LivenessOracle; " +

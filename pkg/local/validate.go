@@ -23,20 +23,10 @@ import (
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
 )
 
-// maxNameLen bounds a caller-supplied volume or snapshot name.
-//
-// LVM caps a logical volume name at 127 characters and this provider composes
-// snapshot LV names as "<volume>_snap_<snapshot>", so two names plus the
-// six-character separator have to fit. 56 leaves that composition at 118 with
-// room to spare, and no realistic volume name comes close.
+// maxNameLen bounds a volume or snapshot name so "<volume>_snap_<snapshot>" fits LVM's 127-character limit.
 const maxNameLen = 56
 
-// snapSeparator joins a volume name and a snapshot name into the snapshot's
-// logical volume name, which is also its SnapshotID.
-//
-// The underscore is what makes the join reversible: validateName rejects it in
-// caller-supplied names, so "<volume>_snap_<snapshot>" splits back into its two
-// halves unambiguously no matter what hyphens or digits either half contains.
+// snapSeparator joins volume and snapshot names into the SnapshotID; validateName forbids underscores, so the join splits back unambiguously.
 const snapSeparator = "_snap_"
 
 // reservedNamePrefixes are the leading words LVM refuses in a logical volume
@@ -44,13 +34,7 @@ const snapSeparator = "_snap_"
 // error at the API boundary.
 var reservedNamePrefixes = []string{"snapshot", "pvmove"}
 
-// validateName checks a caller-supplied volume, snapshot or volume-group name.
-//
-// The permitted set is deliberately narrower than what LVM itself accepts:
-// an ASCII letter or digit, then letters, digits and hyphens. Every accepted
-// name is therefore safe as an lvcreate argument, as a device-mapper name, and
-// as a path element, with no escaping anywhere. Names that LVM would take but
-// this rejects are a small price for a rule that is auditable by reading it.
+// validateName accepts an ASCII letter or digit followed by letters, digits and hyphens: safe as an LVM argument, dm name and path element.
 func validateName(kind, name string) error {
 	if name == "" {
 		return fmt.Errorf("%w: %s name is empty", common.ErrInvalidArgument, kind)
@@ -75,12 +59,7 @@ func validateName(kind, name string) error {
 	return nil
 }
 
-// mkfsBinaries maps an accepted filesystem type to the binary that creates it.
-//
-// The map is the allowlist. Nothing derives a binary name from caller input by
-// concatenating "mkfs." onto it, because that turns FSType into a choice of
-// which program to execute; a type absent from this table is rejected, never
-// guessed at.
+// mkfsBinaries maps an accepted filesystem type to its binary; it is the allowlist.
 var mkfsBinaries = map[string]string{
 	"ext2": "mkfs.ext2",
 	"ext3": "mkfs.ext3",
@@ -106,14 +85,7 @@ func sortedFSTypes() []string {
 	return []string{"ext2", "ext3", "ext4", "xfs"}
 }
 
-// validateMountFlags checks every flag against the allowlist, and rejects a
-// flag that contradicts an explicit read-only request.
-//
-// mount(8) resolves a conflicting -o ro,rw by taking the last option, so an
-// "rw" arriving in Flags would quietly win over MountOptions.ReadOnly and mount
-// the volume writable. That is exactly the case where ReadOnly is being used as
-// a guard and Flags are coming from somewhere less trusted, so the contradiction
-// is refused rather than silently resolved either way.
+// validateMountFlags checks every flag against the allowlist and rejects "rw" alongside a read-only request.
 func validateMountFlags(readOnly bool, flags []string) error {
 	for _, f := range flags {
 		if _, ok := mount.Lookup(f); !ok {
@@ -126,13 +98,7 @@ func validateMountFlags(readOnly bool, flags []string) error {
 	return nil
 }
 
-// validateTarget checks a mount target path.
-//
-// The path must be absolute and already clean, so "/mnt/data/../../etc" is
-// rejected rather than quietly resolved to somewhere else. Requiring the
-// caller's path to equal its own cleaned form also means the string handed to
-// mount(8) is the string the caller passed, which is what makes an audit log of
-// the request meaningful.
+// validateTarget requires an absolute, already-clean mount target path.
 func validateTarget(target string) error {
 	return validateAbsPath("mount target", target)
 }
@@ -143,18 +109,7 @@ func validateAbsPath(kind, target string) error {
 	if target == "" {
 		return fmt.Errorf("%w: %s is empty", common.ErrInvalidArgument, kind)
 	}
-	// Control characters are rejected, newline above all. The kernel's mount
-	// table is a line-oriented file, and while the parser now undoes the octal
-	// escaping the kernel applies to a newline (\012), a target carrying one is
-	// still a target nothing else in the system handles well — and this
-	// provider passes it to tools that are line-oriented in their own right.
-	// Linux permits any byte but NUL and '/' in a path, so this has to be
-	// refused here rather than assumed away.
-	//
-	// A space is deliberately still allowed, and it round-trips: the kernel
-	// escapes it as \040 in /proc/self/mountinfo and internal/mountinfo unescapes
-	// it, which TestParseUnescapesPaths and the integration test that mounts at
-	// a path with a space both pin.
+	// Control characters are refused; a space is allowed and round-trips through mountinfo.
 	for i := 0; i < len(target); i++ {
 		if c := target[i]; c < 0x20 || c == 0x7f {
 			return fmt.Errorf("%w: %s %q contains control character %#x", common.ErrInvalidArgument, kind, target, c)
@@ -166,12 +121,7 @@ func validateAbsPath(kind, target string) error {
 	if filepath.Clean(target) != target {
 		return fmt.Errorf("%w: %s %q is not a clean path", common.ErrInvalidArgument, kind, target)
 	}
-	// Leading or trailing whitespace is refused because the kernel's own record
-	// would not carry it back the way it went in: the mount table is
-	// whitespace-separated, and a target padded with a space is a target this
-	// provider cannot match against its own record afterwards. Unmount would
-	// then report the convergent "not mounted there" over a volume that is
-	// still mounted, which is the fail-open the mount lookups exist to avoid.
+	// Leading or trailing whitespace is refused: it cannot be matched against the mount table afterwards.
 	if strings.TrimSpace(target) != target {
 		return fmt.Errorf("%w: %s %q has leading or trailing whitespace", common.ErrInvalidArgument, kind, target)
 	}

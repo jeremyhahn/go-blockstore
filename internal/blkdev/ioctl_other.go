@@ -28,9 +28,5 @@ var errUnsupportedPlatform = errors.New("blkdev: block-device ioctls require Lin
 // deviceSize has no implementation off Linux.
 func deviceSize(*os.File) (int64, error) { return 0, errUnsupportedPlatform }
 
-// zeroRange has no implementation off Linux.
-//
-// Refusing rather than falling back to writing zeroes by hand: the callers use
-// this to destroy a former tenant's data, and a silent substitution with
-// different durability is not the kind of thing to do behind a build tag.
+// zeroRange has no implementation off Linux and refuses rather than writing zeroes by hand.
 func zeroRange(*os.File, uint64, uint64) error { return errUnsupportedPlatform }

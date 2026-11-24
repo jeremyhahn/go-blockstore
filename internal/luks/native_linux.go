@@ -52,39 +52,13 @@ type Native struct{}
 // Ensure the backend satisfies the seam at compile time.
 var _ Backend = Native{}
 
-// sectorSize is the encryption sector size every container this package
-// creates uses.
-//
-// It is pinned for the same reason the cipher and the KDF are: it is one of the
-// inputs to the on-disk layout, and a library default that moved would move the
-// layout with it. 512 is also what the data-offset measurement recorded in
-// HeaderBytes was taken at.
+// sectorSize is the pinned encryption sector size.
 const sectorSize = 512
 
-// pbkdfIterTime is the wall-clock target go-luks2 calibrates PBKDF2 against when
-// it picks an iteration count.
-//
-// It is stated rather than defaulted, like every other format parameter, and it
-// happens to be go-luks2's own default. It BUYS nothing until go-luks2
-// v0.2.0-alpha, and that is recorded here rather than discovered later: measured
-// against v0.1.7-alpha on 2026-08-29, the benchmark timed 1000 iterations of
-// PBKDF2-HMAC-SHA-512 with time.Since(...).Milliseconds(), that derivation takes
-// well under a millisecond on this hardware, and the elapsed time therefore
-// rounded to ZERO — so it fell through to a hard-coded 100000 and this figure
-// was not consulted at all.
-//
-// go-luks2 #102 fixed the calibration. Measured on 2026-09-03 across the bump,
-// with the parameters Format pins below: v0.1.10-alpha wrote 100000 iterations
-// in 363ms, v0.2.0-alpha writes 3,988,449 in 2.42s — so this constant is now
-// the target it always claimed to be, and the derivation lands where the 2000ms
-// asks. See Manager.Format for why the old count was nonetheless acceptable for the
-// high-entropy material it stretches.
+// pbkdfIterTime is the wall-clock target go-luks2 calibrates PBKDF2 against.
 const pbkdfIterTime = 2 * time.Second
 
-// hashFunc is hashAlgo as go-luks2 v1 spells it. It is both the digest and
-// anti-forensic hash (FormatParams.Hash) and the keyslot's PBKDF2 pseudo-random
-// function (KDFParams.Hash): v1 takes the two separately, and this package
-// states both so that one hash runs across the header.
+// hashFunc is hashAlgo as go-luks2 v1 spells it, for both FormatParams.Hash and KDFParams.Hash.
 const hashFunc = crypto.SHA512
 
 // Format writes a LUKS2 header onto the device with every cryptographic
@@ -194,7 +168,7 @@ func (Native) DataOffset(ctx context.Context, device string) (int64, error) {
 				"a container mid-reencryption has no single usable capacity", len(segments))
 		}
 
-		// go-luks2 parses the offset, which LUKS2 renders as a decimal STRING.
+		// LUKS2 renders the offset as a decimal string.
 		offset = segments[0].Offset
 		if offset <= 0 {
 			return fmt.Errorf("the LUKS header reports data offset %d, which leaves no room for a header", offset)
@@ -274,13 +248,7 @@ func (Native) Identity(ctx context.Context, path string) (string, error) {
 	return formatDeviceID(rdev), nil
 }
 
-// blockDeviceNumber returns the device number a path leads to.
-//
-// os.Stat follows symlinks, which is the point: a device-mapper device is
-// reachable as /dev/<vg>/<lv>, /dev/mapper/<vg>-<lv> and /dev/dm-N, the first
-// two being symlinks to the third, so comparing the strings tools print says
-// nothing about whether two paths are the same device. Lstat would describe the
-// link and report no device number at all.
+// blockDeviceNumber returns the device number a path leads to, following symlinks.
 func blockDeviceNumber(path string) (uint64, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -296,36 +264,18 @@ func blockDeviceNumber(path string) (uint64, error) {
 	return stat.Rdev, nil
 }
 
-// formatDeviceID renders a device number the way the rest of the provider
-// compares them: major and minor in hex, which is the spelling `stat -c %t:%T`
-// produced when this check ran through a command and the spelling every
-// recorded fixture uses.
+// formatDeviceID renders a device number as hex major:minor.
 func formatDeviceID(rdev uint64) string {
 	return fmt.Sprintf("%x:%x", unix.Major(rdev), unix.Minor(rdev))
 }
 
-// sysfsRoot is where the kernel publishes what a device is stacked on. It is a
-// parameter of backingDevice rather than a literal inside it so the fail-closed
-// cases can be tested against a directory a test owns — there is no way to make
-// a real /sys list two slaves for one dm-crypt target on demand, and those are
-// exactly the shapes that must not be read as success.
+// sysfsRoot is a parameter so tests can supply the fail-closed shapes.
 const sysfsRoot = "/sys"
 
-// sysfsSectorBytes is the unit of /sys/dev/block/<major>:<minor>/size. It is
-// the block layer's 512-byte sector whatever the device's own logical sector
-// size — a 4Kn disk still reports its capacity in these — so the scaling is a
-// constant and not a second lookup.
+// sysfsSectorBytes is the unit of the sysfs size file, always 512.
 const sysfsSectorBytes = 512
 
-// deviceSize returns a block device's current capacity in bytes, read from
-// sysfs.
-//
-// Every unreadable shape is a refusal rather than a zero. This number decides
-// whether a plaintext mapping still covers the device it decrypts, and the two
-// wrong defaults are both silent: a 0 read as a size makes every mapping look
-// stale, and an error read as "unknown, assume fine" makes none of them. A
-// missing file is a device the kernel does not have — the same fail-closed
-// answer backingDevice gives for a missing slaves directory.
+// deviceSize returns a block device's current capacity from sysfs; every unreadable shape is an error.
 func deviceSize(root string, rdev uint64) (int64, error) {
 	path := filepath.Join(root, "dev", "block", fmt.Sprintf("%d:%d", unix.Major(rdev), unix.Minor(rdev)), "size")
 	// #nosec G304 -- the path is built from a device number and a sysfs root
@@ -344,18 +294,7 @@ func deviceSize(root string, rdev uint64) (int64, error) {
 	return sectors * sysfsSectorBytes, nil
 }
 
-// backingDevice returns the single device a device-mapper device is stacked on,
-// as the most legible path that leads to it.
-//
-// Exactly one is required. A dm-crypt target has one backing device, so none or
-// several is not the mapping being looked for, and the whole point
-// of the lookup is to refuse what cannot be established — see ErrNoBackingDevice.
-//
-// The path is dm-canonical where it can be: a slave that is itself
-// device-mapper publishes its name under <root>/class/block/<kname>/dm/name, and
-// /dev/mapper/<that> is the spelling an operator recognizes and the one
-// cryptsetup used to print. Anything else is reported as /dev/<kname>, which is
-// what the kernel calls it.
+// backingDevice returns the single device a device-mapper device is stacked on, as /dev/mapper/<name> where possible, else /dev/<kname>.
 func backingDevice(root string, rdev uint64) (string, error) {
 	dir := filepath.Join(root, "dev", "block", fmt.Sprintf("%d:%d", unix.Major(rdev), unix.Minor(rdev)), "slaves")
 	entries, err := os.ReadDir(dir)
@@ -374,15 +313,6 @@ func backingDevice(root string, rdev uint64) (string, error) {
 	kname := names[0]
 
 	// #nosec G304 -- kname is a directory entry, not a caller-supplied path.
-	//
-	// G304 fires because the path is built from a variable. That variable is an
-	// entry of a directory the KERNEL owns and populates: os.ReadDir returns one
-	// path element per entry, never "." or "..", and never a name containing a
-	// separator, so filepath.Join here cannot leave root however sysfs is
-	// spelled. Nothing a caller of this package supplies reaches it — the volume
-	// ID is not in the path, and neither is anything derived from one. The read
-	// is also advisory: a failure just means the backing device is reported by
-	// its kernel name instead of its device-mapper one.
 	if dmName, err := os.ReadFile(filepath.Join(root, "class", "block", kname, "dm", "name")); err == nil {
 		if trimmed := strings.TrimSpace(string(dmName)); trimmed != "" {
 			return "/dev/mapper/" + trimmed, nil

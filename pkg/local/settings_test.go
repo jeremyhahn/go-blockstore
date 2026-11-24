@@ -29,11 +29,7 @@ func TestNewFromSettings(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	// The startup privilege checks are off because this test is about
-	// SETTINGS PARSING, not about the host it runs on: with them on, the result
-	// would depend on whether the test machine can do device-mapper. The check
-	// itself is exercised against a real kernel in preflight_test.go and
-	// through NewFromSettings in TestNewFromSettingsRunsThePreflight.
+	// Preflight is off: this test covers settings parsing, not the host.
 	p, err := NewFromSettings(map[string]string{
 		SettingVolumeGroup:        "vg0",
 		SettingNodeID:             "node-a",

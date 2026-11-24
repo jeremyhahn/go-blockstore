@@ -107,15 +107,7 @@ func (l lvInfo) luksHeaderTags() []string {
 	return found
 }
 
-// luksHeaderFromTags reads the header size this volume was tagged with.
-//
-// The three answers are distinct on purpose. NOT TAGGED is a volume provisioned
-// before the tag existed, and is a legitimate state with a documented fallback.
-// TAGGED WITH SOMETHING UNREADABLE — a value that is not a positive number, or
-// several disagreeing tags — is not: it means the tag was hand-edited or two
-// writers disagreed, and answering with a number anyway would put a
-// plausible-looking figure where an unreadable one was, which is the one thing
-// this package refuses everywhere it reads a value back from a tool.
+// luksHeaderFromTags returns the tagged header size, distinguishing untagged from unreadable or conflicting tags.
 func (l lvInfo) luksHeaderFromTags() (headerBytes int64, tagged bool, err error) {
 	found := l.luksHeaderTags()
 	switch len(found) {
@@ -142,22 +134,12 @@ func (l lvInfo) isSnapshot() bool {
 	return l.Origin != ""
 }
 
-// usedBytes is the space a snapshot currently occupies: its CoW area scaled by
-// how much of that area has been written. SnapshotInfo.SizeBytes is defined as
-// this occupancy rather than the origin's capacity.
-//
-// It is 0 for an INACTIVE snapshot, which is what this provider leaves them as.
-// LVM reports occupancy only while the kernel has the device mapped, and the
-// figure is not worth activating a snapshot to obtain — activating one activates
-// its origin too, which would move a volume the caller is using.
+// usedBytes is a snapshot's occupied CoW space, or 0 when inactive.
 func (l lvInfo) usedBytes() int64 {
 	return int64(float64(l.SizeBytes) * l.DataPercent / 100)
 }
 
-// lvTimeLayouts are the formats lvs has used for lv_time. The first two are
-// what LVM emits with its default and ISO time formats; the parser tries each
-// and leaves CreatedAt zero if none fit, because a creation timestamp is
-// reporting detail and not worth failing a listing over.
+// lvTimeLayouts are lv_time formats; CreatedAt stays zero if none fit.
 var lvTimeLayouts = []string{
 	"2006-01-02 15:04:05 -0700",
 	"2006-01-02 15:04:05 Z0700",
@@ -165,12 +147,7 @@ var lvTimeLayouts = []string{
 	time.RFC3339,
 }
 
-// parseLVTags splits the lv_tags column, which lvs renders as a comma-separated
-// list and leaves EMPTY for an untagged volume — measured on LVM 2.03.16,
-// including through the JSON report, where the field is the empty string rather
-// than absent or null. Splitting "" yields one EMPTY tag rather than none, which
-// would make a volume with no tags look like a volume with one, so empties are
-// dropped both at the front and inside the loop.
+// parseLVTags splits the comma-separated lv_tags column, dropping empty entries.
 func parseLVTags(raw string) []string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -198,13 +175,7 @@ func parseLVTime(s string) time.Time {
 	return time.Time{}
 }
 
-// listLVs returns every logical volume in the provider's volume group.
-//
-// The provider queries the whole group in one call and searches the result,
-// rather than asking lvs about a single volume, because lvs signals "no such
-// logical volume" with an exit status shared by real failures. A full listing
-// makes absence an ordinary empty result and keeps every lifecycle method's
-// ErrNotFound decision a matter of reading a slice, not decoding exit codes.
+// listLVs returns every LV in the volume group, so absence is an empty result rather than an exit code.
 func (p *Provider) listLVs(ctx context.Context) ([]lvInfo, error) {
 	out, err := p.runner.Run(ctx, nil, "lvs",
 		"--reportformat", "json",
@@ -244,13 +215,7 @@ func (p *Provider) listLVs(ctx context.Context) ([]lvInfo, error) {
 			}
 			info.SizeBytes = int64(size)
 
-			// data_percent is reported only where the kernel is tracking it:
-			// for a snapshot that is ACTIVE. Measured on LVM 2.03.16, a plain
-			// volume reports empty always, and so does an inactive snapshot —
-			// which is the ordinary state here, since this provider leaves
-			// snapshots deactivated. Empty is a real answer in both cases and
-			// only a malformed one for a snapshot that IS active, where the
-			// kernel has a figure and lvs failed to render it.
+			// data_percent is empty for plain volumes and inactive snapshots; empty on an active snapshot is malformed.
 			if raw := strings.TrimSpace(lv.DataPercent); raw != "" {
 				pct, pctErr := parseLVNumber(raw)
 				if pctErr != nil {
@@ -267,11 +232,7 @@ func (p *Provider) listLVs(ctx context.Context) ([]lvInfo, error) {
 					p.volumeGroup, lv.Name)
 			}
 
-			// origin_size is reported for a snapshot and for an origin that has
-			// one, and left empty for an ordinary volume. Only the snapshot's
-			// value is used, and a snapshot without one cannot be restored from
-			// safely — the copy's length and the zeroing offset both come from
-			// it — so it is required there and ignored everywhere else.
+			// origin_size is required on a snapshot and ignored elsewhere.
 			if raw := strings.TrimSpace(lv.OriginSize); raw != "" {
 				originSize, sizeErr := parseLVNumber(raw)
 				if sizeErr != nil {
@@ -290,19 +251,7 @@ func (p *Provider) listLVs(ctx context.Context) ([]lvInfo, error) {
 	return infos, nil
 }
 
-// parseLVNumber reads one of lvs's numeric columns, refusing anything that is
-// not a finite, non-negative number.
-//
-// The alternative — the zero value on a parse failure, which is what this used
-// to do — puts a plausible-looking number where an unreadable one was, and these
-// feed decisions rather than reports: a zero lv_size makes Resize read every
-// request as a grow and makes a restore's "is the target big enough" check pass
-// for any size at all. Failing the listing means an operation over a volume
-// group this provider cannot read stops instead of acting on invented numbers.
-// maxInt64Float is 2^63 exactly, the first float64 that does not fit in an
-// int64. Converting a float at or above it is implementation-specific in Go and
-// yields a nonsense value on amd64 — a negative one — so it is refused rather
-// than converted.
+// parseLVNumber reads a numeric lvs column, refusing anything not finite and non-negative; maxInt64Float is 2^63, refused rather than converted.
 const maxInt64Float = float64(math.MaxInt64)
 
 func parseLVNumber(raw string) (float64, error) {
@@ -335,12 +284,7 @@ type vgsReport struct {
 	} `json:"report"`
 }
 
-// extentSize returns the volume group's allocation unit in bytes.
-//
-// Resize needs it to tell a genuine shrink from a repeat of a request LVM has
-// already rounded up. Asking for 100000000 bytes yields a 100663296-byte volume
-// on a 4 MiB-extent group, and without knowing the extent size the identical
-// second request looks like a shrink and comes back ErrUnsupported.
+// extentSize returns the volume group's extent size, so Resize can tell a shrink from a rounded repeat.
 func (p *Provider) extentSize(ctx context.Context) (int64, error) {
 	out, err := p.runner.Run(ctx, nil, "vgs",
 		"--reportformat", "json",
@@ -377,18 +321,7 @@ func maxRoundableBytes(extent int64) int64 {
 	return math.MaxInt64 - (extent - 1)
 }
 
-// maxUsableBytes is the largest USABLE capacity a caller can ask for on a
-// volume carrying overhead bytes of per-volume overhead, given a volume group
-// with this extent size.
-//
-// Both steps that turn a usable capacity into a backing size can overflow: the
-// addition of the overhead, and the rounding up to a whole extent inside
-// roundUpToExtent. This is the bound past which either of them would, so the
-// callers check once against it rather than each guarding half the arithmetic.
-//
-// The subtraction cannot itself go negative: maxRoundableBytes never returns
-// less than the extent size, and the guard below covers the degenerate case of
-// an overhead larger than the whole representable range.
+// maxUsableBytes is the largest usable capacity whose overhead addition and extent rounding do not overflow.
 func maxUsableBytes(extent, overhead int64) int64 {
 	limit := maxRoundableBytes(extent)
 	if overhead >= limit {
@@ -397,13 +330,7 @@ func maxUsableBytes(extent, overhead int64) int64 {
 	return limit - overhead
 }
 
-// usableBytes is the capacity a caller can write to on a backing device of
-// backing bytes carrying overhead bytes of per-volume overhead.
-//
-// It floors at zero rather than going negative. A backing device smaller than
-// its own overhead is not a volume with negative capacity, it is a volume with
-// none — and a negative size reported through VolumeStatus would be read as a
-// number rather than as the nonsense it is.
+// usableBytes is backing minus overhead, floored at zero.
 func usableBytes(backing, overhead int64) int64 {
 	if backing <= overhead {
 		return 0
@@ -411,15 +338,7 @@ func usableBytes(backing, overhead int64) int64 {
 	return backing - overhead
 }
 
-// roundUpToExtent rounds a byte count up to a whole number of extents, the way
-// lvcreate and lvextend do.
-//
-// bytes must not exceed maxRoundableBytes(extent). The addition below overflows
-// past that, and a signed overflow in Go wraps rather than trapping: the result
-// comes back NEGATIVE, which then reads as a smaller size than the volume
-// already has. A caller that skipped the check would have a request to grow a
-// volume to an enormous size reported back as an unsupported SHRINK — the wrong
-// answer, arrived at silently, to a question nobody would think to re-ask.
+// roundUpToExtent rounds bytes up to whole extents; bytes must not exceed maxRoundableBytes(extent).
 func roundUpToExtent(bytes, extent int64) int64 {
 	if extent <= 0 {
 		return bytes
@@ -450,11 +369,7 @@ func (p *Provider) lvRef(name string) string {
 	return p.volumeGroup + "/" + name
 }
 
-// activate makes a logical volume's device node available on this host.
-//
-// --yes answers the confirmation lvchange raises for a snapshot, where changing
-// the snapshot's activation changes its origin's too. There is nobody to answer
-// it from inside a library call, and the operation is one the caller asked for.
+// activate makes an LV's device node available; --yes answers lvchange's snapshot prompt.
 func (p *Provider) activate(ctx context.Context, name string) error {
 	if _, err := p.runner.Run(ctx, nil, "lvchange", "--activate", "y", "--yes", p.lvRef(name)); err != nil {
 		return fmt.Errorf("go-blockstore/local: activating %s: %w", p.lvRef(name), err)
@@ -470,23 +385,10 @@ func (p *Provider) deactivate(ctx context.Context, name string) error {
 	return nil
 }
 
-// autoActivationOff is what keeps Detach meaning anything.
-//
-// LVM autoactivation is on by default, and udev reactivates a whole volume
-// group in response to unrelated device events — a mkfs on a sibling volume is
-// enough. A deactivated volume therefore comes back on its own within seconds,
-// which would make Detach a suggestion and Status a coin flip. Marking a volume
-// as not auto-activated leaves activation entirely to this provider: explicit
-// lvchange still works, boot and udev leave it alone.
-//
-// The flag needs LVM 2.03.12 (2021) or newer.
+// autoActivationOff keeps udev and boot from reactivating detached volumes; needs LVM 2.03.12 or newer.
 var autoActivationOff = []string{"--setautoactivation", "n"}
 
-// addTag records a tag on a logical volume.
-//
-// It is idempotent: measured on LVM 2.03.16, adding a tag the volume already
-// carries exits 0 and leaves one copy of it, so a repeated call is a no-op
-// rather than something callers have to guard against.
+// addTag records a tag on an LV; adding an existing tag is a no-op.
 func (p *Provider) addTag(ctx context.Context, name, tag string) error {
 	if _, err := p.runner.Run(ctx, nil, "lvchange", "--addtag", tag, p.lvRef(name)); err != nil {
 		return fmt.Errorf("go-blockstore/local: tagging %s with %q: %w", p.lvRef(name), tag, err)
@@ -494,11 +396,7 @@ func (p *Provider) addTag(ctx context.Context, name, tag string) error {
 	return nil
 }
 
-// deleteHeaderTags removes every header tag from a volume, for the case where
-// the probe says there should not be one at all.
-//
-// --deltag of a tag the volume does not carry exits 0 — measured — so this is
-// idempotent and needs no read-back to confirm what it removed.
+// deleteHeaderTags removes every header tag from a volume; --deltag of an absent tag exits 0.
 func (p *Provider) deleteHeaderTags(ctx context.Context, name string, tags []string) error {
 	args := make([]string, 0, 2*len(tags)+1)
 	for _, tag := range tags {
@@ -513,12 +411,7 @@ func (p *Provider) deleteHeaderTags(ctx context.Context, name string, tags []str
 	return nil
 }
 
-// retagLUKSHeader makes the volume's recorded header size be exactly want,
-// removing any header tag that says something else.
-//
-// Both halves go to ONE lvchange — measured on LVM 2.03.16, --deltag and
-// --addtag are accepted together and applied in that order — so the volume is
-// never briefly untagged, and never briefly carrying two tags that disagree.
+// retagLUKSHeader sets the header tag to want in one lvchange (--deltag then --addtag), so the volume is never untagged or double-tagged.
 func (p *Provider) retagLUKSHeader(ctx context.Context, name string, stale []string, want string) error {
 	args := make([]string, 0, 2*len(stale)+3)
 	for _, tag := range stale {
@@ -534,11 +427,7 @@ func (p *Provider) retagLUKSHeader(ctx context.Context, name string, stale []str
 	return nil
 }
 
-// createLV creates a logical volume of the given size.
-//
-// The size reaches lvcreate in bytes with an explicit "b" suffix. LVM rounds it
-// up to a whole number of extents, so the volume can come back marginally
-// larger than requested and never smaller.
+// createLV creates an LV of the given size in bytes; LVM rounds up to whole extents.
 func (p *Provider) createLV(ctx context.Context, name string, sizeBytes int64) error {
 	args := append([]string{
 		"--yes",
@@ -561,20 +450,10 @@ func (p *Provider) removeLV(ctx context.Context, name string) error {
 	return nil
 }
 
-// blkidNoSignature is the exit status blkid uses for "no information about this
-// device", which covers both a device with no recognizable signature and one
-// that does not exist. Its other non-zero statuses are failures: a usage error,
-// or the exit 8 that means low-level probing found an ambivalent result.
+// blkidNoSignature is blkid's exit status for no signature or no device; other non-zero statuses are failures.
 const blkidNoSignature = 2
 
-// probeFSType asks blkid what is on a device, returning "" for a device with no
-// recognizable signature — a freshly created raw volume, most often.
-//
-// Only blkid's "nothing here" status becomes an empty answer. Every other
-// failure is returned, because the alternative is reporting "no filesystem" for
-// a device blkid could not read, or found two conflicting signatures on, and the
-// caller acting on that would attach an encrypted volume as though it were
-// plain, or skip growing a filesystem that is really there.
+// probeFSType returns blkid's TYPE for a device, "" only for blkid's no-signature status, and an error otherwise.
 func (p *Provider) probeFSType(ctx context.Context, device string) (string, error) {
 	out, err := p.runner.Run(ctx, nil, "blkid", "-o", "export", device)
 	if err != nil {
@@ -583,12 +462,7 @@ func (p *Provider) probeFSType(ctx context.Context, device string) (string, erro
 		}
 		return "", fmt.Errorf("go-blockstore/local: probing %s: %w", device, err)
 	}
-	// A zero exit means blkid identified the device, so it owes us a TYPE.
-	// Returning "" here — the authoritative "this is a raw device" answer —
-	// for output that simply did not contain one would let truncated or
-	// unexpected output pass as fact, and callers act on that answer: Attach
-	// would hand back a LUKS container as a plain device, and Mount would try
-	// to mount one.
+	// A zero exit must carry a TYPE; output without one is an error, not a raw device.
 	var types []string
 	for _, line := range strings.Split(string(out), "\n") {
 		key, value, found := strings.Cut(strings.TrimSpace(line), "=")
@@ -607,28 +481,12 @@ func (p *Provider) probeFSType(ctx context.Context, device string) (string, erro
 	}
 }
 
-// dmName composes the device-mapper name LVM gives a logical volume.
-//
-// Each component has its hyphens doubled, which is what lets the single-hyphen
-// join between them stay unambiguous. Measured on LVM 2.03.16: volume group
-// "bs-p9" and logical volume "my-vol" appear as "bs--p9-my--vol".
+// dmName composes LVM's device-mapper name, doubling hyphens in each component ("bs-p9"/"my-vol" -> "bs--p9-my--vol").
 func dmName(vg, lv string) string {
 	return strings.ReplaceAll(vg, "-", "--") + "-" + strings.ReplaceAll(lv, "-", "--")
 }
 
-// mountpointsFor returns every path the volume is currently mounted at.
-//
-// The device is identified by its major:minor rather than by a path, which is
-// what removed sourceAliases from this file. A volume answers to several names
-// — /dev/<vg>/<lv>, /dev/mapper/<vg>-<lv>, the /dev/dm-N beneath them — and
-// asking findmnt meant guessing which spelling it would report a mount under,
-// then listing them all so one would match. The kernel records the device
-// number, and every name resolves to the same one.
-//
-// A device that is not mounted yields no paths and no error. Only a mount table
-// that could not be READ is an error, and keeping those apart is the point:
-// "not mounted" is the answer Delete acts on immediately before a forced
-// lvremove, and findmnt spent one exit status on both.
+// mountpointsFor returns every path the volume is mounted at, matched by major:minor; an unreadable mount table is an error.
 func (p *Provider) mountpointsFor(ctx context.Context, device string) ([]string, error) {
 	if device == "" {
 		return nil, nil
@@ -636,18 +494,7 @@ func (p *Provider) mountpointsFor(ctx context.Context, device string) ([]string,
 	return p.mountTable.MountPointsFor(ctx, device)
 }
 
-// visibleMountpointsFor returns the paths where the volume is the filesystem
-// VISIBLE, which is the set anything unmounting by path may act on.
-//
-// The difference from mountpointsFor is a directory this volume was mounted at
-// and something else has since been mounted over: both records stay in the
-// table, the later one is what a process reaching that path gets, and umount(2)
-// detaches what is visible. Unmounting by such a path would take the other
-// filesystem down and leave this volume mounted underneath it.
-//
-// So the two questions are asked separately: "is it mounted at all", which
-// keeps a hidden mount counted and a teardown honest, and "where can it be
-// unmounted", which is this.
+// visibleMountpointsFor returns the paths where the volume is the visible filesystem, the set safe to unmount by path.
 func (p *Provider) visibleMountpointsFor(ctx context.Context, device string) ([]string, error) {
 	if device == "" {
 		return nil, nil

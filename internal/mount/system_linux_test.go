@@ -98,12 +98,7 @@ func TestPinDirectoryRefusesMagicLinks(t *testing.T) {
 	}
 }
 
-// TestPinnedTargetSurvivesASwap is the race the pinning exists for, made
-// deterministic. The directory is resolved, then MOVED aside and replaced by a
-// symlink aimed somewhere else, and only then is the descriptor used — which is
-// the shape of the attack: validation sees a directory, the operation sees a
-// symlink. A lexical design follows the swap. A pinned one still addresses the
-// directory it resolved.
+// TestPinnedTargetSurvivesASwap: a directory swapped for a symlink after resolution is still the one addressed.
 func TestPinnedTargetSurvivesASwap(t *testing.T) {
 	base := t.TempDir()
 	target := filepath.Join(base, "target")
@@ -121,9 +116,7 @@ func TestPinnedTargetSurvivesASwap(t *testing.T) {
 	}
 	defer func() { _ = unix.Close(fd) }()
 
-	// Swap the path: the original directory moves aside and a symlink takes its
-	// name. Moving rather than deleting keeps the original addressable, which
-	// is what lets the test say WHICH one the descriptor holds.
+	// Move the directory aside and put a symlink in its place, keeping the original addressable.
 	moved := filepath.Join(base, "moved")
 	if err := os.Rename(target, moved); err != nil {
 		t.Fatalf("Rename: %v", err)
@@ -163,8 +156,7 @@ func TestPinnedTargetSurvivesASwap(t *testing.T) {
 		t.Error("the write landed where the symlink points")
 	}
 
-	// And the swapped path no longer resolves at all — which is what a lexical
-	// design would have sailed straight through.
+	// The swapped path no longer resolves.
 	if fd2, err := pinDirectory(target); err == nil {
 		_ = unix.Close(fd2)
 		t.Error("the swapped path still resolved; a symlink was accepted as a target")
@@ -243,11 +235,7 @@ func TestMountArgumentsTreatsDefaultsAsNoOps(t *testing.T) {
 	}
 }
 
-// TestCheckAgreesWithMount is the property the pre-format guard in a provider
-// depends on: Check must accept exactly what a Mount would pin and refuse
-// exactly what it would refuse. A cheaper lookalike — an Lstat, say — passes a
-// path whose PARENT is a symlink, and a provider that formatted a volume on the
-// strength of it would have destroyed something for a mount that then failed.
+// TestCheckAgreesWithMount: Check accepts and refuses exactly what Mount would, including a symlinked parent.
 func TestCheckAgreesWithMount(t *testing.T) {
 	base := t.TempDir()
 	real := filepath.Join(base, "real")

@@ -24,18 +24,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// tryLockFile takes an exclusive advisory lock without blocking, reporting
-// whether it got one.
-//
-// The lock belongs to the open file description, not to the process, which is
-// what makes it work in both directions this provider needs: two Provider values
-// in one process hold separate descriptions and conflict, and so do two separate
-// daemons. Closing the file releases it, including when the process dies, so a
-// crash mid-operation does not leave a volume locked forever.
-// x/sys/unix rather than the syscall package: syscall.Flock is missing on some
-// unix targets — measured, a GOOS=solaris build fails on it — and this package
-// compiles for every platform even though it can only RUN on Linux. x/sys/unix
-// provides it uniformly, and it is already in the module graph.
+// tryLockFile takes a non-blocking exclusive flock on the open file description, released on close or exit; x/sys/unix because syscall.Flock is missing on some targets.
 func tryLockFile(f *os.File) (bool, error) {
 	err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 	switch {

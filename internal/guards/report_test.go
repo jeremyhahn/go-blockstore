@@ -29,12 +29,7 @@ func scannerReturning(name string, result Result, err error) Scanner {
 	}
 }
 
-// TestReportRefusesAnEmptyScannerSet is the requirement stated in #47 in its own
-// words: an empty guard set must not read as success.
-//
-// Zero scanners produce zero findings and would otherwise exit 0 — which is
-// character-for-character what a clean tree produces. The sweep that opened the
-// issue printed exactly that, and it meant "there are no guards".
+// TestReportRefusesAnEmptyScannerSet: an empty guard set must not read as success.
 func TestReportRefusesAnEmptyScannerSet(t *testing.T) {
 	var out strings.Builder
 
@@ -120,13 +115,7 @@ func TestReportSeparatesADirtyTreeFromABrokenScan(t *testing.T) {
 	})
 }
 
-// TestReportOverTheRealScannersIsTheGate is the binary's own path, run against
-// this repository — the same call `make guards` makes.
-//
-// It duplicates TestGuardsTheRepositoryIsClean on purpose, through the OTHER
-// entry point. The two exist because a gate reachable from the test binary and
-// not from the command line is a gate that runs in one of the two places it is
-// supposed to.
+// TestReportOverTheRealScannersIsTheGate runs the binary's path, the call make guards makes.
 func TestReportOverTheRealScannersIsTheGate(t *testing.T) {
 	var out strings.Builder
 	if err := Report(&out, repoRoot(t), All()); err != nil {

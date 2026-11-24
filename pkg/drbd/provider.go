@@ -49,34 +49,14 @@ const (
 const (
 	blkidNoSig = 2 // blkid: the device carries no recognized signature.
 
-	// e2fsck: errors were found and fixed. Together with 0 that is a filesystem
-	// which can now be resized; 2 and above mean errors it could not fix, an
-	// operational failure, or a check that did not finish, none of which should
-	// be followed by a resize.
+	// e2fsck exit 1: errors found and fixed; with 0 the filesystem can be resized, 2 and above cannot.
 	e2fsckCorrected = 1
 )
 
-// rollbackTimeout bounds the cleanup that unwinds a failed Provision. It is
-// generous because the commands it runs — drbdadm down, lvremove — touch the
-// kernel and the LVM metadata lock, and it is bounded at all because a cleanup
-// that hangs would hold the provider's mutex indefinitely.
+// rollbackTimeout bounds the cleanup that unwinds a failed Provision, so it cannot hold the mutex forever.
 const rollbackTimeout = 2 * time.Minute
 
-// cleanupContext detaches from the caller's context for a compensating action,
-// bounded so a cleanup cannot hang forever either.
-//
-// The most likely reason to be running one is that ctx was canceled or its
-// deadline passed partway through the operation being compensated. Reusing it
-// makes every cleanup command fail instantly — the production runner execs
-// through exec.CommandContext, so a canceled context means the process never
-// starts — and leaves behind exactly the state the cleanup exists to undo. That
-// is worse than not attempting it, because the code reads as though the state
-// were restored.
-//
-// One function rather than the expression written at each site: the three
-// callers are a provisioning rollback and two deletion paths that give back a
-// borrowed activation, and they must not drift apart on a subtlety this easy to
-// get wrong by copying.
+// cleanupContext detaches a compensating action from the caller's possibly canceled context, with its own bound.
 func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
 }
@@ -161,10 +141,7 @@ type Provider struct {
 	mountTable   MountTable
 	blockDevices BlockDevices
 
-	// injected records which seams the caller replaced, so runPreflight checks
-	// exactly the operations this provider will actually perform. A seam that
-	// was replaced is not checked: that is a derivation from the configuration,
-	// not a guess — a provider given its own Mounter does not call mount(2).
+	// injected records which seams the caller replaced, so runPreflight skips their checks.
 	injected    injectedSeams
 	secrets     SecretProvider
 	keyProvider KeyProvider
@@ -281,14 +258,7 @@ func New(settings map[string]string, opts ...Option) (*Provider, error) {
 	if p.luks == nil {
 		return nil, fmt.Errorf("%w: luks backend is nil", common.ErrInvalidArgument)
 	}
-	// A provider told to require propagation, over a mount table that cannot
-	// report it, is a configuration that cannot work — and discovering it after
-	// the first mount is worse than useless: the mount has already happened, the
-	// guard cannot judge it, and the rollback cannot identify it either, so
-	// Mount would return an error over a filesystem it left mounted. It is a
-	// startup refusal for the same reason the preflight checks are, and it is
-	// only reachable through WithMountTable: the real mountinfo.System answers
-	// the question.
+	// Requiring propagation over a mount table that cannot report it is refused at startup.
 	if !p.mountGuard().Policy.Valid() {
 		return nil, fmt.Errorf("%w: %s is %s, not one of %s",
 			common.ErrInvalidArgument, SettingMountPropagation, cfg.MountPropagation, strings.Join(mountguard.Spellings(), ", "))
@@ -303,10 +273,7 @@ func New(settings map[string]string, opts ...Option) (*Provider, error) {
 	if p.keyProvider == nil && cfg.LUKSKeyFile != "" {
 		p.keyProvider = FileKeyProvider(cfg.LUKSKeyFile)
 	}
-	// Refused at construction rather than at the first Promote. A node
-	// configured to encrypt with no way to obtain the passphrase is a
-	// deployment mistake, and finding out at the first failover is finding out
-	// at the worst possible moment.
+	// Encryption without a key source is refused at construction.
 	if cfg.Encrypted && p.keyProvider == nil {
 		return nil, fmt.Errorf("%w: %s is set but there is no way to obtain the passphrase: set %s or inject a KeyProvider",
 			common.ErrInvalidArgument, SettingEncrypted, SettingLUKSKeyFile)
@@ -331,10 +298,7 @@ func New(settings map[string]string, opts ...Option) (*Provider, error) {
 			common.ErrInvalidArgument, SettingReplicationSecretFile, SettingAllowUnauthenticatedPeers)
 	}
 
-	// 0750, not the 0755 /etc/drbd.d conventionally carries: nothing outside
-	// root and its group has any business reading a node's replication
-	// topology, and MkdirAll leaves an existing directory's mode alone, so this
-	// only applies to one this provider creates.
+	// 0750: only root and its group may read the replication topology.
 	if err := os.MkdirAll(cfg.ConfigDir, 0o750); err != nil {
 		return nil, fmt.Errorf("creating %s %q: %w", SettingConfigDir, cfg.ConfigDir, err)
 	}
@@ -342,13 +306,7 @@ func New(settings map[string]string, opts ...Option) (*Provider, error) {
 		return nil, fmt.Errorf("creating %s %q: %w", SettingStateDir, cfg.StateDir, err)
 	}
 
-	// Last, after every setting has been validated: a caller who got the
-	// configuration wrong should hear about the configuration, not about the
-	// node's capabilities. And at construction rather than at the first
-	// Provision, because what it detects is fixed when the process starts —
-	// discovering it at the first volume operation turns a deployment mistake
-	// into an outage. The capability set is derived, and it is NOT the local
-	// provider's; see requiredCapabilities.
+	// Preflight runs last, after every setting is validated; see requiredCapabilities.
 	if err := runPreflight(p.injected, cfg.Encrypted, cfg.Preflight); err != nil {
 		return nil, err
 	}
@@ -404,14 +362,7 @@ func (p *Provider) localRole(ctx context.Context, name string) (common.ReplRole,
 	return role, up, err
 }
 
-// localRoleRaw is localRole plus the role string exactly as drbdsetup reported
-// it, empty when the resource is not up.
-//
-// Delete is what needs the raw string. A role this parser does not recognize is
-// what makes it refuse, and that refusal is only actionable if it names the
-// value it could not recognize; the mapped common.ReplRoleUnknown has thrown
-// that away by then, and cannot tell an unparsed string from a literal
-// "Unknown" either.
+// localRoleRaw is localRole plus drbdsetup's role string, empty when the resource is not up.
 func (p *Provider) localRoleRaw(ctx context.Context, name string) (common.ReplRole, string, bool, error) {
 	rs, up, err := p.resourceStatus(ctx, name)
 	if err != nil || !up {
@@ -448,15 +399,7 @@ func (p *Provider) drbdadm(ctx context.Context, args ...string) error {
 	return err
 }
 
-// createMetadata initializes DRBD's internal metadata on the backing device.
-//
-// The --force here suppresses drbdmeta's confirmation prompt about overwriting
-// what it finds on the device. That device was created by the immediately
-// preceding lvcreate, so anything on it is a remnant of a previous logical
-// volume that occupied the same extents — LVM zeroes only the first sectors of
-// a new LV, which is not where internal metadata lives. This force destroys
-// nothing a caller has; it is unrelated to the promotion force this provider
-// refuses to expose. See the package doc.
+// createMetadata initializes DRBD internal metadata; --force only skips drbdmeta's overwrite prompt on the fresh LV.
 func (p *Provider) createMetadata(ctx context.Context, res string) error {
 	if err := p.drbdadm(ctx, "--", "--force", "create-md", res); err != nil {
 		return fmt.Errorf("creating drbd metadata for %q: %w", res, err)
@@ -532,15 +475,7 @@ func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (commo
 	if spec.SizeBytes <= 0 {
 		return common.Volume{}, fmt.Errorf("%w: size must be positive, got %d", common.ErrInvalidArgument, spec.SizeBytes)
 	}
-	// The backing volume is created at backingBytes(spec.SizeBytes, encrypted),
-	// and those additions have to be representable. A signed overflow in Go
-	// wraps rather than trapping, so without this a size near math.MaxInt64
-	// would reach lvcreate as a NEGATIVE byte count. It is malformed input
-	// rather than an unsupported operation: no backend could back it, and the
-	// caller has to change the number rather than choose another provider.
-	// Extent rounding is lvcreate's here, so the bound is the header and
-	// metadata additions alone; the restore and resize paths, which round in
-	// Go, bound that too.
+	// Refuse sizes whose header and metadata additions would overflow int64.
 	if limit := maxDataBytes(0, p.cfg.Encrypted); spec.SizeBytes > limit {
 		return common.Volume{}, fmt.Errorf("%w: size %d exceeds the largest usable capacity this provider can back, %d (a larger request overflows the backing size once DRBD's internal metadata, and the LUKS2 header on an encrypted provider, is added)",
 			common.ErrInvalidArgument, spec.SizeBytes, limit)
@@ -548,34 +483,17 @@ func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (commo
 	if err := validateFSType(spec.FSType); err != nil {
 		return common.Volume{}, err
 	}
-	// Every volume is carved out of the one configured volume group, and this
-	// provider has no notion of tiers. Taking a storage class and ignoring it
-	// would return a Volume whose Spec names a class the volume is not on — a
-	// description of the volume that is simply untrue. It is ErrUnsupported
-	// rather than malformed input: the request is well formed, and a backend
-	// with tiers could serve it.
+	// This provider has no storage classes, so a requested class is ErrUnsupported.
 	if spec.StorageClass != "" {
 		return common.Volume{}, fmt.Errorf("%w: the drbd provider has no storage classes; volume group %q backs every volume, and StorageClass %q cannot be honored",
 			common.ErrUnsupported, p.cfg.VG, spec.StorageClass)
 	}
-	// A restore is a byte-for-byte copy, so the restored volume carries the
-	// SNAPSHOT's filesystem whatever the spec says. Accepting an FSType here
-	// and recording it would hand back a Volume whose Spec claims "xfs" over an
-	// ext4 image, and every later Mount and Resize would reach for the wrong
-	// tooling on the strength of it.
+	// A restore carries the snapshot's filesystem, so FSType must be empty.
 	if spec.SourceSnapshotID != "" && spec.FSType != "" {
 		return common.Volume{}, fmt.Errorf("%w: FSType %q cannot be applied to a restore from %q; the restored volume carries the snapshot's filesystem",
 			common.ErrInvalidArgument, spec.FSType, spec.SourceSnapshotID)
 	}
-	// This provider has exactly one shape: the two-node pair the resource
-	// template describes, so its natural count is two.
-	//
-	// The three branches are VolumeSpec.Replicas's, and the distinction between
-	// the last two is load-bearing. A negative count is meaningless anywhere
-	// and is a malformed request. A positive count this provider cannot honor
-	// is a WELL-FORMED request that the local provider serves happily, so the
-	// caller's fix is to choose that one — which is what ErrUnsupported means,
-	// and what reporting a bad argument would hide.
+	// The natural count is two: 0 means two, negative is ErrInvalidArgument, any other count ErrUnsupported.
 	switch {
 	case spec.Replicas < 0:
 		return common.Volume{}, fmt.Errorf("%w: replicas must not be negative, got %d", common.ErrInvalidArgument, spec.Replicas)
@@ -639,62 +557,19 @@ func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (commo
 		Incomplete: true,
 	}
 
-	// The record is written first so that the minor and port it holds are
-	// reserved for the rest of this call and for any concurrent one, and marked
-	// incomplete so that a concurrent Status or Mount still sees no volume.
-	// Every failure below unwinds it.
+	// Write the record first, marked incomplete, to reserve the minor and port; every failure below unwinds it.
 	if err := p.writeMeta(&meta); err != nil {
 		return common.Volume{}, err
 	}
 
 	var lvCreated, resWritten bool
 
-	// rollback undoes what has been built so far and returns what it could not
-	// undo, in reverse order of construction.
-	//
-	// It runs on a context detached from the caller's. The most likely reason
-	// to be here is that ctx was canceled or its deadline passed partway
-	// through a long dd or initial "up" — and reusing it would make every
-	// cleanup command fail instantly, leaving exactly the half-built resource
-	// this exists to remove.
-	//
-	// The teardown is attempted whenever the resource file exists, not only
-	// once "drbdadm up" has returned: an up that fails partway can leave the
-	// device attached, and "drbdadm down" on a resource that never came up
-	// succeeds anyway.
-	//
-	// What it could not undo is joined to the failure that triggered it rather
-	// than discarded. A cleanup that itself failed has left a logical volume or
-	// a resource file on the node, and an operator who is only told about the
-	// original failure has no reason to go looking for it.
-	//
-	// The two files are removed only once the teardown they describe has been
-	// CONFIRMED. Removing them regardless is worse than leaving them, in three
-	// separate ways: the resource file is what drbdadm needs to take a resource
-	// down, so deleting it after "drbdadm down" failed strips the node of the
-	// means to clean up a resource that may still be live; the state record is
-	// what makes the reservation visible to listMeta, so deleting it frees a
-	// minor and a port that a still-running resource is holding, and the next
-	// Provision collides with it; and both together are the only evidence that
-	// anything was left behind at all.
-	//
-	// Retaining them is therefore the safe direction, and it composes with
-	// listMeta's fail-closed read: a record that could not be removed and a
-	// record that cannot be parsed both stop the allocator from reusing what
-	// they describe.
-	//
-	// For the same reason the steps are ordered and the order is enforced: a
-	// "drbdadm down" that failed stops the cleanup before it reaches lvremove,
-	// because the resource it could not take down may still be attached to the
-	// volume that removal would destroy.
+	// rollback undoes the build in reverse order on a detached context, stops before lvremove if drbdadm down fails, keeps the files unless teardown is confirmed, and returns what it could not undo.
 	rollback := func() error {
 		cleanupCtx, cancel := cleanupContext(ctx)
 		defer cancel()
 
-		// incomplete reports a cleanup that stopped early or partly failed,
-		// naming everything still on the node so an operator has somewhere to
-		// start. The two files are always among them: reaching here means they
-		// were kept.
+		// incomplete reports a partial cleanup, naming everything left on the node.
 		incomplete := func(errs []error, retained []string) error {
 			if resWritten {
 				retained = append(retained, "resource file "+p.resPath(meta.Name))
@@ -711,15 +586,7 @@ func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (commo
 		var retained []string
 		if resWritten {
 			if downErr := p.resourceDown(cleanupCtx, meta.Name); downErr != nil {
-				// Stop the cleanup here rather than carrying on to lvremove.
-				// A resource that would not go down may still be attached to
-				// this logical volume, and the removal is "lvremove --force",
-				// which is the flag that talks past a refusal. Whether LVM
-				// declines to pull a device out from under an open holder is
-				// its business and its version's; a rollback that only avoids
-				// destroying live data because something downstream said no is
-				// not relying on its own ordering, and ordering is the part
-				// this code controls.
+				// Stop here: a resource that would not go down may still be attached to this LV.
 				errs = append(errs, downErr)
 				retained = append(retained, fmt.Sprintf("drbd resource %q may still be up", meta.Name))
 				if lvCreated {
@@ -754,9 +621,7 @@ func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (commo
 		return incomplete(errs, retained)
 	}
 
-	// A restore creates the backing volume at the SOURCE's size and grows to the
-	// requested one after bring-up; see restorePlan for why the copy cannot go
-	// straight into a longer device.
+	// A restore creates the backing volume at the source's size and grows after bring-up; see restorePlan.
 	createSize := backingBytes(meta.SizeBytes, p.cfg.Encrypted)
 	if plan != nil {
 		createSize = plan.backingSize
@@ -785,10 +650,7 @@ func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (commo
 		return common.Volume{}, errors.Join(err, rollback())
 	}
 
-	// A restore that asked for more than the source held is grown now, through
-	// the same sequence a caller's Resize runs. The resource was brought up
-	// immediately above, so the up-first guard that refuses to extend a
-	// detached resource is satisfied rather than bypassed.
+	// Grow a restore that asked for more than the source, through the Resize sequence.
 	if plan != nil && plan.grow {
 		if growErr := p.resizeLocked(ctx, &meta, spec.SizeBytes); growErr != nil {
 			return common.Volume{}, errors.Join(growErr, rollback())
@@ -805,8 +667,7 @@ func (p *Provider) Provision(ctx context.Context, spec common.VolumeSpec) (commo
 	return common.Volume{ID: meta.Name, Spec: spec}, nil
 }
 
-// Labels through which a caller pins the two values that BOTH halves of a pair
-// must agree on. See resolveMinorAndPort.
+// Labels that pin the minor and port both nodes of a pair must agree on; see resolveMinorAndPort.
 const (
 	// LabelMinor pins the DRBD device minor.
 	LabelMinor = "drbd.minor"
@@ -815,31 +676,10 @@ const (
 	LabelPort = "drbd.port"
 )
 
-// labelPrefix namespaces this provider's labels. An unrecognized label under it
-// is rejected rather than ignored: a mistyped "drbd.prt" that silently fell
-// back to local allocation is precisely the failure the labels exist to
-// prevent, and it would not show up until the two nodes failed to connect.
+// labelPrefix namespaces this provider's labels; an unrecognized label under it is rejected.
 const labelPrefix = "drbd."
 
-// resolveMinorAndPort decides the device minor and replication port for a new
-// volume.
-//
-// Both values are written into the resource file at resource scope, which means
-// both halves of the pair use them: the port appears in each host's address,
-// and the minor is the one device number the resource has. The two nodes must
-// therefore agree, and this provider allocates from its OWN state directory —
-// so two nodes whose state directories have drifted, because a volume was
-// created on one and not the other or a provision failed halfway, would pick
-// different numbers for the same volume and the resource would never connect.
-//
-// A caller that coordinates the pair — the HA controller, which holds the
-// Coordinator and can allocate cluster-wide — pins both through the LabelMinor
-// and LabelPort labels, and both nodes then render identical files. Local
-// allocation remains the default for a pair driven by hand, where the operator
-// is the thing keeping the two sides in step.
-//
-// Pinning one and not the other is refused, for the same reason a half-given
-// node id is: it mixes a coordinated value with a locally invented one.
+// resolveMinorAndPort uses LabelMinor and LabelPort when both are pinned, else allocates locally; pinning only one is refused.
 func (p *Provider) resolveMinorAndPort(spec *common.VolumeSpec, existing []resourceMeta) (minor, port int, err error) {
 	for k := range spec.Labels {
 		if strings.HasPrefix(k, labelPrefix) && k != LabelMinor && k != LabelPort {
@@ -890,22 +730,7 @@ func parseLabelInt(label, raw string, min, max int) (int, error) {
 	return n, nil
 }
 
-// resolveSnapshot turns a caller-supplied snapshot id into the logical volume
-// it names, having proved that the snapshot is one this provider took.
-//
-// Three things must hold, and a caller-supplied id is not trusted on any of
-// them. The id must parse and name this provider's volume group. The volume
-// half must be a volume this provider has a record of, so that an id shaped
-// like ours cannot reach an LV that merely happens to be named that way. And
-// the LV must be an LVM snapshot whose origin is that volume, so that an
-// ordinary logical volume with a snapshot-shaped name is not mistaken for one.
-//
-// A failure on the last two is common.ErrSnapshotNotFound rather than a
-// permission-flavored error: from the caller's side, a snapshot this provider
-// did not take is a snapshot this provider does not have.
-//
-// It returns the owning volume's record alongside the snapshot, because a
-// restore needs it: the copy carries that volume's filesystem.
+// resolveSnapshot returns the snapshot LV and its owning volume's record, or common.ErrSnapshotNotFound if this provider did not take it.
 func (p *Provider) resolveSnapshot(ctx context.Context, snapID common.SnapshotID) (lvEntry, resourceMeta, error) {
 	volLV, snapName, err := p.parseSnapshotID(string(snapID))
 	if err != nil {
@@ -939,21 +764,7 @@ func (p *Provider) resolveSnapshot(ctx context.Context, snapID common.SnapshotID
 	return entry, owner, nil
 }
 
-// restorePlan is how a restore is carried out.
-//
-// A restore is a whole-device copy, so the destination's backing volume is
-// created at the SOURCE's size — not at the size the caller asked for. With
-// internal metadata, DRBD keeps its metadata at the END of the backing device,
-// and copying a shorter source into a longer destination would land the
-// source's metadata partway through what the new volume presents as data, where
-// create-md, which writes at the destination's own end, never touches it.
-//
-// A larger volume is then reached by GROWING, through the same sequence a
-// caller's Resize runs: lvextend, drbdadm resize — which relocates the metadata
-// to the new end because that is its job — and the filesystem where it can be
-// grown. Which is exactly what this provider used to tell callers to do for
-// themselves, in an error. Doing it here is the same operation with the caller
-// left out of it.
+// restorePlan copies into a backing volume of the source's size, then grows through the Resize sequence, because DRBD metadata sits at the device end.
 type restorePlan struct {
 	// device is the snapshot's logical volume, the source of the copy.
 	device string
@@ -987,36 +798,19 @@ func (p *Provider) restoreSource(ctx context.Context, spec *common.VolumeSpec) (
 			spec.SourceSnapshotID, entry.Name, common.ErrUnsupported)
 	}
 
-	// The destination's backing size — data plus DRBD metadata, rounded up to a
-	// whole extent — has to be representable before it is computed. Past the
-	// bound, backingBytes or the rounding on top of it wraps NEGATIVE, and the
-	// src > dst comparison below would read a wrapped-negative destination as a
-	// shrink the caller never asked for. Malformed input rather than an
-	// unsupported restore: no volume group could hold it.
+	// Refuse sizes whose backing size would overflow.
 	if limit := maxDataBytes(entry.extentSizeBytes(), p.cfg.Encrypted); spec.SizeBytes > limit {
 		return nil, fmt.Errorf("%w: size %d exceeds the largest usable capacity representable on this volume group, %d (extents are %d bytes and DRBD's internal metadata, and the LUKS2 header on an encrypted provider, is added on top)",
 			common.ErrInvalidArgument, spec.SizeBytes, limit, entry.extentSizeBytes())
 	}
-	// Both are logical volumes, whose sizes LVM rounds up to the volume group's
-	// extent, so the comparison is against the size lvcreate would give the
-	// destination rather than the unrounded request — comparing a rounded
-	// origin against an unrounded request reads a restore at exactly the
-	// original size as a shrink. The conversion is this provider's, header
-	// included when it encrypts: a snapshot of an encrypted volume has the
-	// encrypted backing size as its origin, so a same-size restore of it lands
-	// on exactly that figure and is neither a grow nor a shrink.
+	// Compare against the extent-rounded size lvcreate would give the destination, header included when encrypted.
 	dst := roundUpTo(backingBytes(spec.SizeBytes, p.cfg.Encrypted), entry.extentSizeBytes())
 	if src > dst {
 		return nil, fmt.Errorf("%w: restoring snapshot %q needs a %d-byte backing volume, but %d usable (%d backing) was requested: this provider does not shrink during restore",
 			common.ErrUnsupported, spec.SourceSnapshotID, src, spec.SizeBytes, dst)
 	}
 
-	// A restore that would have to GROW runs resizeLocked once the resource is
-	// up, on an encrypted provider like any other. The restored resource comes
-	// up Secondary, its container closed, so the grow it runs is the deferring
-	// one: the device grows, the record follows, and the filesystem — the
-	// source's, copied byte for byte — is owed a grow that the first Promote
-	// sizes the mapping for and the first Mount pays. See FSGrowPending.
+	// A growing restore runs resizeLocked after bring-up; the filesystem grow is deferred to the first Mount.
 	return &restorePlan{
 		device:      p.lvPath(entry.Name),
 		fsType:      owner.FSType,
@@ -1052,18 +846,7 @@ func (p *Provider) Attach(ctx context.Context, volID string, node common.NodeID)
 		return common.AttachInfo{}, err
 	}
 
-	// Serialized with Delete. This method has no precondition of its own to
-	// invalidate, which is why it looks safe unlocked and is not: the check it
-	// breaks belongs to Delete, which observes that a resource is not up, skips
-	// the teardown on that basis, and then removes the backing volume and the
-	// state files. A "drbdadm up" anywhere in that span brings the resource up
-	// onto storage that is about to be lvremove'd, and hands this caller a
-	// device path for a volume whose record no longer exists.
-	//
-	// The LOOKUP is inside the lock, not just the drbdadm call. Reading the
-	// record first and locking afterwards leaves the same bug with extra steps:
-	// the wait ends after the delete has finished, and this method then acts on
-	// a record that no longer exists on disk.
+	// Lookup and up are serialized with Delete, which removes storage after seeing the resource down.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1072,17 +855,7 @@ func (p *Provider) Attach(ctx context.Context, volID string, node common.NodeID)
 		return common.AttachInfo{}, err
 	}
 
-	// Attaching a resource that is already up converges rather than running
-	// "drbdadm up" a second time. Detach's counterpart of this — returning nil
-	// when the resource is already down — has been here from the start, and an
-	// Attach that does not converge in the same way is the asymmetry, not this.
-	//
-	// It is also the normal path: Provision brings the resource up before it
-	// returns, so a caller following the contract's Provision, Attach, Mount
-	// order arrives here with the resource already up. Whether a repeated
-	// "drbdadm up" is a no-op or an error on a real node is a question this
-	// removes rather than answers; it has never been exercised against
-	// hardware, so it is not a question worth leaving on that path.
+	// An already-up resource converges without a second drbdadm up.
 	if _, up, statusErr := p.resourceStatus(ctx, meta.Name); statusErr != nil {
 		return common.AttachInfo{}, statusErr
 	} else if up {
@@ -1111,16 +884,7 @@ func (p *Provider) Detach(ctx context.Context, volID string, node common.NodeID)
 		return nodeErr
 	}
 
-	// Serialized with Promote for the reason Snapshot is serialized with
-	// Demote, in the opposite direction: reading the role and taking the
-	// resource down are two steps, and a promotion between them means this
-	// method tears down a device on the strength of a precondition that stopped
-	// holding — the caller of Promote was told its volume is Primary and the
-	// device is gone underneath it. Checking that a volume is not writable does
-	// not keep it that way; the lock does.
-	//
-	// The lookup is inside the lock for the reason given in Attach: a record
-	// read before the wait can have been deleted by the time the wait ends.
+	// Serialized with Promote so the role cannot change between check and teardown; lookup inside the lock.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1143,12 +907,7 @@ func (p *Provider) Detach(ctx context.Context, volID string, node common.NodeID)
 		return fmt.Errorf("volume %q: drbdsetup reports role %q: %w", meta.Name, rawRole, ErrRoleUnknown)
 	}
 
-	// Converging rather than expected: a Secondary reached through Demote has
-	// no mapping left, because Demote closes it and DRBD would not have
-	// demoted otherwise. What this covers is the mapping nobody closed — a run
-	// that ended between the two, an operator who opened one by hand — and it
-	// has to go before the resource does, since an open mapping holds the
-	// device and fails the drbdadm down.
+	// Close any mapping left open before taking the resource down.
 	if err := p.closeContainer(ctx, &meta); err != nil {
 		return err
 	}
@@ -1184,20 +943,7 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 		return fsErr
 	}
 
-	// The whole method is serialized, with the LOOKUP inside, and the reason is
-	// identity rather than role. This once relied on failing closed: a demotion
-	// between the Primary check and the open makes the open fail, because DRBD
-	// refuses every open of a Secondary. That argument is sound and it is not
-	// enough, because it only covers the volume STAYING the volume.
-	//
-	// A record read before the lock names a minor, and a minor is reusable. Let
-	// Delete free this volume's record and a following Provision take the same
-	// number — which the allocator will do, and which a caller can pin outright
-	// — and every step below is then pointed at /dev/drbd<minor> belonging to a
-	// DIFFERENT volume. The probe reads it, and if it reads as empty the format
-	// destroys it. Failing closed on the role does not help: the replacement is
-	// perfectly happy to be Primary, so the check passes and the mkfs proceeds
-	// against a volume this call never looked up.
+	// Serialized with the lookup inside, so a reused minor cannot point the mount at another volume.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1218,37 +964,18 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 		return primaryErr
 	}
 
-	// And that the container is open, which Primary implies in the ordinary
-	// case and does not guarantee. Checked before the format for the reason the
-	// target is: ensureFilesystem writes to the plaintext device, and a device
-	// node that is not there is not a mkfs to attempt and hope for a legible
-	// error from. A no-op for an unencrypted volume.
+	// Require an open container before the format; a no-op for an unencrypted volume.
 	if unlockErr := p.requireContainerOpen(ctx, &meta); unlockErr != nil {
 		return unlockErr
 	}
 
-	// Before the format, not merely before the mount. Mount creates a
-	// filesystem on an empty device, and that is the destructive step: a
-	// request that is going to fail on its target must fail BEFORE it, or a
-	// rejected call still leaves the volume formatted.
-	//
-	// It is the SAME resolution the mount will do — mount.Check pins the target
-	// exactly as Mount would and lets it go — because a cheaper lookalike
-	// diverges. An Lstat here would pass a path whose PARENT is a symlink,
-	// which the pin then refuses, and the format would already have happened.
-	//
-	// This is still an ordering control rather than a security one: passing
-	// here does not make the later mount safe, since the path can be swapped in
-	// between. Mount resolves again and mounts against what it pinned itself.
+	// Check the target with mount.Check before the format; Mount pins it again.
 	if targetErr := mount.Check(target); targetErr != nil {
 		return fmt.Errorf("%w: mount target %q: %w", common.ErrInvalidArgument, target, targetErr)
 	}
 
 	dev := p.fsDevice(&meta)
-	// The type that comes back is the one on the device, which may not be the
-	// one that went in: a volume formatted by an attempt that failed before
-	// recording carries a filesystem neither the record nor the caller knows
-	// about, and mounting it as anything else fails.
+	// The returned type is the one on the device.
 	onDisk, err := p.ensureFilesystem(ctx, &meta, fsType, opts.ReadOnly)
 	if err != nil {
 		return err
@@ -1260,27 +987,12 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 		return fmt.Errorf("mounting volume %q at %q: %w", meta.Name, target, err)
 	}
 
-	// The mount exists in THIS namespace now. Whether it exists in the
-	// workload's is a different question, and the only moment it can be asked is
-	// this one: propagation is inherited from the parent at the instant mount(2)
-	// is called, so there was nothing to inspect before, and by the time a
-	// caller notices the workload's directory is empty the answer is expensive.
-	//
-	// Off unless the deployment asked for it; see MountPropagationPolicy. A
-	// refusal unwinds the mount rather than leaving one the caller was told did
-	// not happen.
+	// Check propagation now, when it is set; off unless configured (MountPropagationPolicy), and a refusal unwinds the mount.
 	if id, finding := p.verifyMountPropagation(ctx, dev, target); finding != nil {
 		return p.unwindUnverifiedMount(ctx, dev, target, id, finding)
 	}
 
-	// A grow the record owes is paid HERE, after the mount, because this is
-	// the first point at which both filesystems this package manages can be
-	// grown online: resize2fs against a mounted ext4 needs no check, and
-	// xfs_growfs has no other form. It is not paid at Promote, where the only
-	// ext4 route is a forced e2fsck of the whole filesystem in the failover
-	// path and XFS cannot be grown at all, and the record cannot even be sure
-	// the debt is real — see FSGrowPending. A mount that returns an error has
-	// mounted nothing, the same promise the propagation check keeps.
+	// Pay a deferred grow after mounting, where ext4 and XFS both grow online; see FSGrowPending.
 	if meta.FSGrowPending {
 		if err := p.payDeferredGrow(ctx, &meta, target); err != nil {
 			return err
@@ -1289,19 +1001,7 @@ func (p *Provider) Mount(ctx context.Context, volID, target string, opts common.
 	return nil
 }
 
-// payDeferredGrow grows the filesystem Mount just mounted, because a Resize
-// left it behind its device, and clears the record's debt.
-//
-// An error unwinds the mount. The two silent alternatives are both wrong
-// answers: mounted behind an error reports a mount that did not happen, and
-// success with the grow undone reports a size the filesystem never reached.
-// The debt is left standing either way, so the next Mount tries again — and
-// for a stale mapping the error names what has to happen first.
-//
-// The unwind runs on a context of its own, like Promote's rollback: the
-// likeliest reason to be unwinding is that ctx died partway through the grow,
-// and an unmount on that context fails before it starts, leaving exactly the
-// mount this reports as undone.
+// payDeferredGrow grows the just-mounted filesystem and clears the debt; on error it unmounts on its own context and leaves the debt.
 func (p *Provider) payDeferredGrow(ctx context.Context, meta *resourceMeta, target string) error {
 	grown, err := p.growFilesystem(ctx, meta)
 	if err == nil && grown {
@@ -1309,10 +1009,7 @@ func (p *Provider) payDeferredGrow(ctx context.Context, meta *resourceMeta, targ
 		err = p.writeMeta(meta)
 	}
 	if err == nil && !grown {
-		// Unreachable by construction — mounted ext4 and xfs both grow — and
-		// a filesystem left short behind a successful mount is precisely the
-		// silent answer this refuses to give, so it is an error rather than a
-		// pass if the construction ever changes.
+		// Mounted ext4 and xfs always grow; anything else is an error.
 		err = fmt.Errorf("volume %q: the grow it owes could not be performed even mounted at %q", meta.Name, target)
 	}
 	if err == nil {
@@ -1326,21 +1023,7 @@ func (p *Provider) payDeferredGrow(ctx context.Context, meta *resourceMeta, targ
 	return err
 }
 
-// probeDevice reports what blkid recognizes on the device: the filesystem type
-// if there is one, and whether the device is empty of ANY signature.
-//
-// Both answers come from one probe, and both are needed. Emptiness decides
-// whether to format, and it asks for everything rather than filtering to the
-// filesystem type — a device holding a partition table and no filesystem
-// reports only PTTYPE, so a TYPE-filtered probe exits successfully with empty
-// output, indistinguishable from an empty device and enough to format over
-// somebody's partitioned volume. The filesystem type is what the record is
-// reconciled against, so a device formatted by an attempt that then failed to
-// record it does not stay mis-described forever.
-//
-// Only blkid's "nothing found" exit status counts as empty. A successful exit
-// means it recognized something, and any other failure means the answer is
-// unknown; neither may lead to a mkfs.
+// probeDevice reports the filesystem type blkid finds and whether the device carries no signature at all; only blkid's nothing-found exit counts as empty.
 func (p *Provider) probeDevice(ctx context.Context, dev string) (fsType string, empty bool, err error) {
 	out, err := p.runner.Run(ctx, binBlkid, "-p", "-o", "export", dev)
 	if err != nil {
@@ -1349,9 +1032,7 @@ func (p *Provider) probeDevice(ctx context.Context, dev string) (fsType string, 
 		}
 		return "", false, fmt.Errorf("probing %q: %w", dev, err)
 	}
-	// export format is KEY=VALUE per line. TYPE is the filesystem; a device
-	// with only PTTYPE has a partition table and no filesystem, which is not
-	// empty and not something to reconcile a record against.
+	// export format is KEY=VALUE per line; PTTYPE alone means a partition table, not empty.
 	for _, line := range strings.Split(string(out), "\n") {
 		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "TYPE="); ok {
 			return strings.Trim(value, `"`), false, nil
@@ -1360,50 +1041,16 @@ func (p *Provider) probeDevice(ctx context.Context, dev string) (fsType string, 
 	return "", false, nil
 }
 
-// ensureFilesystem creates the filesystem on a device that carries nothing,
-// records what is on it either way, and RETURNS the type that is actually
-// there.
-//
-// Returning it is not incidental. The record and the device can disagree — an
-// earlier attempt formats and fails before recording — and reconciling the
-// record while the caller went on to mount with the type it walked in holding
-// would fix the bookkeeping and then fail the mount for the same reason it was
-// wrong in the first place.
-//
-// The steps are ONE critical section, and that is the whole reason this is a
-// function. Probing, formatting and recording are separately harmless and
-// collectively destructive: two concurrent first mounts that both probe before
-// either formats will both run mkfs on the same device, and with different
-// filesystems if their callers asked for different ones. A provider documented
-// as safe for concurrent use cannot leave that open.
-//
-// The lock covers the mkfs, which is not free — it is held for as long as
-// making a filesystem takes. That is deliberate: it happens once in a volume's
-// life, and the alternative is a race whose outcome is a corrupted volume. The
-// MOUNT is outside it, so the slow, repeatable part does not serialize the
-// provider.
+// ensureFilesystem probes, formats an empty device and records the type in one critical section, and returns the type actually on the device.
 func (p *Provider) ensureFilesystem(ctx context.Context, meta *resourceMeta, fsType string, readOnly bool) (string, error) {
-	// The caller holds p.mu. This used to take it here, over the probe, the
-	// format and the record write, because those three are what must not
-	// interleave with each other. Mount now holds it across its whole body —
-	// the lookup included, so that meta names a volume that still exists — and
-	// this is its only caller, so taking it again would deadlock.
+	// The caller holds p.mu.
 	dev := p.fsDevice(meta)
 	found, empty, err := p.probeDevice(ctx, dev)
 	if err != nil {
 		return "", err
 	}
 	if !empty {
-		// The device already carries a filesystem, and the record may not say
-		// so: an earlier attempt can format and then fail before recording it,
-		// and without this that volume stays described as raw forever — its
-		// next Mount has no filesystem type to use and its next Resize grows
-		// nothing. Reconciling here converges on the retry.
-		//
-		// Only a filesystem this provider understands. Something else on the
-		// device is a fact worth not overwriting the record with, since the
-		// record drives mkfs and grow decisions that only make sense for the
-		// two it supports.
+		// Reconcile the record with a supported filesystem already on the device, e.g. from an attempt that failed before recording.
 		if _, supported := supportedFilesystems[found]; supported {
 			// What is on the device wins over what the caller asked for and
 			// over what the record said, because it is the only one of the
@@ -1427,18 +1074,11 @@ func (p *Provider) ensureFilesystem(ctx context.Context, meta *resourceMeta, fsT
 		return "", mkfsErr
 	}
 
-	// What is on the device is now known exactly, and it may not be what the
-	// record says: MountOptions.FSType overrides the recorded type, so a volume
-	// provisioned as ext4 — or as a raw device — can be formatted here as
-	// something else.
+	// MountOptions.FSType may override the recorded type.
 	return fsType, p.reconcileFSType(meta.Name, fsType)
 }
 
-// reconcileFSType records the filesystem now known to be on a volume.
-//
-// The record is re-read rather than written back from a caller's copy, which
-// may be stale — writing that back would undo a size a concurrent Resize had
-// just recorded. Callers hold the provider lock.
+// reconcileFSType re-reads the record and stores the filesystem now on the volume; callers hold the provider lock.
 func (p *Provider) reconcileFSType(name, fsType string) error {
 	current, err := p.readMeta(name)
 	if err != nil {
@@ -1475,17 +1115,7 @@ func (p *Provider) Unmount(ctx context.Context, volID, target string) error {
 		return targetErr
 	}
 
-	// Serialized with the lookup inside, for Mount's reason. The device
-	// comparison below looks like it already settles identity, and it does not:
-	// what it compares is the MINOR, and the minor is the thing that gets
-	// recycled. A record read before the lock, whose volume is then deleted and
-	// whose number a new volume takes, matches that new volume's device exactly
-	// — so the check passes and this unmounts a filesystem belonging to someone
-	// it was never asked about, out from under whatever is using it.
-	//
-	// With the lookup inside the lock the deleted volume is simply not found,
-	// which is the honest answer, and the comparison goes back to doing the job
-	// it was written for: refusing a target that holds some OTHER live volume.
+	// Serialized with the lookup inside, so a recycled minor cannot match another volume's device.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1499,10 +1129,7 @@ func (p *Provider) Unmount(ctx context.Context, volID, target string) error {
 		return err
 	}
 	if !mounted {
-		// Either nothing is mounted at the target or something else is. Neither
-		// is an error by contract, and neither unmounts anything: this provider
-		// unmounts its own volume, and another device is emphatically not ours
-		// to take out from under whoever is using it.
+		// Nothing or another device is mounted at the target; neither is an error and nothing is unmounted.
 		return nil
 	}
 
@@ -1512,36 +1139,12 @@ func (p *Provider) Unmount(ctx context.Context, volID, target string) error {
 	return nil
 }
 
-// mountedAt reports whether dev — this volume's device — is mounted at target.
-//
-// It asks which paths the DEVICE is mounted at rather than which device is
-// mounted at the path, because the answer to the second question is a string:
-// the mount source is whichever of the device's names was used to mount it, and
-// a DRBD device has several — /dev/drbdN, /dev/drbd/by-res/<res>/0,
-// /dev/drbd/by-disk/... . Comparing that string against the one name this
-// provider spells would read a mount made through an alias as belonging to
-// somebody else, and quietly not unmount a filesystem it was asked to unmount.
-// Matching by the device number, which is what MountPointsFor does, has no such
-// hole.
-//
-// A device node that does not exist is not an error: the resource is down, so
-// nothing of this volume is mounted anywhere, which is the same converging
-// no-op as a target it is not mounted at. Every other failure — a mount table
-// that could not be read above all — stops the unmount, because "not mounted"
-// is exactly the answer a teardown acts on.
+// mountedAt reports whether dev is mounted and visible at target, matching by device number; a missing device node means not mounted.
 func (p *Provider) mountedAt(ctx context.Context, dev, target string) (bool, error) {
-	// Visible, not merely mounted: umount(2) detaches whatever is visible at
-	// the path it is given, so a target this volume has been over-mounted at is
-	// one where unmounting takes down somebody else's filesystem and leaves
-	// this one where it was. That is not mounted "at" the target in any sense
-	// this method should answer yes to.
+	// Visible, not merely mounted: umount(2) detaches what is visible at the path.
 	targets, err := p.mountTable.VisibleMountPointsFor(ctx, dev)
 	if err != nil {
-		// Only the DEVICE being absent converges. os.ErrNotExist alone is too
-		// broad a test: a mount table that could not be opened reports the same
-		// thing about /proc/self/mountinfo, and reading THAT as "not mounted"
-		// is the fail-open this whole change removed. The error type is what
-		// separates them.
+		// Only a missing device converges; an unreadable mount table is an error.
 		var deviceErr *mountinfo.DeviceError
 		if errors.As(err, &deviceErr) && errors.Is(err, os.ErrNotExist) {
 			return false, nil
@@ -1551,11 +1154,7 @@ func (p *Provider) mountedAt(ctx context.Context, dev, target string) (bool, err
 	return slices.Contains(targets, target), nil
 }
 
-// mountTarget returns where the device is mounted, if it is. A device mounted
-// at more than one path yields the first, which is all the callers here need:
-// one asks whether it is mounted at all, the other wants a path to hand
-// xfs_growfs, and growing through any of a filesystem's mount points grows the
-// filesystem.
+// mountTarget returns the first path the device is mounted at, if any.
 func (p *Provider) mountTarget(ctx context.Context, dev string) (string, bool, error) {
 	targets, err := p.mountTable.MountPointsFor(ctx, dev)
 	if err != nil {
@@ -1638,13 +1237,7 @@ func (p *Provider) Resize(ctx context.Context, volID string, newSize int64) erro
 	return p.resizeLocked(ctx, &meta, newSize)
 }
 
-// resizeLocked is Resize with the lock already held and the volume already
-// looked up.
-//
-// It exists because a restore into a larger volume finishes by growing, and
-// Provision holds the lock throughout — so the grow has to be the SAME sequence
-// a caller's Resize would run, not a second implementation of it that could
-// drift from the one that knows about metadata at the end of the device.
+// resizeLocked is Resize with the lock held and the volume looked up, shared with a growing restore.
 func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newSize int64) error {
 	meta := *metaPtr
 	if newSize <= 0 {
@@ -1653,27 +1246,9 @@ func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newS
 	if newSize < meta.SizeBytes {
 		return fmt.Errorf("%w: volume %q is %d bytes and this provider does not shrink", common.ErrUnsupported, meta.Name, meta.SizeBytes)
 	}
-	// A request equal to the recorded size is NOT a no-op. Growing the device
-	// and growing the filesystem on it are two halves of one operation, and the
-	// second half can fail on its own — an unmounted XFS volume, a Secondary,
-	// an e2fsck that found something. Returning early here would report success
-	// over a filesystem still at its old size and leave no way to finish the
-	// job. Every step below is idempotent, so a repeat costs a few commands and
-	// completes what the first attempt could not.
+	// An equal size is not a no-op: every step is idempotent and the repeat finishes a partial resize.
 
-	// The resource has to be UP before anything is extended.
-	//
-	// drbdadm resize only works on a running resource, and the backing volume
-	// is where DRBD keeps its internal metadata — at the END of the device. So
-	// extending the LV under a resource that is down moves the end away from
-	// the metadata and there is no drbdadm resize available to follow it: the
-	// call fails with the lower device already changed, the record still saying
-	// the old size, and a resource that will not come up because its metadata
-	// is no longer where it belongs.
-	//
-	// Refusing rather than bringing it up: Resize does not get to attach a
-	// volume the caller detached. ErrNotAttached is the same answer Mount gives
-	// for the same missing precondition.
+	// The resource must be up, or extending the LV strands DRBD's metadata; ErrNotAttached otherwise.
 	if _, up, roleErr := p.localRole(ctx, meta.Name); roleErr != nil {
 		return roleErr
 	} else if !up {
@@ -1681,18 +1256,7 @@ func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newS
 			meta.Name, common.ErrNotAttached)
 	}
 
-	// The backing volume carries the metadata as well as the data, and the
-	// bitmap grows with the device, so the target is recomputed rather than
-	// extended by the difference.
-	//
-	// The current size is read first so that each of the three steps can be
-	// skipped when it has already happened. A resize is two system operations
-	// and a state write, and any of them can fail partway — a lost context, a
-	// DRBD hiccup, a full state directory — leaving the backing volume grown
-	// and the record still holding the old size. Retrying then runs lvextend
-	// against a volume already at the target, which LVM refuses as not larger,
-	// and the resize could never finish through this API. Skipping the step
-	// that is already done lets the same call converge instead.
+	// Recompute the backing target and skip steps already done, so a retried resize converges.
 	lvs, err := p.lvs(ctx)
 	if err != nil {
 		return err
@@ -1701,14 +1265,7 @@ func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newS
 	if !ok {
 		return fmt.Errorf("volume %q: backing logical volume %q is missing", meta.Name, p.lvRef(meta.LV))
 	}
-	// The target below is backingBytes(newSize, encrypted) rounded up to a whole extent, and
-	// that has to be representable BEFORE it is computed. Past the bound it wraps
-	// NEGATIVE: entry.sizeBytes() < target is then false, so lvextend and the
-	// drbdadm resize after it are SKIPPED, the filesystem is never grown, and yet
-	// meta.SizeBytes is written as the fabricated size and nil returned — silent
-	// success over a device that never moved, after which every legitimate Resize
-	// is refused as a shrink against the recorded size. A size with no
-	// representable backing is malformed input, not a supported grow.
+	// Refuse sizes whose extent-rounded backing would overflow int64.
 	if limit := maxDataBytes(entry.extentSizeBytes(), p.cfg.Encrypted); newSize > limit {
 		return fmt.Errorf("%w: newSize %d exceeds the largest usable capacity representable on this volume, %d (this volume group's extents are %d bytes and DRBD's internal metadata, and the LUKS2 header on an encrypted provider, is added on top)",
 			common.ErrInvalidArgument, newSize, limit, entry.extentSizeBytes())
@@ -1726,11 +1283,7 @@ func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newS
 
 	grown, growErr := p.growFilesystem(ctx, &meta)
 	if growErr != nil {
-		// Nothing is recorded. The device half stands — it is idempotent and
-		// the repeat converges on it — but the record must never say a size
-		// the filesystem did not reach, and must not owe a grow a repeat
-		// would not perform (a stale mapping is refused again until the
-		// remedy is applied).
+		// Record nothing; the device half stands and the repeat converges.
 		return growErr
 	}
 
@@ -1746,44 +1299,7 @@ func (p *Provider) resizeLocked(ctx context.Context, metaPtr *resourceMeta, newS
 	return nil
 }
 
-// growFilesystem extends the filesystem on a volume whose device has just grown,
-// and reports whether it did.
-//
-// ext4 grows either way, but not by the same route. Mounted, resize2fs grows it
-// online. Unmounted, resize2fs refuses until the filesystem has been checked —
-// it answers "Please run 'e2fsck -f <device>' first." even for a filesystem
-// whose own state field reads clean — so the check runs first, and only when
-// the device is genuinely unmounted, because running e2fsck against a MOUNTED
-// filesystem would corrupt it. That is why this decides from the mount table
-// and not from a flag. pkg/local reached the same arrangement against the same
-// tools; this is deliberately the same shape.
-//
-// The offline route has one precondition that is this provider's alone: it has
-// to open the device read/write, and DRBD permits that only on the Primary. On
-// a Secondary the filesystem cannot be grown at all, so the device growth
-// stands, the call succeeds, and the filesystem takes up the space the next
-// time it is grown from the node holding Primary.
-//
-// XFS grows only through xfs_growfs against a live mountpoint, having no
-// offline form, so an unmounted XFS volume is left for the caller to grow after
-// mounting. A raw volume has nothing to grow but itself.
-//
-// AN ENCRYPTED VOLUME'S FILESYSTEM LIVES ON THE MAPPING, and the mapping is
-// checked before anything else is decided. No mapping — the container is
-// closed, which a Secondary's always is — means no plaintext device to grow
-// into, so the grow is deferred exactly as a Secondary's is; the next Promote
-// opens a mapping sized to the device as it is then. A mapping that no longer
-// covers the device is refused with ErrMappingStale rather than grown into: a
-// resize2fs against it would fit the filesystem to the OLD size and exit 0,
-// and the caller would record the new one. This is the one place every grow
-// passes through, which is what makes the check unavoidable; see
-// requireFreshMapping. A raw encrypted volume is checked too, since its
-// consumer uses the plaintext device directly.
-//
-// The bool is the caller's bookkeeping: true when the filesystem now fills the
-// device (or there is none to fill it), false with a nil error when the grow
-// was DEFERRED — nothing could be done from this node's state, and nothing is
-// wrong. A grow that is attempted and fails is a real failure and is returned.
+// growFilesystem grows the filesystem after the device grew and reports whether it did; false with nil means deferred (Secondary, unmounted XFS, closed container), and a stale mapping is ErrMappingStale.
 func (p *Provider) growFilesystem(ctx context.Context, meta *resourceMeta) (bool, error) {
 	if p.cfg.Encrypted {
 		open, err := p.containerIsOpen(ctx, meta)
@@ -1848,13 +1364,7 @@ func (p *Provider) growFilesystem(ctx context.Context, meta *resourceMeta) (bool
 	return true, nil
 }
 
-// checkExtFilesystem runs the forced check resize2fs demands before an offline
-// grow.
-//
-// -f forces it even on a filesystem marked clean, which is what resize2fs is
-// asking for. -p makes it non-interactive, fixing only what can be fixed
-// without a question — there is nobody to answer one, and the alternative is a
-// command that blocks forever holding the device open.
+// checkExtFilesystem runs e2fsck -f -p, the check resize2fs requires before an offline grow.
 func (p *Provider) checkExtFilesystem(ctx context.Context, dev string) error {
 	_, err := p.runner.Run(ctx, binE2fsck, "-f", "-p", dev)
 	if err == nil {
@@ -1880,10 +1390,7 @@ func (p *Provider) checkExtFilesystem(ctx context.Context, dev string) error {
 //
 // It is serialized against Delete: see the lock below.
 func (p *Provider) Snapshot(ctx context.Context, volID, name string) (common.SnapshotID, error) {
-	// Serialized with Delete, which refuses a volume that still has snapshots.
-	// That check and its lvremove are two steps, and a snapshot created between
-	// them would be destroyed by the removal of its origin — the protection
-	// bypassed by timing rather than by anything the caller did wrong.
+	// Serialized with Delete, which refuses a volume that has snapshots.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1978,13 +1485,7 @@ func (p *Provider) ListSnapshots(ctx context.Context, volID string) ([]common.Sn
 // the restore has finished. A restore still IN PROGRESS does depend on it, and
 // is serialized against by the lock below.
 func (p *Provider) DeleteSnapshot(ctx context.Context, snapID common.SnapshotID) error {
-	// Serialized with Provision and Snapshot for the same reason Snapshot is
-	// serialized with Delete: resolving a snapshot and acting on it are two
-	// steps, and a removal that lands between them destroys something another
-	// operation has already accepted. A restore is the sharp case — Provision
-	// validates the source snapshot and then copies it, holding this lock
-	// throughout, so without it here the source could vanish mid-copy and a
-	// restore that was legitimate when it started would fail or roll back.
+	// Serialized with Provision and Snapshot so a restore's source cannot vanish mid-copy.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -2030,14 +1531,7 @@ func (p *Provider) Delete(ctx context.Context, volID string) error {
 		return err
 	}
 
-	// Snapshots are checked BEFORE the role, and the order is deliberate.
-	//
-	// Both conditions block a delete, and only one of them changes with the
-	// volume's role. Demoting does not make a snapshot go away: a caller told
-	// "demote first" would demote, retry, and only then learn it has restore
-	// points to decide about — the larger decision, discovered second. Told
-	// about the snapshots first, it deals with the thing that is true either
-	// way and finds the role waiting for it afterwards.
+	// Snapshots are checked before the role, since demoting does not remove them.
 	lvs, err := p.lvs(ctx)
 	if err != nil {
 		return err
@@ -2053,18 +1547,7 @@ func (p *Provider) Delete(ctx context.Context, volID string) error {
 		return fmt.Errorf("volume %q: delete %s first: %w", meta.Name, strings.Join(snaps, ", "), common.ErrHasSnapshots)
 	}
 
-	// A resource that is up may be torn down only once it is affirmatively
-	// Secondary. Testing for "is Primary" instead lets every answer that is
-	// neither through — an unparsed role string, or the "Unknown" drbdsetup
-	// reports in some states, both of which map to ReplRoleUnknown with no
-	// error — and the next two steps are drbdadm down and lvremove. Written
-	// this way a role added to the enum later also refuses by default, which is
-	// the right default for the one operation here that destroys data.
-	//
-	// A resource that is NOT up is a different case and still deletable: it
-	// holds no role because nothing is running, so it cannot be Primary, and
-	// refusing would strand the half-provisioned records lookupAny exists to
-	// clean up.
+	// An up resource is torn down only when affirmatively Secondary; a resource that is not up is deletable.
 	role, rawRole, up, err := p.localRoleRaw(ctx, meta.Name)
 	if err != nil {
 		return err
@@ -2077,10 +1560,7 @@ func (p *Provider) Delete(ctx context.Context, volID string) error {
 	}
 
 	if up {
-		// Before the teardown, for the reason it is before Demote's role
-		// change: an open mapping holds the device open and drbdadm down fails
-		// on it. Only while the resource is UP, because that is when the device
-		// a mapping could be over exists at all.
+		// Close any open mapping before the teardown while the resource is up.
 		if err := p.closeContainer(ctx, &meta); err != nil {
 			return err
 		}
@@ -2101,11 +1581,7 @@ func (p *Provider) Delete(ctx context.Context, volID string) error {
 			}
 		}
 		if err := p.lvRemove(ctx, meta.LV); err != nil {
-			// A wipe activates an inactive volume to have a device to write to
-			// and leaves it that way, because the removal was about to take it.
-			// When the REMOVAL is what failed, that activation is left over
-			// from an operation the operator watched fail — a volume they had
-			// deactivated, now carrying a device node nobody asked for.
+			// Give back the wipe's activation when the removal failed.
 			if p.cfg.WipeOnDelete && !wasActive {
 				cleanupCtx, cancel := cleanupContext(ctx)
 				defer cancel()
@@ -2123,55 +1599,7 @@ func (p *Provider) Delete(ctx context.Context, volID string) error {
 	return nil
 }
 
-// wipe zero-fills a backing logical volume so nothing of it survives in the
-// extents LVM returns to the free pool. It runs only with Config.WipeOnDelete
-// set; that field documents what the exposure is and what this does not cover.
-//
-// It goes over the BACKING volume, not /dev/drbd<minor>. The extents that get
-// freed are the logical volume's, so the logical volume is what has to be
-// overwritten — and the DRBD metadata living at the end of that device goes with
-// it, which is correct for something about to be removed. Writing through the
-// DRBD device instead would also replicate every zero to the peer, turning a
-// local cleanup into a full-volume resync of data that is being destroyed.
-//
-// blkdiscard --zeroout uses the device's own zeroing offload where the hardware
-// has one and falls back to writing zeroes where it does not, which is the
-// difference between seconds and hours on a large volume. It is the same
-// mechanism and the same flag pkg/local uses, deliberately: the two providers
-// carve from the same kind of volume group, and an operator comparing them
-// should not find two different answers to one question.
-//
-// ORDERING: this runs after the resource is down and before lvremove, and both
-// halves matter. DRBD holds its backing device open while the resource is up, so
-// a wipe attempted first fails on a busy device rather than quietly doing
-// nothing; and a wipe after the removal has nothing left to address.
-//
-// An INACTIVE backing volume is activated first, because it has no device node
-// to write to otherwise. It is tempting to think that cannot happen — a DRBD
-// backing volume is active whenever the resource has been up, and provisioning
-// brings it up before returning — but Delete deliberately serves states where
-// the resource is already down, and a volume reaches those with no device node
-// after a reboot without autoactivation, after an administrator deactivates it,
-// or from a provisioning run that failed partway. Assuming otherwise turns
-// wipe_on_delete into a PERMANENT block on an otherwise valid deletion: the
-// blkdiscard fails on a missing device, the wipe failure stops the delete by
-// design, and the operator cannot get past it without turning the option off.
-// The fail-closed retention is meant to protect data, not to strand a volume.
-//
-// A borrowed activation is given back on EITHER failure, and this function owns
-// only the first of them. If the wipe fails, it deactivates here. If the wipe
-// succeeds and the lvremove that follows fails, Delete deactivates there — the
-// volume survives that path too, so the activation is just as much a leftover
-// from an operation the operator watched fail. Restoring it matters for the
-// reason it does in pkg/local: a volume they left deactivated must not come back
-// carrying a device node nobody asked for. A volume that was already active is
-// left exactly as it was found, with no lvchange run at all.
-//
-// A failure here stops the delete. The volume and its record stay, which is the
-// honest outcome: the caller asked for the contents to be destroyed before the
-// volume was, and if that did not happen the volume should still be there to try
-// again on. Removing it anyway would hand the extents back holding exactly the
-// data this option exists to keep out of them.
+// wipe zero-fills the backing LV with blkdiscard --zeroout after the resource is down and before lvremove, activating an inactive LV and deactivating it again on failure; a failure stops the delete.
 func (p *Provider) wipe(ctx context.Context, lv string, wasActive bool) error {
 	if !wasActive {
 		if err := p.lvActivate(ctx, lv); err != nil {
@@ -2236,12 +1664,7 @@ func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatu
 		return common.VolumeStatus{}, err
 	}
 	if !up {
-		// Said explicitly, because the zero value already means something else.
-		// common.VolumeStatus reserves it for a volume that is NOT REPLICATED,
-		// and this provider has no such volumes — every one it makes is a
-		// two-host DRBD resource. Leaving the field alone here told an HA
-		// controller that a replicated volume which is merely down has no peer
-		// to fail over to, which is the one thing it must not be told.
+		// Set explicitly: the zero value means not replicated.
 		status.Replication = downReplState()
 		return status, nil
 	}
@@ -2284,26 +1707,7 @@ func (p *Provider) Status(ctx context.Context, volID string) (common.VolumeStatu
 	return status, nil
 }
 
-// fsDeviceMounted reports whether the volume's filesystem device is mounted
-// anywhere, on a volume whose plaintext mapping may not exist.
-//
-// The mount table resolves a device by stat(2) BEFORE it reads anything, so
-// asking about a path with no node behind it is an error rather than an empty
-// answer — and on an encrypted provider the filesystem device is the mapping,
-// which exists only while the container is open. Every Secondary after a
-// Demote, and every volume resized Secondary-side with its container closed,
-// has no such node; asking anyway failed Status on exactly the volumes this
-// provider is supposed to be able to describe (#69 review).
-//
-// The container's state is the gate, through the same ownership check every
-// other path uses: a closed container has nothing mounted and is not looked
-// up; an open one is asked about like any device. What is NOT absorbed is an
-// error from that check — a mapping under our name over some other device —
-// because reading that as "closed" would report Attached about a volume whose
-// mapping is a conflict a human has to resolve. Nothing here is read as "not
-// mounted" because a lookup failed; the lookup is skipped because the device
-// provably does not exist. That is the difference from the fail-open the
-// mount-table lookup was moved off findmnt to remove.
+// fsDeviceMounted reports whether the filesystem device is mounted, skipping the lookup when the container is provably closed.
 func (p *Provider) fsDeviceMounted(ctx context.Context, meta *resourceMeta) (bool, error) {
 	if p.cfg.Encrypted {
 		open, err := p.containerIsOpen(ctx, meta)
@@ -2335,18 +1739,7 @@ func (p *Provider) fsDeviceMounted(ctx context.Context, meta *resourceMeta) (boo
 // this provider's own role- and lifecycle-changing methods, which is a
 // different concern: see the lock below.
 func (p *Provider) Promote(ctx context.Context, volID string) error {
-	// Serialized with Delete. Delete refuses a volume that is Primary and then
-	// tears it down, and those are two steps: a promotion landing between them
-	// defeats the demote-before-delete guard entirely, and the resource that
-	// just became writable is removed underneath whatever started writing to
-	// it.
-	//
-	// The same lock is what keeps this out of Snapshot's window, between its
-	// Primary check and its lvcreate. A promotion there is harmless in the
-	// direction that matters — the check demanded Primary and the promotion
-	// only supplies it — but the lock covers both directions, so there is no
-	// second rule to remember. Demote is where the direction is NOT harmless;
-	// see the lock there.
+	// Serialized with Delete and Snapshot.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -2355,12 +1748,7 @@ func (p *Provider) Promote(ctx context.Context, volID string) error {
 		return err
 	}
 
-	// Read BEFORE the promotion, because the rollback below turns on it and
-	// afterwards there is no way to tell the two cases apart. It mirrors
-	// pkg/local's Attach, which rolls its activation back only when the volume
-	// was not already active: a promotion this call did not perform is not this
-	// call's to undo, and undoing it would take the volume away from whoever
-	// promoted it first.
+	// Read before promoting: only a promotion this call made is rolled back.
 	wasPrimary := false
 	if p.cfg.Encrypted {
 		role, up, roleErr := p.localRole(ctx, meta.Name)
@@ -2374,23 +1762,12 @@ func (p *Provider) Promote(ctx context.Context, volID string) error {
 		return fmt.Errorf("promoting volume %q: %w", meta.Name, err)
 	}
 
-	// AFTER the role change, because DRBD refuses every open of a Secondary's
-	// device — there is no earlier moment at which the container can be
-	// unlocked. A no-op for an unencrypted volume.
+	// Open the container after the role change; a no-op for an unencrypted volume.
 	if err := p.openContainer(ctx, &meta); err != nil {
 		if wasPrimary {
 			return err
 		}
-		// The promotion was this call's, and it did not achieve what the caller
-		// asked for: a Primary with no plaintext device is a volume nothing can
-		// mount, holding the pair's only writable copy away from the peer. It
-		// goes back.
-		//
-		// On a context of ITS OWN. The most likely reason to be here is that
-		// ctx was canceled or timed out partway through the unlock, and reusing
-		// it makes the demotion fail instantly — the production runner execs
-		// through exec.CommandContext — leaving behind exactly the state this
-		// undoes, while the code reads as though it had been restored.
+		// Demote again on a fresh context when the unlock failed.
 		cleanupCtx, cancel := cleanupContext(ctx)
 		defer cancel()
 		if demoteErr := p.drbdadm(cleanupCtx, "secondary", meta.Name); demoteErr != nil {
@@ -2408,18 +1785,7 @@ func (p *Provider) Promote(ctx context.Context, volID string) error {
 //
 // It is serialized against Snapshot, Promote and Delete: see the lock below.
 func (p *Provider) Demote(ctx context.Context, volID string) error {
-	// Serialized with Snapshot. Snapshot requires the volume to be Primary on
-	// this node and then runs lvcreate, and those are two steps: a demotion
-	// landing between them produces a snapshot of a Secondary's backing device,
-	// which is precisely what the role check exists to refuse — a device
-	// written by the replication stream with nothing above it ordering those
-	// writes, so what is captured is not crash-consistent and not anything
-	// else either.
-	//
-	// Making a volume LESS writable is not therefore harmless. That was the
-	// reasoning this lock replaces: less-writable is exactly the direction that
-	// invalidates a precondition another method has already checked and is
-	// still acting on.
+	// Serialized with Snapshot, whose Primary check a demotion would invalidate.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -2428,40 +1794,19 @@ func (p *Provider) Demote(ctx context.Context, volID string) error {
 		return err
 	}
 
-	// BEFORE the role change, and the order is the operation. An open dm-crypt
-	// mapping holds /dev/drbdN open, and DRBD refuses to demote a device
-	// somebody has open — so a demotion attempted first fails on a busy device
-	// and reports it as though a workload still held the volume. A no-op for an
-	// unencrypted volume.
-	//
-	// A failure here is the caller's answer: the volume stays Primary and stays
-	// unlocked, which is the state it was in, rather than half of a demotion.
+	// Close the mapping before the role change; on failure the volume stays Primary and unlocked.
 	if err := p.closeContainer(ctx, &meta); err != nil {
 		return err
 	}
 
 	if err := p.drbdadm(ctx, "secondary", meta.Name); err != nil {
-		// The mapping is NOT re-opened. Demote is reached with the volume
-		// already unmounted — the mapping is what a mount sits on — so what a
-		// failed demotion leaves is a Primary with a closed container and
-		// nothing using it, and the next Promote opens one. Re-opening here
-		// would be a second operation that can fail on its own, in a path that
-		// is already reporting a failure, to restore a plaintext device with no
-		// user.
+		// The mapping is not re-opened; the next Promote opens one.
 		return fmt.Errorf("demoting volume %q: %w", meta.Name, err)
 	}
 	return nil
 }
 
-// downReplState is what a resource that is configured for replication and not
-// running reports, and it is one function rather than two literals so that
-// Status and ReplicationState cannot drift into disagreeing about the same
-// volume in the same state.
-//
-// Down is a definite answer, not an absent one: the resource exists, this
-// provider knows about it, and nothing is running. It is not standalone either
-// — standalone means the resource IS up and has stopped talking to its peer —
-// and a resource that is down holds no role at all.
+// downReplState is what a configured resource that is not running reports, shared by Status and ReplicationState.
 func downReplState() common.ReplState {
 	return common.ReplState{Conn: common.ReplStateDown, Role: common.ReplRoleUnknown}
 }
@@ -2512,10 +1857,7 @@ func (p *Provider) lookup(volID string) (resourceMeta, error) {
 	return p.loadMeta(volID)
 }
 
-// lookupAny is lookup without the completeness filter. Delete uses it so that a
-// volume left half-provisioned by a failed attempt — which every other method
-// correctly reports as absent — can still be cleaned up rather than needing the
-// state file removed by hand.
+// lookupAny is lookup without the completeness filter, so Delete can clean up a half-provisioned volume.
 func (p *Provider) lookupAny(volID string) (resourceMeta, error) {
 	if err := validateName("volume id", volID); err != nil {
 		return resourceMeta{}, fmt.Errorf("%w: %w", common.ErrNotFound, err)
@@ -2523,22 +1865,7 @@ func (p *Provider) lookupAny(volID string) (resourceMeta, error) {
 	return p.readMeta(volID)
 }
 
-// requireLocalNode decides whether an operation may act on the named node, and
-// separates the two ways it may not.
-//
-// A resource generated by this provider has exactly two hosts, so those are the
-// only node names that mean anything to it. A name that is neither is not a
-// node of this volume at all — a malformed request, reported as
-// common.ErrInvalidArgument, which tells the caller to fix what it asked rather than
-// to ask a different backend.
-//
-// The peer is a real node of the resource, and attaching there is a perfectly
-// well-formed thing to want; this provider simply cannot do it. It drives the
-// local DRBD instance and has no channel to the other one, so the peer's own
-// provider is what serves that request. That is ErrUnsupported, per the Attach
-// contract's rule for a request the provider cannot serve on the node asked
-// for. Reporting success would claim something happened on a host this process
-// never spoke to.
+// requireLocalNode allows only the local node; the peer is ErrUnsupported and any other name ErrInvalidArgument.
 func (p *Provider) requireLocalNode(node common.NodeID) error {
 	switch string(node) {
 	case p.cfg.NodeName:

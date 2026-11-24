@@ -175,17 +175,7 @@ func Root(dir string) (string, error) {
 	}
 }
 
-// skippedDirs are directories no scanner descends into.
-//
-// GuardFixtureDir is the load-bearing entry: this package's own testdata holds
-// DELIBERATE violations, planted so each scanner can be shown to fire. Scanning
-// them from the repository sweep would report the fixtures as defects and make
-// the whole suite permanently red.
-//
-// It is excluded by exact path rather than by the name "testdata", so a real
-// violation in some other package's testdata is still found. A blanket
-// exclusion would be the scanner blinding itself, which is the failure this
-// package is about.
+// skippedDirs are directories no scanner descends into; the guard fixtures are excluded by exact path.
 var skippedDirs = map[string]struct{}{
 	".git":     {},
 	"coverage": {},

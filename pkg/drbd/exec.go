@@ -105,18 +105,6 @@ func exitCode(err error) (int, bool) {
 const maxStderr = 4096
 
 // allowedBinaries is every program this package will exec.
-//
-// Taking the binary name as a parameter is what makes the runner a seam a test
-// can substitute, and also what makes it, read on its own, an arbitrary
-// subprocess launcher. It is not one: the name is checked against this set
-// before the exec, so a bug that let a caller-controlled string reach Run
-// could not turn it into a way to run something else. Arguments are separate
-// argv elements and never touch a shell.
-//
-// The mkfs entries are spelled out because the caller builds that name from a
-// filesystem type. That type is already allowlisted in validate.go; this is the
-// second lock on the same door, and the one that holds if the first is ever
-// widened without thinking about what the name is used for.
 var allowedBinaries = map[string]struct{}{
 	binDRBDAdm:   {},
 	binDRBDSetup: {},

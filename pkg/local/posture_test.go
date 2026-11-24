@@ -18,9 +18,7 @@ import (
 	"testing"
 )
 
-// TestPostureNamesTheGuardThatIsOff is the whole point: a guard that is off has
-// to be SAID, not omitted. An operator reading a list of the guards that are on
-// cannot tell it from a complete list.
+// TestPostureNamesTheGuardThatIsOff: a disabled guard is listed as not checked.
 func TestPostureNamesTheGuardThatIsOff(t *testing.T) {
 	p := newTestProvider(t, newFakeRunner())
 
@@ -54,9 +52,7 @@ func TestPostureReportsAnEnabledGuardAsChecked(t *testing.T) {
 	}
 }
 
-// TestPostureNamesEveryStartupCapability covers the other kind of silence:
-// "preflight ran" says nothing about WHICH capabilities it covered, and the
-// mode makes that vary.
+// TestPostureNamesEveryStartupCapability lists each startup capability by name.
 func TestPostureNamesEveryStartupCapability(t *testing.T) {
 	p := newTestProvider(t, newFakeRunner())
 
@@ -68,10 +64,7 @@ func TestPostureNamesEveryStartupCapability(t *testing.T) {
 	}
 }
 
-// TestPostureReflectsTheConfiguration checks the report is derived rather than
-// fixed. A provider driven entirely through injected seams performs no
-// privileged operation, so its startup checks are correctly absent — and that
-// absence has to show up as NOT CHECKED rather than as a shorter list.
+// TestPostureReflectsTheConfiguration: a provider on injected seams reports its startup checks as not checked.
 func TestPostureReflectsTheConfiguration(t *testing.T) {
 	injected := newTestProvider(t, newFakeRunner()).Posture()
 
@@ -114,12 +107,7 @@ func TestUncheckedIsTheActionablePart(t *testing.T) {
 	}
 }
 
-// TestPostureNamesTheOrphanInspection covers the guard that never acts.
-//
-// Reporting it as "checked" would imply something watches continuously, and
-// omitting it would leave an operator to discover by reading the code that
-// nothing cleans up an abandoned mapping. It is named, and the line says which
-// of those it is.
+// TestPostureNamesTheOrphanInspection names the inspection and says it runs on demand.
 func TestPostureNamesTheOrphanInspection(t *testing.T) {
 	rendered := newTestProvider(t, newFakeRunner()).Posture().String()
 
@@ -133,12 +121,7 @@ func TestPostureNamesTheOrphanInspection(t *testing.T) {
 	}
 }
 
-// TestPostureDistinguishesAnUncheckableKeyPath covers a guard whose absence is
-// not a setting somebody forgot.
-//
-// A KeyProvider supplied as a func closes over whatever it reads, so there is
-// no path to check. Reporting that the same way as a disabled guard would send
-// an operator looking for a switch that does not exist.
+// TestPostureDistinguishesAnUncheckableKeyPath: a func KeyProvider is reported as uncheckable, not disabled.
 func TestPostureDistinguishesAnUncheckableKeyPath(t *testing.T) {
 	opaque := newTestProvider(t, newFakeRunner(), withKey).Posture().String()
 	if !strings.Contains(opaque, "NOT APPLICABLE") {

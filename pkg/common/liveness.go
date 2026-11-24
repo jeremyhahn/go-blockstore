@@ -115,10 +115,7 @@ func LivenessOf(ctx context.Context, oracle LivenessOracle, volID string) (Liven
 
 	state, err := oracle.AttachmentLiveness(ctx, volID)
 	if err != nil {
-		// The oracle's own error is wrapped rather than replaced: it names the
-		// coordinator that was unreachable or the record that would not parse,
-		// and that is what somebody fixes. Any state returned beside it is
-		// dropped, because an implementation that failed had nothing to report.
+		// Wrap the oracle's error, which names what to fix, and drop any state returned beside it.
 		if errors.Is(err, ErrLivenessIndeterminate) {
 			return "", err
 		}

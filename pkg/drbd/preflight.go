@@ -66,36 +66,7 @@ type injectedSeams struct {
 	luks         bool
 }
 
-// requiredCapabilities derives what this configuration will actually ask the
-// kernel to do.
-//
-// # This set is MEASURED, not copied from pkg/local
-//
-// The two providers overlap and they are not the same, and taking the local
-// provider's list would have been a guard that passes for the wrong reason.
-// Measured 2026-09-02 against this package's own dispatch and the kernel:
-//
-//   - CapabilityNetAdmin is REQUIRED HERE AND NOT THERE. DRBD's control path is
-//     drbdsetup speaking generic netlink to the drbd kernel module, whose
-//     administrative operations are gated on CAP_NET_ADMIN. That is a different
-//     bit from CAP_SYS_ADMIN and neither confers the other, so a container
-//     granted only the device-mapper privilege drives LVM perfectly and fails at
-//     the first resource up.
-//   - CapabilityDRBDControl is required here and has no analog there. It is
-//     not a privilege: the module has to be loaded on the node.
-//   - CapabilityKernelKeyring is required here ONLY WHEN THE PROVIDER IS
-//     CONFIGURED TO ENCRYPT, which was not a state this package had when the
-//     set was first measured. That measurement said the capability was never
-//     needed because "this package performs no LUKS operations at all — grep
-//     the package", and the grep now finds them: LUKS-above-DRBD gives every
-//     replicated device a dm-crypt mapping, opened on Promote. The condition is
-//     what keeps the old conclusion true where it still holds — an unencrypted
-//     deployment asks for nothing new, and asking for a capability a provider
-//     does not exercise would make a correctly configured node refuse to start.
-//     The DRBD shared secret is unchanged by this: it authenticates the peer and
-//     never enters the kernel keyring.
-//   - CapabilityDeviceMapper and CapabilityMount ARE shared: volumes are LVM
-//     logical volumes underneath, and the provider mounts filesystems.
+// requiredCapabilities: NetAdmin, DRBDControl, DeviceMapper and Mount, plus KernelKeyring only when encrypting.
 func requiredCapabilities(seams injectedSeams, encrypted bool, mode PreflightMode) []preflight.Capability {
 	if mode == PreflightOff {
 		return nil
@@ -130,12 +101,7 @@ func requiredCapabilities(seams injectedSeams, encrypted bool, mode PreflightMod
 	return capabilities
 }
 
-// runPreflight verifies the deployment before New returns a Provider.
-//
-// It runs after the configuration has been parsed and validated, so a caller
-// who got the settings wrong hears about the settings rather than about the
-// node's capabilities — and before any volume work, so a misconfigured
-// deployment is a refusal to start rather than a failure at the first Provision.
+// runPreflight verifies the node after configuration is validated and before New returns a Provider.
 func runPreflight(seams injectedSeams, encrypted bool, mode PreflightMode) error {
 	capabilities := requiredCapabilities(seams, encrypted, mode)
 	if len(capabilities) == 0 {

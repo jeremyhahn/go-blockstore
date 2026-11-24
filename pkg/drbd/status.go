@@ -22,18 +22,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// This file models the output of "drbdsetup status --json" and maps it onto
-// common.ReplState.
-//
-// drbdsetup is used rather than "drbdadm status --json" even though drbd-utils
-// 9 accepts both: drbdadm re-parses the configuration files and then shells out
-// to drbdsetup anyway, so going straight to drbdsetup removes a failure mode
-// (an unrelated resource file with a syntax error) from every status read.
-//
-// The whole-node form is used — "drbdsetup status --json" with no resource
-// argument — so that a resource which is simply not up is an absent entry in a
-// successful reply rather than a non-zero exit whose code has to be
-// interpreted.
+// This file models "drbdsetup status --json" for the whole node and maps it onto common.ReplState; a resource not up is an absent entry.
 
 // The volume number this provider gives every resource. One resource holds
 // exactly one volume, so the mapping between a go-blockstore volume and a DRBD
@@ -149,15 +138,7 @@ func (c *connectionStatus) peerDevice() (peerDeviceStatus, bool) {
 	return peerDeviceStatus{}, false
 }
 
-// -----------------------------------------------------------------------------
-// DRBD 9 state names
-//
-// Each family below lists every name the kernel can report, so that an
-// unrecognized name is distinguishable from a recognized one this provider has
-// nothing better to say about. Parsing returns ok=false for anything off the
-// list and the caller reports common.ReplStateUnknown; nothing is inferred from
-// the shape of an unknown name.
-// -----------------------------------------------------------------------------
+// DRBD 9 state names: each family lists every name the kernel reports; an unknown name maps to common.ReplStateUnknown.
 
 // drbdRole is the "role" / "peer-role" field.
 type drbdRole string
@@ -308,18 +289,7 @@ func parseDisk(s string) (drbdDisk, bool) {
 // Mapping onto common.ReplConnState
 // -----------------------------------------------------------------------------
 
-// connMapping maps every DRBD connection state onto the common model.
-//
-// Connected is absent: it is not an answer on its own, and is resolved from the
-// peer device's replication state instead. See toCommonConn.
-//
-// The seven names between StandAlone and Connecting — Disconnecting, Timeout,
-// BrokenPipe, NetworkFailure, ProtocolError, TearDown, Unconnected — are the
-// ways a connection breaks or is torn down. DRBD re-enters Connecting from all
-// of them on its own, so ReplStateConnecting describes where the resource is
-// heading and, more to the point, keeps them out of ReplStateStandalone.
-// StandAlone means the node has stopped trying, which is an operator-visible
-// condition; a flapping link is not.
+// connMapping maps every DRBD connection state; Connected resolves through toCommonConn, and the broken-link states map to ReplStateConnecting.
 var connMapping = map[drbdConn]common.ReplConnState{
 	connStandAlone:     common.ReplStateStandalone,
 	connDisconnecting:  common.ReplStateConnecting,
@@ -342,32 +312,7 @@ type replResolution struct {
 	deferToDisk bool
 }
 
-// replMapping maps every DRBD replication state onto the common model.
-//
-// The question the HA controller asks of this value is "is my local copy safe
-// to promote", so the direction of a divergence is what matters and the sync
-// states are bucketed by which side is behind:
-//
-//	source side — StartingSyncS, WFBitMapS, SyncSource, PausedSyncS, Ahead
-//	target side — StartingSyncT, WFBitMapT, WFSyncUUID, SyncTarget,
-//	              PausedSyncT, Behind
-//
-// WFSyncUUID has no S/T pair because it exists only on the target, waiting for
-// the source's sync UUID before the resync begins.
-//
-// Ahead and Behind are not resyncs — they are protocol-A congestion, where
-// replication is temporarily suspended and the peer is allowed to fall behind.
-// They land in the sync buckets anyway because they answer the same question
-// the same way: Behind means the local copy is the stale one and must not be
-// promoted, Ahead means it is the good one.
-//
-// VerifyS and VerifyT defer to the disk state. Online verification compares two
-// UpToDate copies block by block; it changes no data and, until it finds a
-// mismatch, says nothing about which copy is current.
-//
-// Off means this volume is not replicated over this connection. It is
-// self-contradictory here, because it is only consulted once the connection has
-// reported Connected, so it resolves to unknown rather than to a guess.
+// replMapping maps every DRBD replication state by which side is behind; Verify defers to the disk state and Off resolves to unknown.
 var replMapping = map[drbdRepl]replResolution{
 	replOff:           {state: common.ReplStateUnknown},
 	replEstablished:   {deferToDisk: true},
@@ -386,24 +331,7 @@ var replMapping = map[drbdRepl]replResolution{
 	replBehind:        {state: common.ReplStateSyncTarget},
 }
 
-// diskMapping resolves a local disk state for a connection that is Connected
-// and replicating normally.
-//
-// Only UpToDate becomes ReplStateUpToDate. Every other disk state describes a
-// local copy that is not current, and they all become ReplStateInconsistent —
-// a definite fact about the volume, as distinct from ReplStateUnknown, which
-// means the state could not be determined. A controller must refuse to promote
-// on either, but only one of them is an answer.
-//
-// The nine are not all the same underneath. Consistent, Outdated and
-// Inconsistent describe data that is present and not current; Diskless and
-// Failed describe a device that cannot serve reads at all; Attaching,
-// Detaching and Negotiating are transient; DUnknown is DRBD's own ignorance.
-// They collapse here because the question this value answers is binary — is
-// the local copy safe to promote, and for all nine the answer is no — and
-// because nothing is lost by collapsing them: Status reports Failed and
-// Diskless as VolumeStateError, so the distinction that matters for diagnosis
-// survives one level up.
+// diskMapping: UpToDate is ReplStateUpToDate, every other disk state ReplStateInconsistent.
 var diskMapping = map[drbdDisk]common.ReplConnState{
 	diskUpToDate:     common.ReplStateUpToDate,
 	diskConsistent:   common.ReplStateInconsistent,
@@ -417,11 +345,7 @@ var diskMapping = map[drbdDisk]common.ReplConnState{
 	diskDUnknown:     common.ReplStateInconsistent,
 }
 
-// toCommonConn resolves one connection into a common connection state.
-//
-// connRaw is the connection field, replRaw and diskRaw the peer device's
-// replication state and the local device's disk state. Any name that is not a
-// known DRBD state yields ReplStateUnknown.
+// toCommonConn resolves a connection, peer replication and local disk state into a common state; unknown names yield ReplStateUnknown.
 func toCommonConn(connRaw, replRaw, diskRaw string) common.ReplConnState {
 	conn, ok := parseConn(connRaw)
 	if !ok {
@@ -456,11 +380,7 @@ func toCommonConn(connRaw, replRaw, diskRaw string) common.ReplConnState {
 	return common.ReplStateUnknown
 }
 
-// safetyRank orders connection states from least to most safe, where "safe"
-// means "the local copy can be trusted". It exists so that a resource with more
-// than one peer reports its worst connection: this provider configures exactly
-// one, but a resource that has grown a second must not be reported as UpToDate
-// while that second peer is resyncing.
+// safetyRank orders connection states from least to most safe, so a resource reports its worst connection.
 func safetyRank(s common.ReplConnState) int {
 	switch s {
 	case common.ReplStateUnknown:
@@ -489,13 +409,7 @@ func safetyRank(s common.ReplConnState) int {
 	}
 }
 
-// replState builds the common.ReplState for a resource.
-//
-// It returns ok=false when the resource has no connections at all, which is the
-// one shape that genuinely means "this volume is not replicated": a resource
-// with a peer that is merely unreachable still reports a connection, in
-// StandAlone or one of the failure states. The caller turns that into
-// common.ErrNotReplicated.
+// replState builds the common.ReplState for a resource, ok=false when it has no connections at all.
 func (r *resourceStatus) replState() (common.ReplState, bool) {
 	if len(r.Connections) == 0 {
 		return common.ReplState{}, false

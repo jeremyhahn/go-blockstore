@@ -45,23 +45,7 @@ const (
 // operates on the descriptor.
 type systemMounter struct{}
 
-// pinDirectory resolves an absolute path to a descriptor, refusing to traverse a
-// symlink anywhere along the way.
-//
-// RESOLVE_NO_SYMLINKS is the whole point: it makes the kernel fail rather than
-// follow, so a symlink planted at the final component OR at any parent is an
-// error instead of a redirection. RESOLVE_NO_MAGICLINKS is belt to that brace,
-// refusing the /proc entries that resolve to arbitrary files — a target under
-// /proc/self/fd would otherwise reach anything the process has open.
-// RESOLVE_BENEATH is deliberately NOT set: it constrains resolution to a subtree
-// below a starting descriptor, and these targets are absolute paths that a
-// caller is entitled to place anywhere, so there is no subtree to confine them
-// to. O_PATH because the descriptor is a handle rather than something to read,
-// and O_DIRECTORY because a mount target must be one.
-//
-// The descriptor is what makes this safe rather than merely careful: everything
-// afterwards addresses the directory itself, so a path swapped after resolution
-// changes nothing about where the mount lands.
+// pinDirectory resolves an absolute directory path to an O_PATH descriptor with openat2, refusing symlinks and magic links.
 func pinDirectory(path string) (int, error) {
 	how := &unix.OpenHow{
 		Flags:   uint64(unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC),
@@ -116,10 +100,7 @@ func (systemMounter) Mount(_ context.Context, source, target, fsType string, fla
 	}
 	defer func() { _ = unix.Close(fd) }()
 
-	// Addressing the descriptor rather than the path. RESOLVE_NO_MAGICLINKS
-	// refused magic links while RESOLVING the caller's path; using one here is
-	// the opposite operation — this one names a directory already pinned, and
-	// is how a descriptor is handed to a syscall that takes a path.
+	// Address the pinned descriptor through its /proc/self/fd path.
 	if err := unix.Mount(source, fdPath(fd), fsType, flags, data); err != nil {
 		return fmt.Errorf("go-blockstore/mount: mounting %s at %s: %w", source, target, err)
 	}

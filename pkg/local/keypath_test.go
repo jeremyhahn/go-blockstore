@@ -44,10 +44,7 @@ func TestKeyFileInsideTheMountIsRefused(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
 		withBlkid(map[string]string{"/dev/vg0/data": "ext4"}).
-		// The volume is ALREADY mounted here, so the key file is inside its
-		// filesystem rather than underneath a mount point. That distinction is
-		// the whole thing: a file in a directory about to be mounted over is
-		// HIDDEN by the mount, not published by it.
+		// The volume is already mounted here, so the key file is inside its filesystem.
 		withMounts(map[string][]string{"/dev/vg0/data": {target}})
 	p := keyed(t, runner, keyFile)
 
@@ -225,12 +222,7 @@ func TestTheSettingsRouteCarriesTheKeyPath(t *testing.T) {
 	}
 }
 
-// TestASecondMountCannotPublishAKeyInsideTheFirst is the bypass: the new target
-// does not contain the key, so checking only the new target passes — while the
-// mount publishes the same volume, key and all, at a second path.
-//
-// The order matters and it is reachable: attach, write the key file into the
-// volume through the mount it already has, then mount it somewhere else.
+// TestASecondMountCannotPublishAKeyInsideTheFirst: a second mount of a volume holding the key is refused.
 func TestASecondMountCannotPublishAKeyInsideTheFirst(t *testing.T) {
 	first := t.TempDir()
 	second := t.TempDir()
@@ -255,13 +247,7 @@ func TestASecondMountCannotPublishAKeyInsideTheFirst(t *testing.T) {
 	}
 }
 
-// TestAKeyPathTraversingDotDotIsRefused closes a bypass that reads as correct.
-//
-// filepath.Clean collapses "link/.." to the parent of the link; the kernel
-// follows the symlink and goes up from its TARGET. So a configured path can
-// clean to somewhere harmless while os.Open reads from inside the volume, and a
-// guard comparing the cleaned path would allow exactly the exposure it exists
-// to stop.
+// TestAKeyPathTraversingDotDotIsRefused: a key path that is not clean is refused.
 func TestAKeyPathTraversingDotDotIsRefused(t *testing.T) {
 	base := t.TempDir()
 	volume := filepath.Join(base, "mnt")
@@ -302,22 +288,7 @@ func TestAKeyPathTraversingDotDotIsRefused(t *testing.T) {
 	}
 }
 
-// TestAKeyFileUnderTheMountPointIsRefused pins a rule whose REASON is not the
-// obvious one, and which two review rounds pulled in opposite directions.
-//
-// Mounting does not publish the file underneath — it hides it. Measured: a file
-// in a directory is unreadable at that path the moment anything is mounted over
-// it. So "the mount publishes the key" is false, and a guard justified that way
-// is justified wrongly.
-//
-// The rule survives on a different reason. After the mount the configured path
-// MEANS SOMETHING ELSE, and which something depends on the volume's contents:
-// either nothing is there and the provider can no longer read its own key, or
-// the volume has a file at that path and the provider's key is now a file
-// inside the volume it just handed over — attacker-controllable if the volume's
-// contents are. Measured: a path reading HOST-KEY before the mount reads
-// VOLUME-KEY after. Neither case is knowable from outside, so the class is
-// refused.
+// TestAKeyFileUnderTheMountPointIsRefused: after the mount the configured key path would resolve into the volume or to nothing.
 func TestAKeyFileUnderTheMountPointIsRefused(t *testing.T) {
 	target := t.TempDir()
 	keyFile := filepath.Join(target, "volume.key")
@@ -325,8 +296,7 @@ func TestAKeyFileUnderTheMountPointIsRefused(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	// Nothing of this volume is mounted anywhere: this is the FIRST mount, the
-	// case the existing-mounts check cannot see.
+	// Nothing of this volume is mounted yet: the first mount.
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
 		withBlkid(map[string]string{"/dev/vg0/data": "ext4"})
@@ -341,14 +311,7 @@ func TestAKeyFileUnderTheMountPointIsRefused(t *testing.T) {
 	}
 }
 
-// TestAKeyInsideAnotherVolumeIsRefused covers the exposure that survives a
-// check scoped to the volume being operated on.
-//
-// luks_key_file is PROVIDER-GLOBAL: one setting serves the whole volume group.
-// A key stored inside volume A is readable by whoever consumes A, and that
-// stays true while this provider attaches or mounts volume B — B's own devices
-// are innocent, so a check that looks only at them hands B over while A's
-// workload reads the credential.
+// TestAKeyInsideAnotherVolumeIsRefused: the provider-global key inside volume A blocks operations on B.
 func TestAKeyInsideAnotherVolumeIsRefused(t *testing.T) {
 	mountOfA := t.TempDir()
 	keyFile := filepath.Join(mountOfA, "shared.key")
@@ -379,22 +342,7 @@ func TestAKeyInsideAnotherVolumeIsRefused(t *testing.T) {
 	}
 }
 
-// TestAttachRefusesAKeyInsideAnotherVolume is the cross-volume refusal on the
-// ATTACH path, which the Mount test above does not reach.
-//
-// Attach is a different sequence, not a second caller of the same one: it takes
-// the volume lock, ACTIVATES the volume, unlocks it, and rolls the activation
-// back when anything downstream fails. The containment check sits inside
-// unlockForAttach specifically because a volume whose mapping is already open
-// never re-reads the key — the exposure is in the handover, not in the unlock —
-// and that placement was got wrong once already. A reordering that moved the
-// check after the unlock, or dropped it, would restore a fail-open credential
-// exposure while the Mount test stayed green.
-//
-// Volume B is INACTIVE in the fixture so the activation is newly performed and
-// the rollback is a real one. A test with B already active would assert the
-// deactivation never happens, which is the branch that skips the rollback
-// because the activation belongs to whoever attached it first.
+// TestAttachRefusesAKeyInsideAnotherVolume: Attach refuses in unlockForAttach and rolls back the activation of inactive B.
 func TestAttachRefusesAKeyInsideAnotherVolume(t *testing.T) {
 	mountOfA := t.TempDir()
 	keyFile := filepath.Join(mountOfA, "shared.key")

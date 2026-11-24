@@ -20,13 +20,7 @@ import (
 	"os"
 )
 
-// tryLockFile has no implementation off unix.
-//
-// The provider cannot run there anyway — it drives LVM and device-mapper — but
-// the package still COMPILES for other platforms, and it should
-// keep doing so rather than break a cross-build. Refusing here is what keeps the
-// serialization guarantee honest: a platform without flock gets an error, never
-// an unlocked operation that looks locked.
+// tryLockFile has no implementation off unix and returns an error.
 func tryLockFile(*os.File) (bool, error) {
 	return false, errors.New("advisory file locking is not available on this platform")
 }

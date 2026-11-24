@@ -1,20 +1,5 @@
 #!/bin/sh
-# check-build-tags.sh — prove the Makefile honours GO_BUILD_TAGS (#98).
-#
-# ci-template v1.21+ calls every stage as `make <target> GO_BUILD_TAGS='a b'`.
-# A target that ignores the variable still goes green, just on the wrong tag
-# set, so nothing else would notice. This reads the commands `make -n` would
-# run and asserts:
-#
-#   - a non-empty GO_BUILD_TAGS reaches build, test, the integration targets
-#     and golangci-lint, comma-joined after the tags each already uses;
-#   - an empty GO_BUILD_TAGS prints exactly the commands an unset one does,
-#     and those are the commands the Makefile ran before #98;
-#   - GOLANGCI_CONFIG_TAGS in the Makefile still equals run.build-tags in
-#     .golangci.yml, since the lint flag replaces that list.
-#
-# Run by `make test` (check-build-tags). Plain sh, no grep: the substring tests
-# are `case` patterns.
+# Checks via make -n that GO_BUILD_TAGS reaches build, test, integration and lint targets, and that GOLANGCI_CONFIG_TAGS matches .golangci.yml.
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -22,9 +7,7 @@ cd "$(dirname "$0")/.."
 MAKE_BIN=${MAKE:-make}
 fail=0
 
-# The caller's own TAGS / GO_BUILD_TAGS (and any inherited through MAKEFLAGS
-# when this runs under `make test GO_BUILD_TAGS=...`) must not leak in: every
-# assertion below is against the repository defaults.
+# Clear the caller's TAGS and GO_BUILD_TAGS so assertions run against the defaults.
 dry() {
 	env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL -u TAGS -u GO_BUILD_TAGS \
 		"$MAKE_BIN" --no-print-directory -n "$@" 2>&1

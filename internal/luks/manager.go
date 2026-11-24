@@ -41,44 +41,19 @@ import (
 // FSType is what blkid reports for a LUKS container.
 const FSType = "crypto_LUKS"
 
-// The LUKS2 parameters every container created through this package is
-// formatted with. They are pinned rather than left to the library because
-// go-luks2's defaults are not FIPS-approved: a FormatParams with a zero KDF.Type
-// formats with argon2id outside FIPS mode, and a zero Hash derives with SHA-256.
+// Pinned LUKS2 parameters: go-luks2's defaults are not FIPS-approved.
 const (
-	// pbkdf is PBKDF2, the only key-derivation function among go-luks2's
-	// choices that is FIPS-approved. Argon2id, its default, is not — and cannot
-	// become so by accident, because argon2 is implemented in pure Go by
-	// golang.org/x/crypto and never enters the Go Cryptographic Module at all.
-	//
-	// Its memory-hardness is what argon2 is chosen for, and it is not
-	// load-bearing here: the KDF is stretching KeyProvider material, which is a
-	// machine-generated high-entropy key out of a file or an enclave and never
-	// an interactive human passphrase. There is no low-entropy secret for a
-	// GPU-parallel attacker to grind at. A caller feeding a human-chosen
-	// passphrase into KeyProvider has picked the wrong layer for it — stretch it
-	// where it is entered, and hand this one the result.
+	// pbkdf is PBKDF2, the only FIPS-approved KDF go-luks2 offers; the input is a high-entropy machine key.
 	pbkdf = "pbkdf2"
 
-	// hashAlgo is SHA-512: FIPS 180-4 approved, and faster per byte than
-	// SHA-256 on 64-bit hardware. It also matches the 256-bit security level of
-	// the cipher below, and is what go-luks2 then uses for the anti-forensic
-	// stripes and the keyslot digest, keeping one hash across the header.
+	// hashAlgo is SHA-512 (FIPS 180-4), used across the header.
 	hashAlgo = "sha512"
 
-	// cipher and cipherMode are AES in XTS mode, the block-device standard and
-	// FIPS-approved. They are two constants because go-luks2 takes them
-	// separately and joins them for the header, where they appear as the
-	// familiar "aes-xts-plain64".
+	// cipher and cipherMode are AES-XTS (aes-xts-plain64).
 	cipher     = "aes"
 	cipherMode = "xts-plain64"
 
-	// keySizeBits is in bits, and XTS splits it into two internal keys — so 512
-	// here is AES-256-XTS, not AES-512. go-luks2's default is also 512, and
-	// stating it is what makes the strength a property of this package rather
-	// than a consequence of a default that has moved before: cryptsetup, which
-	// wrote every container this software created before 2026-08-29, defaults to
-	// 256, which XTS halves to AES-128.
+	// keySizeBits is 512, which XTS splits into AES-256-XTS.
 	keySizeBits = 512
 )
 
@@ -92,12 +67,12 @@ const (
 // It is measured rather than taken from folklore, and it has now been measured
 // against two independent formatters that agree to the byte:
 //
-//   - cryptsetup 2.7.0 (measured 2026-08-27 on a loopback volume group).
+//   - cryptsetup 2.7.0 (measured on a loopback volume group).
 //     Formatting with exactly these parameters at 32 MiB, 64 MiB, 128 MiB,
 //     300 MiB and 1200 MiB put the data segment at offset 16777216 every time,
 //     and the plaintext mapping came back exactly that much smaller than the
 //     logical volume under it.
-//   - go-luks2 v0.1.7-alpha (measured 2026-08-29, formatting sparse files at
+//   - go-luks2 (measured formatting sparse files at
 //     the same five sizes and reading the segment offset back out of the header
 //     it wrote). Offset 16777216 at every size, keyslot area at 32768 with
 //     258048 bytes used.
@@ -122,21 +97,7 @@ const (
 // volume restored from a snapshot carries whatever header its source had.
 const HeaderBytes = 16 << 20
 
-// The device-mapper name prefixes the providers namespace their mappings with,
-// so an unlocked volume is recognizable on a host that also runs other LUKS
-// consumers.
-//
-// THEY MUST NOT BE PREFIXES OF ONE ANOTHER, and "bs-" and "bsr-" are not:
-// they differ at index 2, so no scope/volume pair can spell a name belonging to
-// the other provider by rearranging where a hyphen falls. Two providers over
-// one host is not hypothetical — a node can run a local provider and a
-// replicated one out of the same volume group — and the mapping namespace is
-// flat for the whole host.
-//
-// A collision that got through anyway would still be refused rather than acted
-// on: Manager.IsOpen compares the mapping's backing device by major:minor and
-// reports a foreign one as an error. These constants are what keeps that
-// refusal from being something an ordinary deployment ever sees.
+// Mapping name prefixes per provider; neither may be a prefix of the other.
 const (
 	// MappingPrefix is pkg/local's.
 	MappingPrefix = "bs-"
@@ -214,17 +175,7 @@ func (m *Manager) key(ctx context.Context, volID string) (*enclave.MemoryEnclave
 	return enc, nil
 }
 
-// withKey lends the volume's passphrase to exactly one LUKS operation.
-//
-// The passphrase never becomes a []byte in this package: it stays in its
-// enclave, is passed to op, and is destroyed on the way out whatever happened,
-// so a failed operation does not leave locked pages holding a key behind. The
-// only code that reads the bytes is go-luks2, inside its own borrow, for the
-// length of one derivation.
-//
-// op MUST NOT destroy or retain the enclave. Every implementation of Backend is
-// bound by the same rule, and the native one keeps to it by handing the enclave
-// straight to go-luks2, which derives from it and holds nothing.
+// withKey lends the volume's passphrase enclave to one operation and destroys it after; op must not destroy or retain it.
 func (m *Manager) withKey(ctx context.Context, volID string, op func(key *enclave.MemoryEnclave) error) error {
 	enc, err := m.key(ctx, volID)
 	if err != nil {
@@ -259,20 +210,14 @@ func (m *Manager) withKey(ctx context.Context, volID string, op func(key *enclav
 // derivation that finishes in well under a millisecond, so the elapsed time
 // rounded to zero and every container came out with a hard-coded 100000 —
 // against the 3,344,740 cryptsetup 2.7.0 chose on the same hardware. go-luks2
-// #102 fixed the calibration and go-blockstore adopted it in #45.
+// now calibrates correctly.
 //
-// Measured after the adoption, with the pinned parameters: 3,988,449 iterations,
-// 2.42s of derivation, against 100000 and 363ms before it. So the count now
-// tracks the hardware, and pbkdfIterTime is consulted rather than ignored. The
-// cost is real and is paid on every container created — roughly two seconds
-// where it used to be a third of one — and it is the cost of the work actually
-// being done.
+// With the pinned parameters the count tracks the hardware (about 4 million
+// iterations, 2.4s of derivation), and pbkdfIterTime is consulted. The cost is
+// paid on every container created, and it is the cost of the work being done.
 //
-// The passphrase never leaves the process. It was written to a cryptsetup
-// child's standard input before 2026-08-29 — never as an argument, which any
-// process on the host could have read out of /proc/<pid>/cmdline — and now it
-// stays in its enclave and is lent to go-luks2, which borrows it for the
-// derivation, with no file descriptor at all.
+// The passphrase never leaves the process: it stays in its enclave and is lent
+// to go-luks2, which borrows it for the derivation, with no file descriptor.
 func (m *Manager) Format(ctx context.Context, volID, device string) error {
 	err := m.withKey(ctx, volID, func(key *enclave.MemoryEnclave) error {
 		return m.backend.Format(ctx, device, key)
@@ -356,13 +301,7 @@ func (m *Manager) IsOpen(ctx context.Context, volID, backing string) (bool, erro
 	return open, err
 }
 
-// ownMapping is the lookup IsOpen and MeasureMapping share: the mapping under
-// the volume's name, if there is one, refused unless it is over backing.
-//
-// It is one function so the two callers cannot disagree about what "our
-// mapping" means. A measurement taken of a mapping the ownership check would
-// have refused is a measurement of somebody else's device, and a resize that
-// acted on it would grow — or refuse to grow — the wrong volume.
+// ownMapping is the lookup IsOpen and MeasureMapping share: the named mapping, refused unless it is over backing.
 func (m *Manager) ownMapping(ctx context.Context, volID, backing string) (MappingInfo, bool, error) {
 	name := m.MappingName(volID)
 

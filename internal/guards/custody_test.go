@@ -50,14 +50,7 @@ func FileKeyProvider(enc *enclave.MemoryEnclave) error {
 }
 `
 
-// TestCustodyEveryBorrowWindowIsReal keeps borrowWindows honest against the
-// tree it describes.
-//
-// An entry naming a function that no longer borrows is an exemption waiting
-// for something to wear it: rename FileKeyProvider, add a WithBytes call under the old
-// name somewhere else, and a stale entry would let it through. So every entry
-// has to correspond to a site the scan actually met, and the anchor to exactly
-// one.
+// TestCustodyEveryBorrowWindowIsReal requires every borrowWindows entry to match a site the scan met.
 func TestCustodyEveryBorrowWindowIsReal(t *testing.T) {
 	_, evidence, err := scanCustody(repoRoot(t))
 	if err != nil {
@@ -77,13 +70,7 @@ func TestCustodyEveryBorrowWindowIsReal(t *testing.T) {
 	}
 }
 
-// TestCustodyLosingTheAnchorIsNotAPass is rule 1's fail-closed half.
-//
-// If FileKeyProvider stops calling WithBytes while the tree still borrows
-// elsewhere, the window table is being checked against nothing, and a scanner
-// in that state must say so at the anchor rather than report the tree clean.
-// If FileKeyProvider is gone altogether, the scanner has nothing to anchor on
-// and the scan itself fails.
+// TestCustodyLosingTheAnchorIsNotAPass requires a scan without its FileKeyProvider anchor to fail.
 func TestCustodyLosingTheAnchorIsNotAPass(t *testing.T) {
 	t.Run("the anchor no longer borrows", func(t *testing.T) {
 		root := t.TempDir()
@@ -213,12 +200,7 @@ func (m *Manager) withKey(op func(key []byte) error) error {
 	}
 }
 
-// TestCustodyAFileNoConfigurationSelectsIsAScanFailure keeps the type-checked
-// scanner from failing open on the file most likely to be unusual.
-//
-// The text scanners read every file whatever its build tags say. This one
-// cannot — it needs a consistent package — so instead it refuses to report a
-// tree clean while a file went unread.
+// TestCustodyAFileNoConfigurationSelectsIsAScanFailure requires a file no build configuration selects to fail the scan.
 func TestCustodyAFileNoConfigurationSelectsIsAScanFailure(t *testing.T) {
 	root := t.TempDir()
 	writeTree(t, root, map[string]string{

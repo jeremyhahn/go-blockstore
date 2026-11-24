@@ -19,31 +19,10 @@ import (
 	"strings"
 )
 
-// failOpenMarker is the annotation that declares a deliberate exit-swallow and
-// says why.
-//
-// The scanner takes an ANNOTATION rather than an exemption list because the
-// thing worth having is the reason, written next to the code, where the next
-// reader meets it. A central allowlist records that somebody once decided;
-// it does not record what they decided or why, and it drifts out of sight.
+// failOpenMarker annotates a deliberate exit-swallow with its reason.
 const failOpenMarker = "guard:fail-open"
 
-// fleetManagedFiles are files this repository does not own and cannot annotate,
-// so the fail-open scanner does not read them.
-//
-// automerge.yml is deployed into every repository byte-for-byte from the
-// company template by infra/gitea/scripts/deploy-gitea-workflows.sh, which
-// checks that each copy is identical. A `# guard:fail-open` line added here
-// would be overwritten on the next deploy, or would fail that check. This repo
-// cannot make the change, and a scanner that keeps main red over it fails every
-// PR. Its exit-swallows are reviewed where the file is written, in the company
-// repository (automatethethings software/templates/github-actions). Measured
-// 2026-10-05: automerge v7 line 616, `read ... < <(...; echo) || true`, turned
-// main's Lint red (#78).
-//
-// The match is on the exact path. Every other workflow, script and Makefile in
-// this repository, including any other file under .github/workflows/, is still
-// scanned.
+// fleetManagedFiles are template-deployed files this repository cannot annotate; matched by exact path.
 var fleetManagedFiles = map[string]struct{}{
 	".github/workflows/automerge.yml": {},
 }
@@ -151,13 +130,7 @@ func scanShellForFailOpen(root, rel string) ([]Finding, error) {
 	return findings, nil
 }
 
-// isFailOpen reports whether a line swallows an exit status in a command
-// position.
-//
-// A COMMENT that merely discusses the construction is not a violation, and
-// getting that wrong would make the scanner fire on its own documentation and
-// on the comments explaining previous incidents — several of which exist in
-// this repository precisely because the bug was worth recording.
+// isFailOpen reports whether a line swallows an exit status in a command position; comments do not count.
 func isFailOpen(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	if strings.HasPrefix(trimmed, "#") {

@@ -21,11 +21,7 @@ import (
 	"strings"
 )
 
-// skipMethods are the testing methods that make a test report success without
-// having run.
-// t.Parallel is deliberately absent: it changes when a test runs, not whether
-// it runs, and listing it here would have been a scanner rejecting a practice
-// the guidelines encourage.
+// skipMethods are the testing methods that report success without running; t.Parallel is not one.
 var skipMethods = map[string]struct{}{
 	"Skip":    {},
 	"Skipf":   {},
@@ -103,10 +99,7 @@ func scanGoForSkips(root, rel string) ([]Finding, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, rel, source, parser.ParseComments)
 	if err != nil {
-		// A file this package cannot parse is reported as a scan failure by the
-		// caller rather than skipped. A parser error that silently produced
-		// zero findings would be the scanner failing open on exactly the file
-		// most likely to be unusual.
+		// An unparsable file is a scan failure for the caller, never zero findings.
 		return nil, err
 	}
 

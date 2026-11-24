@@ -76,12 +76,7 @@ func preflightModeSpellings() []string {
 	return spellings
 }
 
-// requiredCapabilities derives what this configuration will actually ask the
-// kernel to do.
-//
-// The derivation is from the Options as the caller supplied them, before New
-// substitutes defaults, because a nil seam is precisely what says "the real one
-// will be used".
+// requiredCapabilities derives the needed capabilities from the Options before defaults are applied.
 func requiredCapabilities(opts Options, mode PreflightMode) []preflight.Capability {
 	if mode == PreflightOff {
 		return nil
@@ -99,10 +94,7 @@ func requiredCapabilities(opts Options, mode PreflightMode) []preflight.Capabili
 		capabilities = append(capabilities, preflight.CapabilityMount)
 	}
 
-	// The kernel keyring is only reached when this provider handles encrypted
-	// volumes, which is what Encrypted or a KeyProvider says. Encryption also
-	// creates dm-crypt mappings, so it implies device-mapper whatever the
-	// runner is.
+	// Encryption needs the kernel keyring and implies device-mapper.
 	if all || (opts.luks == nil && (opts.Encrypted || opts.KeyProvider != nil)) {
 		capabilities = append(capabilities, preflight.CapabilityKernelKeyring)
 		usesDeviceMapper = true
@@ -114,20 +106,7 @@ func requiredCapabilities(opts Options, mode PreflightMode) []preflight.Capabili
 	return capabilities
 }
 
-// runPreflight verifies the deployment before New returns a Provider.
-//
-// It runs LAST in New, after every argument has been validated, so that a
-// caller who got the configuration wrong hears about the configuration rather
-// than about a container's capabilities. And it runs at construction rather
-// than at the first Attach: the conditions it detects are fixed when the
-// process starts and cannot change afterwards, so discovering them at the first
-// volume operation converts a deployment mistake into an outage in the middle
-// of a shift, in a code path that reads like a storage fault.
-//
-// Nothing is checked when the derived capability set is empty — a provider
-// driven entirely through injected seams performs no privileged operation of
-// its own — and that is not a silent pass: it is the case where there is
-// nothing to be privileged for.
+// runPreflight runs last in New, after argument validation; an empty capability set checks nothing.
 func runPreflight(opts Options, mode PreflightMode) error {
 	capabilities := requiredCapabilities(opts, mode)
 	if len(capabilities) == 0 {

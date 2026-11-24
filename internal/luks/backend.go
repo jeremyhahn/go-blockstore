@@ -29,21 +29,19 @@ import (
 // is no binary any more. Every operation here is performed IN THIS PROCESS by
 // github.com/jeremyhahn/go-luks2: the header is parsed in Go, the key is
 // derived in Go, and the plaintext mapping is created with device-mapper ioctls
-// rather than by forking cryptsetup. Owner ruling 2026-08-29: everything is
-// done in pure Go unless there is absolutely no other way.
+// rather than by forking cryptsetup.
 //
-// EVERY key parameter is a *enclave.MemoryEnclave the caller lends for the
+// Every key parameter is a *enclave.MemoryEnclave the caller lends for the
 // duration of one call and nothing longer. An implementation must not destroy
 // it, retain it or let it outlive the call — see Manager.withKey, which owns the
 // enclave and destroys it, and KeyProvider, which explains what the enclave is
 // protecting. No implementation reads the passphrase as a []byte itself: the
 // native one hands the enclave to go-luks2, which borrows it for the derivation.
 //
-// THERE IS NO RESIZE HERE, and its absence is load-bearing. Growing a dm-crypt
+// There is no resize here, and its absence is load-bearing. Growing a dm-crypt
 // mapping in place means reloading the device-mapper table underneath the live
 // device, which needs the container's master key; go-luks2 exposes neither that
-// nor a resize of its own — measured against v0.2.0-alpha on 2026-09-17 and
-// still true of v1.0.0-rc.2: pkg/dmcrypt has Activate, Lookup and Deactivate, no
+// nor a resize of its own: pkg/dmcrypt has Activate, Lookup and Deactivate, no
 // reload, no suspend/resume, and Activate computes a "dynamic" segment's length
 // once, from the backing device's size at that moment. The only mechanism reachable
 // through it is to remove the mapping and unlock again, which is a destructive
@@ -54,7 +52,7 @@ import (
 // attached encrypted volume with ErrResizeWhileAttached, pkg/drbd's refuses a
 // mapping that has fallen behind its device with ErrMappingStale, and no
 // implementation of this interface has an operation capable of tearing down a
-// mapping the caller is using. What the seam offers instead is the MEASUREMENT
+// mapping the caller is using. What the seam offers instead is the measurement
 // — MappingInfo carries the mapping's length and its backing device's current
 // size — so a provider can tell a mapping that still covers its device from one
 // that no longer does, and refuse to grow a filesystem into the latter. See

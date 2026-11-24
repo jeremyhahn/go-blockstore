@@ -32,46 +32,8 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// resourceTemplate renders a per-volume DRBD resource file.
-//
-// Every field it interpolates is either a typed integer or a string that has
-// already passed an allowlist in validate.go, so a caller-supplied volume name
-// cannot open a brace and add configuration of its own. The template is
-// text/template rather than string concatenation for the same reason it is
-// worth having at all: one place where the shape of the file lives, and no
-// arithmetic on strings at the call site.
-//
-// Peer authentication is cram-hmac-alg with a shared secret, and the secret is
-// written into this file because that is where drbdadm reads it from. There is
-// no indirection DRBD offers — no key file, no agent — so the file carries the
-// secret at the same trust level as a LUKS key file and is written 0600 in a
-// directory this provider creates 0750. That constraint belongs to DRBD's
-// design; what belongs here is not pretending otherwise. See the package doc.
-//
-// Protocol C is not configurable. It is the only one of DRBD's three protocols
-// that acknowledges a write after the peer has it on stable storage, and the
-// lease-gated failover this library exists to support assumes exactly that: a
-// node that takes over must find every write the old primary acknowledged.
-// Protocols A and B would make that false and are not offered.
-//
-// The connection between the two hosts is left implicit. DRBD 9 connects every
-// pair of nodes that carry a node-id in the same resource, which for two hosts
-// is the one connection wanted; spelling it out adds a place for the two halves
-// to disagree.
-// The template is split at the secret, into named pieces executed in sequence.
-//
-// That split is the whole point. The shared secret arrives in an enclave and
-// must never become an ordinary Go value: a string handed to a template is
-// copied into the template's output buffer and both live on the heap, outliving
-// the enclave's destruction and reachable in a core dump or a swapped page. So
-// the template renders everything EXCEPT the secret's bytes, and those go from
-// the borrowed slice to the file descriptor directly.
-//
-// "head" ends immediately after the opening quote of the shared-secret line and
-// "authClose" begins with the closing one, so the two fragments around the
-// secret are fixed text this package wrote rather than anything interpolated.
-// "tail" is shared by both the authenticated and unauthenticated forms, so the
-// host stanzas exist once and cannot drift between them.
+// resourceTemplate renders a per-volume DRBD resource file from typed integers and allowlisted strings; protocol C only.
+// It is split around the shared secret, whose bytes are written from the enclave straight to the file.
 var resourceTemplate = template.Must(template.New("resource").Parse(
 	`{{define "head"}}# Managed by go-blockstore (provider "drbd"). Do not edit by hand.
 # Volume: {{.Name}}
@@ -133,16 +95,7 @@ func formatAddress(ip net.IP, port int) string {
 	return fmt.Sprintf("ipv6 [%s]:%d", ip.String(), port)
 }
 
-// writeResourceFile renders a volume's resource file straight to disk.
-//
-// It renders to the FILE rather than to a buffer, because the shared secret
-// passes through here and a buffer is a heap copy that outlives the enclave.
-// The fragments around the secret are rendered from the template; the secret's
-// bytes are written from inside the enclave borrow, to the same descriptor, and
-// never exist as a Go string or a slice this package owns.
-//
-// The file is 0600: it carries the secret, so it is worth what a LUKS key file
-// is worth.
+// writeResourceFile renders a volume's resource file straight to disk, 0600, writing the secret from inside the enclave borrow.
 func (p *Provider) writeResourceFile(ctx context.Context, m *resourceMeta) error {
 	params, err := p.resourceParams(m)
 	if err != nil {
@@ -175,10 +128,6 @@ func (p *Provider) writeResourceFile(ctx context.Context, m *resourceMeta) error
 }
 
 // resourceParams builds and re-validates the rendering input.
-//
-// Belt and braces: the fields are validated before they reach here, but a
-// future caller that forgets should get a failure rather than a resource file
-// with an injected block in it.
 func (p *Provider) resourceParams(m *resourceMeta) (resourceParams, error) {
 	params := resourceParams{
 		HMACAlg:                sharedSecretHash,
@@ -213,13 +162,7 @@ func (p *Provider) resourceParams(m *resourceMeta) (resourceParams, error) {
 	return params, nil
 }
 
-// resourceMeta is what this provider records about a volume it provisioned.
-//
-// It lives in StateDir rather than in the resource file because the resource
-// file belongs to DRBD: it is globbed by drbd.conf, parsed by drbdadm, and has
-// no room for the volume's requested size, filesystem or labels. The record is
-// also the provider's answer to "does this volume exist" — its presence is what
-// separates common.ErrNotFound from a real lookup.
+// resourceMeta is what this provider records about a volume it provisioned, in StateDir; its presence means the volume exists.
 type resourceMeta struct {
 	// Name is the volume ID, the DRBD resource name and the LV name.
 	Name string `json:"name"`
@@ -313,11 +256,7 @@ func (p *Provider) resPath(name string) string {
 	return filepath.Join(p.cfg.ConfigDir, name+".res")
 }
 
-// loadMeta reads the record of a volume that has finished being provisioned.
-//
-// It returns common.ErrNotFound both when there is no record and when the one
-// there is still marked Incomplete: from any caller's point of view a volume
-// whose Provision has not returned does not exist yet.
+// loadMeta reads a finished volume's record; missing or incomplete is common.ErrNotFound.
 func (p *Provider) loadMeta(name string) (resourceMeta, error) {
 	m, err := p.readMeta(name)
 	if err != nil {
@@ -329,10 +268,7 @@ func (p *Provider) loadMeta(name string) (resourceMeta, error) {
 	return m, nil
 }
 
-// readMeta reads a volume's record whether or not it is complete. Provision
-// uses it to detect a name already claimed, and Delete to clean up after a
-// provision that did not finish. It returns common.ErrNotFound, wrapped, when
-// there is no record.
+// readMeta reads a volume's record whether or not it is complete; common.ErrNotFound, wrapped, when absent.
 func (p *Provider) readMeta(name string) (resourceMeta, error) {
 	data, err := os.ReadFile(p.metaPath(name))
 	if err != nil {
@@ -345,23 +281,7 @@ func (p *Provider) readMeta(name string) (resourceMeta, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return resourceMeta{}, fmt.Errorf("parsing state for volume %q: %w", name, err)
 	}
-	// A record describes a logical volume in the volume group it names, and
-	// every path that acts on one builds "<configured vg>/<lv>" from the
-	// CURRENT configuration. Let those two disagree and the record stops
-	// describing what the operation will touch: a state directory carried
-	// across a volume_group change, or copied between configurations, aims
-	// Delete's lvremove at a same-named volume in the new group — destroying
-	// something this provider never created while leaving the real volume
-	// behind. Mount, Resize, Snapshot and the restore copy all read the same
-	// way.
-	//
-	// Honoring the RECORDED group instead would be worse, not better: this
-	// provider's own lvs listing covers only the configured group, so the
-	// allocator and every listing would describe one group while the
-	// destructive paths worked in another. Refusing keeps them describing the
-	// same node and puts the misconfiguration in front of a human, which is the
-	// only place it can actually be resolved. It also gives resourceMeta.VG a
-	// job; until now it was written and never read.
+	// A record naming a volume group other than the configured one is refused, so destructive paths never act on a same-named LV elsewhere.
 	if m.VG != p.cfg.VG {
 		return resourceMeta{}, fmt.Errorf(
 			"state record %s describes volume group %q but this provider is configured for %q; "+
@@ -371,20 +291,7 @@ func (p *Provider) readMeta(name string) (resourceMeta, error) {
 	return m, nil
 }
 
-// listMeta reads every volume record in StateDir.
-//
-// A record that cannot be read or parsed FAILS the call. That is the opposite
-// of tolerating it, and deliberately so: the only caller is minor and port
-// allocation, whose entire job is to avoid handing out a number something else
-// already holds. A skipped record is a volume the allocator cannot see, and the
-// resource or logical volume it describes is still out there — so the next
-// Provision can hand a new volume a device minor or a replication port that a
-// live resource is using, and two resources fighting over one minor is not a
-// failure that announces itself.
-//
-// Refusing to provision until somebody looks at the state directory is the
-// cheaper outcome. A file that is not a record at all — anything without the
-// .json suffix — is not a corrupt record and is ignored.
+// listMeta reads every volume record in StateDir; an unreadable record fails the call, non-.json files are ignored.
 func (p *Provider) listMeta() ([]resourceMeta, error) {
 	entries, err := os.ReadDir(p.cfg.StateDir)
 	if err != nil {
@@ -429,19 +336,7 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	})
 }
 
-// writeFileAtomicFunc is the same, for content that must be streamed rather
-// than handed over as a slice.
-//
-// fn receives the FILE, unbuffered and on purpose: a bufio.Writer would copy
-// what it is given onto the heap, which is exactly what the shared secret must
-// not have happen to it. Every Write here is a syscall against the caller's
-// bytes.
-//
-// The three Close calls on the failure paths, and the Remove in the defer, are
-// deliberately unchecked: each runs on a path that is already returning the
-// error that matters, and a close or unlink failure there would displace it
-// with something less useful. The calls that decide whether the write actually
-// landed — Sync, the Close on the success path, and Rename — are all checked.
+// writeFileAtomicFunc streams content to the unbuffered file; Sync, the final Close and Rename are checked.
 func writeFileAtomicFunc(path string, perm os.FileMode, fn func(w io.Writer) error) error {
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp")
@@ -450,7 +345,7 @@ func writeFileAtomicFunc(path string, perm os.FileMode, fn func(w io.Writer) err
 	}
 	tmp := f.Name()
 	defer func() {
-		// Harmless once the rename has happened: the name no longer exists.
+		// Harmless once the rename has happened.
 		_ = os.Remove(tmp)
 	}()
 
@@ -472,34 +367,16 @@ func writeFileAtomicFunc(path string, perm os.FileMode, fn func(w io.Writer) err
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("installing %q: %w", path, err)
 	}
-	// The rename is atomic but not durable. Until the containing directory is
-	// synced the new entry can exist only in the page cache, so a crash after
-	// this function reported success can leave the file absent — the file whose
-	// contents were carefully fsynced a few lines up.
-	//
-	// A failure here is an error, not a warning. Both files this writes are
-	// things later code trusts to still be there: the resource file is what
-	// drbdadm needs to take a resource down, and the state record is what
-	// reserves a minor and a port — the reservation a failed rollback now
-	// deliberately keeps. A reservation that does not survive a crash is a
-	// reservation that has stopped protecting anything, and reporting success
-	// would be promising durability this has not established.
+	// Sync the directory so the rename survives a crash; a failure is an error.
 	if err := syncDir(dir); err != nil {
 		return fmt.Errorf("syncing directory %q after installing %q: %w", dir, path, err)
 	}
 	return nil
 }
 
-// syncDir flushes a directory's own entries to disk, which is what makes a
-// rename into it survive a crash.
-//
-// It is a variable solely so the tests can make the step fail; nothing in the
-// package replaces it.
+// syncDir flushes a directory's entries to disk; a variable so tests can make it fail.
 var syncDir = func(dir string) error {
-	// #nosec G304 -- dir is the directory of a path this package built, which is
-	// StateDir or the drbd.d directory from operator configuration joined with
-	// an allowlist-validated resource name; it is opened to fsync it and never
-	// read.
+	// #nosec G304 -- dir is a directory this package built from configuration and a validated name; opened only to fsync.
 	d, err := os.Open(dir)
 	if err != nil {
 		return err
@@ -511,14 +388,7 @@ var syncDir = func(dir string) error {
 	return d.Close()
 }
 
-// allocate picks the lowest free device minor and TCP port at or above the
-// configured bases, given the volumes already recorded.
-//
-// The record in StateDir is the only input: this provider owns the range, and a
-// minor or port inside it that belongs to something else is a deployment
-// mistake the bases exist to avoid. Reading the live drbdsetup status instead
-// would make provisioning depend on the kernel module being loaded and would
-// still miss resources that are configured but down.
+// allocate picks the lowest free minor and port at or above the configured bases, from the StateDir records.
 func allocate(existing []resourceMeta, minorBase, portBase int) (minor, port int, err error) {
 	usedMinor := make(map[int]struct{}, len(existing))
 	usedPort := make(map[int]struct{}, len(existing))
@@ -574,35 +444,9 @@ const (
 	drbdPeers = 1
 )
 
-// metadataBytes is the space DRBD 9 reserves for internal metadata on a backing
-// device holding dataBytes of data.
+// metadataBytes is the internal metadata DRBD 9 reserves for dataBytes of data, added on top of the request:
 //
-// It is this backend's half of the contract on common.VolumeSpec.SizeBytes:
-// that field is the capacity the CALLER CAN USE, and a provider with per-volume
-// overhead of its own allocates that overhead ON TOP rather than taking it out
-// of what was asked for. "meta-disk internal" puts the metadata at the END of
-// the backing device, so a backing volume created at exactly the requested size
-// would export a DRBD device smaller than the caller asked for. Provision
-// therefore adds this on top, and the caller gets the capacity in the spec.
-//
-// pkg/local implements the same contract against a LUKS2 header; see
-// luksHeaderBytes there. This package now does too: on an encrypted provider
-// the header is added on top of the request FIRST, giving the data area DRBD
-// exports (dataBytes), and this reservation is computed from that data area —
-// the bitmap covers the header's blocks like any others. The two backends
-// differ in what the overhead IS and agree on which side of the request it
-// falls.
-//
-// The size follows DRBD's own formula, in sectors:
-//
-//	M = ceil(C / 2^18) * 8 * peers + 72
-//
-// where C is the data area in sectors — one bit of bitmap per 4 KiB of data
-// per peer, plus the fixed superblock and activity log. The division rounds up
-// by a whole unit rather than exactly, because C is the data area of the
-// finished device and this is computed from the requested size, which is
-// fractionally smaller. Over-reserving by 4 KiB per peer costs nothing next to
-// LVM's 4 MiB extent rounding; under-reserving would truncate the volume.
+//	M = ceil(C / 2^18) * 8 * peers + 72 sectors, C the data area in sectors, rounded up by a whole unit.
 func metadataBytes(dataBytes int64) int64 {
 	dataSectors := (dataBytes + sectorBytes - 1) / sectorBytes
 	units := dataSectors/bitmapUnitSectors + 1
@@ -610,17 +454,7 @@ func metadataBytes(dataBytes int64) int64 {
 	return sectors * sectorBytes
 }
 
-// dataBytes is the DRBD data area — the size of the device DRBD exports — that
-// yields usableBytes of capacity the caller can write to.
-//
-// On a plain provider the two are the same number. On an encrypted one the
-// LUKS2 container sits INSIDE the DRBD device, so the device has to hold the
-// container's header as well as the caller's data, and the header is allocated
-// on top of the request like every other overhead in this package. Status
-// reverses this when it reads the device's size back; see usableBytes.
-//
-// It is unchecked, like backingBytes, for the hot path once a size is known
-// representable; backingBytesChecked guards the addition.
+// dataBytes is the DRBD device size that yields usableBytes; on an encrypted provider it adds the LUKS2 header.
 func dataBytes(usableBytes int64, encrypted bool) int64 {
 	if !encrypted {
 		return usableBytes
@@ -628,15 +462,7 @@ func dataBytes(usableBytes int64, encrypted bool) int64 {
 	return usableBytes + luks.HeaderBytes
 }
 
-// usableBytes is dataBytes inverted: the capacity a caller can write to on a
-// DRBD device of the given size. It is what Status reports for a device it has
-// measured, and what a size read back from DRBD has to go through before it
-// is compared against anything in a VolumeSpec's units.
-//
-// A device on an encrypted provider that is not even a header long cannot be
-// one this provider sized, and the caller sees an error rather than a zero or
-// negative capacity — an invented number is the failure this package refuses
-// to report.
+// usableBytes inverts dataBytes; a device smaller than the header is an error.
 func usableBytes(deviceBytes int64, encrypted bool) (int64, error) {
 	if !encrypted {
 		return deviceBytes, nil
@@ -647,42 +473,23 @@ func usableBytes(deviceBytes int64, encrypted bool) (int64, error) {
 	return deviceBytes - luks.HeaderBytes, nil
 }
 
-// backingBytes is the backing volume size that yields usableBytes of capacity
-// the caller can write to — the conversion from the units
-// common.VolumeSpec.SizeBytes is in to the units an lv_size is in: the data
-// area (usable plus, on an encrypted provider, the LUKS2 header) plus DRBD's
-// metadata for that data area. Every size comparison in this package goes
-// through it rather than mixing the two.
+// backingBytes converts usable capacity to backing LV size: data area plus DRBD metadata.
 func backingBytes(usableBytes int64, encrypted bool) int64 {
 	data := dataBytes(usableBytes, encrypted)
 	return data + metadataBytes(data)
 }
 
-// backingBytesChecked is backingBytes with its intermediate arithmetic guarded
-// against int64 overflow: ok is false when a step would wrap. A signed overflow
-// in Go wraps rather than trapping, so an unchecked backingBytes near
-// math.MaxInt64 comes back NEGATIVE — a backing size smaller than the data it is
-// supposed to hold, which then reads as a SHRINK everywhere a size is compared.
-//
-// It is the predicate the size bounds below binary-search and the check the
-// validators call before committing to a caller-controlled size. The unchecked
-// backingBytes stays for the hot path, once a size is known representable.
+// backingBytesChecked is backingBytes with int64 overflow detected (ok false), for caller-controlled sizes.
 func backingBytesChecked(usableBytes int64, encrypted bool) (int64, bool) {
 	if usableBytes < 0 {
 		return 0, false
 	}
-	// The header addition is the first step that can wrap on an encrypted
-	// provider, before the metadata step below ever sees the data area; an
-	// unguarded wrap here would hand metadataBytes a NEGATIVE data area.
+	// The header addition can wrap first.
 	if encrypted && usableBytes > math.MaxInt64-luks.HeaderBytes {
 		return 0, false
 	}
 	data := dataBytes(usableBytes, encrypted)
-	// metadataBytes rounds the data area up to a whole sector first, and that
-	// addition is the next step that can wrap. Once it is safe, everything
-	// downstream of it is: the bitmap math divides down before it multiplies
-	// back up, so metadataBytes itself cannot overflow for any data area this
-	// far below the ceiling.
+	// Rounding up to a sector can wrap next; nothing after it can.
 	if data > math.MaxInt64-(sectorBytes-1) {
 		return 0, false
 	}
@@ -693,10 +500,7 @@ func backingBytesChecked(usableBytes int64, encrypted bool) (int64, bool) {
 	return data + meta, true
 }
 
-// maxRoundableBytes is the largest byte count roundUpTo can take for a given
-// extent without the addition inside it overflowing. It mirrors the bound the
-// local provider guards against; a value past it wraps NEGATIVE. An extent of
-// one or less rounds nothing, so the whole range is roundable.
+// maxRoundableBytes is the largest count roundUpTo can take for extent without overflow.
 func maxRoundableBytes(extent int64) int64 {
 	if extent <= 1 {
 		return math.MaxInt64
@@ -704,35 +508,12 @@ func maxRoundableBytes(extent int64) int64 {
 	return math.MaxInt64 - (extent - 1)
 }
 
-// maxDataBytes is the largest USABLE capacity whose backing size stays
-// representable as an int64: the data area, plus DRBD's internal metadata, then
-// rounded up to a whole extent of the volume group. Past it, backingBytes — or
-// the extent rounding layered on top of it — wraps NEGATIVE, and a negative
-// backing target reads as a SHRINK: resizeLocked then finds the backing volume
-// already "larger" than the target, skips lvextend and the drbdadm resize that
-// follows it, and records the fabricated size as reached. The next legitimate
-// grow is refused against that recorded size. A caller that asks for more than
-// this bound gets common.ErrInvalidArgument naming it, because a size that has
-// no representable backing is malformed input, not an operation some other
-// backend could serve.
-//
-// Pass extent <= 0 where the caller does no rounding of its own — lvcreate
-// rounds internally, so only the metadata addition is bounded there. On an
-// encrypted provider the bound is one LUKS2 header lower, since the header is
-// part of the data area the metadata and the rounding are computed over.
-//
-// backingBytes and roundUpTo are both monotonic non-decreasing, so the
-// representable capacities form a prefix [0, max] and a binary search finds its
-// top exactly, without inverting metadataBytes's nested ceilings by hand.
+// maxDataBytes is the largest usable capacity whose rounded backing size fits an int64; larger requests are common.ErrInvalidArgument. Found by binary search; extent <= 0 means no rounding.
 func maxDataBytes(extent int64, encrypted bool) int64 {
 	limit := maxRoundableBytes(extent)
 	lo, hi := int64(0), int64(math.MaxInt64)
 	for lo < hi {
-		// Bias the midpoint upward so the search converges on the last value that
-		// satisfies the predicate. Written as hi-(hi-lo)/2 rather than
-		// lo+(hi-lo+1)/2 because the +1 there overflows when the range is the
-		// whole int64 axis (lo 0, hi math.MaxInt64), which is exactly the extent
-		// <= 0 case.
+		// Bias the midpoint up; hi-(hi-lo)/2 cannot overflow over the whole int64 range.
 		mid := hi - (hi-lo)/2
 		if b, ok := backingBytesChecked(mid, encrypted); ok && b <= limit {
 			lo = mid
@@ -743,12 +524,7 @@ func maxDataBytes(extent int64, encrypted bool) int64 {
 	return lo
 }
 
-// devicePath is the block device a resource's volume appears at.
-//
-// The minor is used rather than the /dev/drbd/by-res/<name>/0 symlink because
-// the minor is recorded by this provider and the symlink is created by udev:
-// the device node exists as soon as the resource is up, while the symlink
-// depends on a udev rule being installed and a uevent being processed.
+// devicePath is /dev/drbd<minor>, which exists as soon as the resource is up.
 func devicePath(minor int) string {
 	return fmt.Sprintf("/dev/drbd%d", minor)
 }

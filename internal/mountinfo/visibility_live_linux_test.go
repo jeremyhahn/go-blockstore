@@ -13,38 +13,13 @@
 
 //go:build linux
 
-// The visibility property checked against THIS host's live mount table.
-//
-// # Why it moved out of visibility_test.go
-//
-// It read /proc/self/mountinfo and excused itself with two runtime skips when
-// the read failed or came back empty. conventions/testing-guidelines.md
-// §No Skip Guards bars that: the only platform where those excuses were needed
-// is one without /proc, and a skip there costs the assertion on every platform
-// where it should hold. The prescribed fix is a declared compile-time gate, and
-// `_linux_test.go` is one — the file simply does not build where /proc does not
-// exist, which is greppable, whereas a skip is not.
-//
-// On Linux both conditions are now hard failures, and correctly so: a host whose
-// /proc/self/mountinfo cannot be read, or holds no records, is not a host this
-// package can make any claim about. Reporting that as a pass is the failure this
-// gate exists to prevent.
-//
-// Found by internal/guards' no-runtime-skip scanner (#47).
+// Checks the visibility property against this host's live mount table; an unreadable or empty table fails.
 
 package mountinfo
 
 import "testing"
 
-// TestVisibilityDoesNotHideAMountWithNoDuplicateOnItsChain states the
-// false-positive guard as a property rather than as one host's answer, and runs
-// it against whatever this machine has mounted right now.
-//
-// The rule can only hide a mount when some record shares a mount point with
-// another, so a record whose own mount point is unique AND whose every ancestor
-// has a unique mount point cannot legitimately be hidden. On a table with no
-// stacking at all — the common case — that is every record, and any hidden one
-// is a bug.
+// TestVisibilityDoesNotHideAMountWithNoDuplicateOnItsChain: a record with a unique mount point and unique ancestors is never hidden.
 func TestVisibilityDoesNotHideAMountWithNoDuplicateOnItsChain(t *testing.T) {
 	entries, err := Load()
 	if err != nil {

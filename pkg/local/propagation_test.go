@@ -252,11 +252,7 @@ func (t tableWithoutPropagation) VisibleMountPointsFor(ctx context.Context, devi
 	return t.MountPointsFor(ctx, device)
 }
 
-// The compatibility property the optional interface exists for, asserted at
-// COMPILE time: a caller's own mount table, written before the propagation
-// guard, must still satisfy MountTable. If PropagationAt were a required method
-// this line would not build — which is exactly what would happen to that
-// caller's code.
+// A mount table without PropagationAt still satisfies MountTable.
 var _ MountTable = tableWithoutPropagation{}
 
 // TestAMountTableWithoutPropagationIsNotAPropagationReader keeps the fixture
@@ -270,15 +266,7 @@ func TestAMountTableWithoutPropagationIsNotAPropagationReader(t *testing.T) {
 	}
 }
 
-// TestNewRefusesPropagationOverATableThatCannotReportIt is the other half of
-// making the seam optional, and it is refused at CONSTRUCTION.
-//
-// Skipping the check for a table that cannot answer would turn an injected seam
-// into a way to switch a security guard off silently. Discovering it at the
-// first Mount is barely better: the mount has already happened, the guard
-// cannot judge it, and the rollback cannot identify it either — so Mount would
-// return an error over a filesystem it left mounted. A configuration that
-// cannot work is refused before it can mount anything.
+// TestNewRefusesPropagationOverATableThatCannotReportIt: refused at construction.
 func TestNewRefusesPropagationOverATableThatCannotReportIt(t *testing.T) {
 	_, err := New(Options{
 		VolumeGroup:      "vg0",
@@ -326,14 +314,7 @@ func TestPropagationUncheckedWithATableThatCannotAnswer(t *testing.T) {
 	}
 }
 
-// TestARefusedMountIsNotUnwoundOverAnotherFilesystem is the rollback's own
-// version of the overmount hazard.
-//
-// Between this provider's mount succeeding and the propagation check refusing
-// it, anything on the host can mount over the target — the per-volume lock does
-// not stop a process that never asked this provider for anything. umount(2)
-// takes a path and detaches what is VISIBLE there, so a rollback that did not
-// look would tidy up by taking somebody else's filesystem down.
+// TestARefusedMountIsNotUnwoundOverAnotherFilesystem: a rollback never unmounts what was mounted on top.
 func TestARefusedMountIsNotUnwoundOverAnotherFilesystem(t *testing.T) {
 	p, runner := mountable(t, requireShared)
 	runner.withMounts(map[string][]string{"/dev/vg0/data": {"/mnt/data"}}).
@@ -344,11 +325,7 @@ func TestARefusedMountIsNotUnwoundOverAnotherFilesystem(t *testing.T) {
 		t.Fatal("Mount accepted a mount it could not verify")
 	}
 
-	// The guard now catches this EARLIER than the rollback did: asked about
-	// this device at this path, the mount table reports that something else is
-	// visible there, so no propagation verdict is reached at all. Reading the
-	// interloper's propagation would have been the fail-open — a shared thing
-	// landing on top would have made a private mount pass.
+	// The guard sees something else visible at the path and reaches no verdict.
 	if !errors.Is(err, mountinfo.ErrNotVisibleThere) {
 		t.Errorf("the finding does not say another filesystem is visible there: %v", err)
 	}
@@ -361,13 +338,7 @@ func TestARefusedMountIsNotUnwoundOverAnotherFilesystem(t *testing.T) {
 	}
 }
 
-// TestARefusedMountIsNotUnwoundAfterItIsRestacked is the hazard (device, path)
-// cannot see: a SECOND mount of the SAME device on the SAME path.
-//
-// Every string matches — same device, same target — so a rollback comparing
-// those would unmount the other actor's mount and leave the refused one
-// underneath. The kernel's identity for the mount instance is what tells them
-// apart, and it is what the rollback compares.
+// TestARefusedMountIsNotUnwoundAfterItIsRestacked: the mount ID tells a second mount of the same device apart.
 func TestARefusedMountIsNotUnwoundAfterItIsRestacked(t *testing.T) {
 	p, runner := mountable(t, requireShared)
 	runner.withMounts(map[string][]string{"/dev/vg0/data": {"/mnt/data"}})
@@ -418,15 +389,7 @@ func TestARefusedMountReportsAnUnreadableTableDuringUnwind(t *testing.T) {
 	}
 }
 
-// TestARefusedMountIsUnwoundEvenWhenTheCallerGaveUp is the compensating
-// action's own rule, and the likeliest way to reach the rollback at all.
-//
-// The guard reports a dead context as a refusal, so a caller whose deadline
-// passes just after mount(2) succeeds arrives here with ctx already gone. A
-// rollback that reused it would find the mount table unreadable, do nothing,
-// and leave behind exactly the mount it exists to remove — while the code reads
-// as though it had removed it. pkg/drbd learned this on a borrowed lvchange;
-// the rule is the same for a syscall.
+// TestARefusedMountIsUnwoundEvenWhenTheCallerGaveUp: the rollback works with ctx already dead.
 func TestARefusedMountIsUnwoundEvenWhenTheCallerGaveUp(t *testing.T) {
 	p, runner := mountable(t, requireShared)
 	runner.withMounts(map[string][]string{"/dev/vg0/data": {"/mnt/data"}})
@@ -453,14 +416,7 @@ func TestARefusedMountIsUnwoundEvenWhenTheCallerGaveUp(t *testing.T) {
 	}
 }
 
-// TestAVerifiedMountIsStillUnwoundForACallerWhoGaveUp covers the other half:
-// the mount is fine, and the caller stopped wanting it.
-//
-// The verification runs on its own context, so it reaches a verdict; the
-// CALLER's context is then checked, and a Mount that returns an error must not
-// leave a filesystem mounted. Both facts are needed — a cancellation reported
-// without the rollback would leave the mount, and a rollback without the report
-// would look like success.
+// TestAVerifiedMountIsStillUnwoundForACallerWhoGaveUp: the mount is unwound and the cancellation reported.
 func TestAVerifiedMountIsStillUnwoundForACallerWhoGaveUp(t *testing.T) {
 	p, runner := mountable(t, requireShared)
 	runner.withMounts(map[string][]string{"/dev/vg0/data": {"/mnt/data"}}).
@@ -483,15 +439,7 @@ func TestAVerifiedMountIsStillUnwoundForACallerWhoGaveUp(t *testing.T) {
 	}
 }
 
-// TestNewRefusesAnUnknownPropagationPolicy is the fail-open the settings path
-// alone does not close.
-//
-// MountPropagationPolicy is an exported integer type, so a caller building
-// Options by hand can write a value that is neither of the two. Every
-// comparison in this package is against MountPropagationShared, so an unknown
-// value would behave exactly like "off" — the guard silently absent because the
-// value asking for it was not one this package defines, and Posture reporting
-// it as NOT CHECKED as though that had been the choice.
+// TestNewRefusesAnUnknownPropagationPolicy: a value that is neither policy is refused.
 func TestNewRefusesAnUnknownPropagationPolicy(t *testing.T) {
 	_, err := New(Options{
 		VolumeGroup:      "vg0",

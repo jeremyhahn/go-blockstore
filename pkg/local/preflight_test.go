@@ -109,13 +109,7 @@ func TestRunPreflightChecksNothingWhenThereIsNothingToCheck(t *testing.T) {
 	}
 }
 
-// TestRunPreflightAgreesWithTheChecker ties the wiring to the package that owns
-// the probes: for the capabilities this configuration derives, New's answer must
-// be the checker's answer on this machine, whatever that is.
-//
-// This is the two-sided form. On a machine that can do the work it requires a
-// PASS, so a guard that refused everything would fail it; on a machine that
-// cannot it requires the refusal.
+// TestRunPreflightAgreesWithTheChecker: New's answer is the checker's answer on this machine.
 func TestRunPreflightAgreesWithTheChecker(t *testing.T) {
 	opts := Options{VolumeGroup: "vg0"}
 	capabilities := requiredCapabilities(opts, PreflightConfigured)
@@ -134,13 +128,7 @@ func TestRunPreflightAgreesWithTheChecker(t *testing.T) {
 	}
 }
 
-// TestNewRunsTheStartupPrivilegeChecks is the guard at the point that matters:
-// a Provider must not be constructed in a deployment that cannot serve it.
-//
-// It is written against the checker rather than against a fixed expectation, so
-// it asserts the real thing on a privileged host and on an unprivileged one.
-// Delete the runPreflight call from New and this test fails on any machine that
-// cannot do device-mapper.
+// TestNewRunsTheStartupPrivilegeChecks asserts against the checker on any host.
 func TestNewRunsTheStartupPrivilegeChecks(t *testing.T) {
 	opts := Options{VolumeGroup: "vg0"}
 	oracle := preflight.Check(context.Background(), requiredCapabilities(opts, PreflightConfigured)...)
@@ -304,9 +292,7 @@ func TestPreflightModeSpellingsAreStableAndComplete(t *testing.T) {
 	}
 }
 
-// TestNewFromSettingsRunsThePreflight is the factory-facing half: the checks
-// reach the path an operator's configuration actually takes, not only the
-// programmatic constructor.
+// TestNewFromSettingsRunsThePreflight: the checks run on the settings path too.
 func TestNewFromSettingsRunsThePreflight(t *testing.T) {
 	oracle := preflight.Check(context.Background(),
 		requiredCapabilities(Options{VolumeGroup: "vg0"}, PreflightConfigured)...)

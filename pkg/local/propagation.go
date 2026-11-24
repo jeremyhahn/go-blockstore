@@ -52,10 +52,7 @@ var errUnwindTargetTakenOver = mountguard.ErrTargetTakenOver
 // order, for the error a misspelling produces.
 func mountPropagationSpellings() []string { return mountguard.Spellings() }
 
-// mountGuard is this provider's policy over its mount table.
-//
-// It is built at each call site rather than held as a field, so the policy the
-// guard enforces and the policy Posture reports are the same one value.
+// mountGuard is this provider's policy over its mount table, built per call so Posture reports the same value.
 func (p *Provider) mountGuard() mountguard.Guard {
 	return mountguard.Guard{Policy: p.mountPropagation, Table: p.mountTable}
 }

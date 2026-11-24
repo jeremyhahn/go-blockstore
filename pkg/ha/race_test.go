@@ -24,13 +24,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// One goroutine per volume is the serialization the controller's check-then-act
-// sequences rest on, so the admission has to hold under a real race and not
-// merely under sequential calls.
-//
-// The barrier releases every caller at once; the assertion that matters is not
-// the error count but the promotion count, because two admitted managers would
-// each drive the provider.
+// Concurrent Manage calls for one volume admit one manager; the promotion count is the assertion.
 func TestConcurrentManageAdmitsExactlyOne(t *testing.T) {
 	const contenders = 8
 
@@ -124,12 +118,7 @@ func TestStatusIsSafeWhileTheControllerTransitions(t *testing.T) {
 		}()
 	}
 
-	// Fence and re-elect a few times underneath the readers.
-	//
-	// Each cycle registers TWO timers — the renewal wait a leader parks on, and
-	// the retry wait a fenced manager parks on — so the barriers step by two.
-	// Advancing before the manager has parked would fire into a clock nobody is
-	// waiting on and strand the loop.
+	// Fence and re-elect under the readers; each cycle registers two timers, so the barriers step by two.
 	for i := 0; i < 3; i++ {
 		r.clock.awaitTimers(t, 2*i+1)
 		r.coord.expireNow(r.leaseKey(testVolume))
@@ -185,9 +174,7 @@ func TestARenewalResolvingAfterDoneClosedNeverPromotes(t *testing.T) {
 	}
 }
 
-// Cancellation landing between the state read and the promotion. The read
-// completes honestly — that ordering is real — and the guard before Promote is
-// what stops the controller acting on an answer its lease no longer covers.
+// Cancellation between the state read and the promotion: the guard before Promote stops it.
 func TestCancellationBetweenTheStateReadAndThePromotion(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 

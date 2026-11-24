@@ -154,12 +154,7 @@ func TestListLVsRejectsUnreadableNumbers(t *testing.T) {
 	}
 }
 
-// TestListLVsAcceptsAnEmptyPercentWhereLVMLeavesItEmpty is the other half, and
-// it is measured rather than assumed: on LVM 2.03.16 data_percent is populated
-// only while the kernel has the device mapped, so a plain volume reports empty
-// always and so does an INACTIVE snapshot. Inactive is the ordinary state here —
-// this provider leaves snapshots deactivated — so refusing an empty value for
-// every snapshot would have failed every listing of a volume group holding one.
+// TestListLVsAcceptsAnEmptyPercentWhereLVMLeavesItEmpty: plain volumes and inactive snapshots report empty data_percent.
 func TestListLVsAcceptsAnEmptyPercentWhereLVMLeavesItEmpty(t *testing.T) {
 	cases := map[string]string{
 		"plain volume":      `{"report":[{"lv":[{"lv_name":"data","lv_size":"1024","lv_attr":"-wi-a-----","origin":"","lv_time":"","data_percent":""}]}]}`,
@@ -266,11 +261,7 @@ func TestRoundUpToExtent(t *testing.T) {
 	}
 }
 
-// TestRoundUpToExtentAtTheBoundary walks the edge where the addition inside
-// roundUpToExtent would overflow. Signed overflow in Go wraps rather than
-// trapping, so an unguarded round of a near-maximal size comes back NEGATIVE —
-// and a negative target reads as smaller than the volume already is, turning a
-// request to grow enormously into an "unsupported shrink".
+// TestRoundUpToExtentAtTheBoundary walks the edge where the rounding addition would overflow.
 func TestRoundUpToExtentAtTheBoundary(t *testing.T) {
 	const extent = 4 << 20
 	limit := maxRoundableBytes(extent)
@@ -329,11 +320,7 @@ func TestProbeFSTypeParsesBlkidExport(t *testing.T) {
 	}
 }
 
-// TestProbeFSTypeRequiresATypeOnSuccess closes a fail-open. A zero exit means
-// blkid identified the device, so it owes a TYPE; returning "" for output that
-// lacks one would hand callers the authoritative "this is a raw device" answer
-// on the strength of truncated or unexpected output — and Attach acts on that
-// answer by treating a LUKS container as a plain device.
+// TestProbeFSTypeRequiresATypeOnSuccess: a zero blkid exit without a TYPE is an error.
 func TestProbeFSTypeRequiresATypeOnSuccess(t *testing.T) {
 	cases := map[string]string{
 		"empty output":      "",
@@ -392,15 +379,7 @@ func TestProbeFSTypeOnlyAcceptsTheNotFoundStatus(t *testing.T) {
 	}
 }
 
-// TestLUKSIsOpenOnlyAcceptsAnAbsentMapping keeps a lookup that could not answer
-// from being read as "the mapping is not open".
-//
-// The negative answer is exactly one thing: the mapping lookup succeeded and
-// found no mapping under the name. Everything else — a device-mapper that
-// cannot be reached, a mapping whose backing device sysfs will not name, a
-// permission problem — is reported, because guessing "not open" would make
-// Attach try to unlock a volume that is already unlocked and Detach skip a
-// mapping it should have closed.
+// TestLUKSIsOpenOnlyAcceptsAnAbsentMapping: only a successful lookup finding no mapping means not open; other failures are reported.
 func TestLUKSIsOpenOnlyAcceptsAnAbsentMapping(t *testing.T) {
 	failures := map[string]error{
 		"device-mapper unreachable": errors.New("open /dev/mapper/control: permission denied"),
@@ -508,8 +487,7 @@ func TestLVMFailuresPropagate(t *testing.T) {
 
 	cases := map[string]struct {
 		binary string
-		// failCopy fails the block-device copy instead of a binary, for the one
-		// operation whose failure no longer comes from an exec.
+		// failCopy fails the in-process block-device copy.
 		failCopy bool
 		lvs      []lvFixture
 		call     func(*Provider) error

@@ -67,26 +67,14 @@ func Copy(ctx context.Context, src, dst string) error {
 		return &CopyError{Source: src, Destination: dst, Op: "closing the destination", Err: err}
 	}
 
-	// The transfer honors the context per buffer, but the flush and close after
-	// it do not: on a block device they are the writeback, and they can take
-	// substantial time with no way to interrupt them. A caller whose deadline
-	// expired in there would otherwise be told the copy succeeded and go on to
-	// the next step — for a restore, tagging the volume and reporting it ready
-	// — under a context that has been dead since before the copy finished.
-	//
-	// Same reasoning and same treatment as ZeroOut: what this reports is that
-	// the caller gave up, not that nothing was written.
+	// The flush and close are uninterruptible writeback, so the context is checked again after them.
 	if err := ctx.Err(); err != nil {
 		return &CopyError{Source: src, Destination: dst, Op: "copying", Err: err}
 	}
 	return nil
 }
 
-// contextReader stops a copy when its context is done.
-//
-// io.Copy takes no context, so cancellation has to enter through the reader. The
-// check is per buffer rather than per byte, which for a 4 MiB buffer means a
-// canceled copy stops within one transfer.
+// contextReader stops a copy within one buffer once its context is done.
 type contextReader struct {
 	ctx context.Context
 	r   io.Reader
@@ -142,31 +130,14 @@ func ZeroOut(ctx context.Context, device string, offset int64) error {
 		return &ZeroOutError{Device: device, Offset: offset, Size: size, Err: err}
 	}
 
-	// The ioctl cannot be interrupted, and on a large device it is the step that
-	// takes minutes: a caller that gave up did so while it was running, and the
-	// check before it was made long ago. So the context is checked again here.
-	//
-	// What this reports is that the CALLER gave up, not that the device is
-	// untouched — the zeroing above completed, and the volume is zeroed whatever
-	// this returns. Reporting it is still the right way round: every caller uses
-	// a failed wipe to stop short of the deletion that follows, and stopping
-	// leaves a zeroed volume to try again on. Reporting success would hand a
-	// dead context to the next step instead.
+	// The ioctl is uninterruptible; report a caller that gave up meanwhile, even though the range is zeroed.
 	if err := ctx.Err(); err != nil {
 		return &ZeroOutError{Device: device, Offset: offset, Size: size, Err: err}
 	}
 	return nil
 }
 
-// rangeToZero decides what ZeroOut asks the kernel for, given where the caller
-// wants zeroing to start and how large the device turned out to be.
-//
-// It is separate from ZeroOut because it is the part with the decisions in it —
-// an offset past the end is a caller error, an offset exactly at the end is
-// nothing to do, and everything else runs to the end of the device — while the
-// rest of ZeroOut is an open and an ioctl that need a real block device and
-// root to reach. Deciding here means the decisions are checked by the unit
-// tests rather than only by the integration suite.
+// rangeToZero decides the zeroing range for a device size, so the decisions are unit-testable.
 func rangeToZero(offset, size int64) (length uint64, zero bool, err error) {
 	// Checked by ZeroOut before the device is opened; repeated here so this
 	// function's own contract makes the conversion below provably in range.

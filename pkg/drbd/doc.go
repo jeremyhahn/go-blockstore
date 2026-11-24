@@ -32,8 +32,8 @@
 // here is a fixed two-node HA pair whose placement is decided by configuration,
 // not scheduled. Adopting LINSTOR would add a controller daemon (itself a
 // single point of failure needing its own HA story), a satellite on both nodes,
-// a database, and a second source of truth for state that the HA controller in
-// issue #4 already keeps in the injected Coordinator. drbdadm needs none of
+// a database, and a second source of truth for state that the HA controller
+// already keeps in the injected Coordinator. drbdadm needs none of
 // that: the kernel module, drbd-utils, and a generated .res file per volume.
 //
 // The cost of the choice is that this provider owns resource-file generation,
@@ -47,7 +47,7 @@
 // It is the mechanical layer: it creates backing logical volumes, generates and
 // installs DRBD resource configuration, brings resources up and down, and
 // exposes Promote, Demote and ReplicationState. It does not talk to a
-// common.Coordinator and holds no leases. The HA controller (issue #4) owns the
+// common.Coordinator and holds no leases. The HA controller owns the
 // per-volume primary lease and calls Promote only while it holds that lease.
 // Keeping the lease out of here means the promotion path has exactly one
 // gatekeeper.

@@ -185,14 +185,7 @@ func TestVerifyAcceptsAMountThatPropagates(t *testing.T) {
 	}
 }
 
-// TestVerifyReadsTheTableEvenOnADeadContext is the ordering that keeps a
-// canceled caller from leaving an unidentifiable mount behind.
-//
-// Once mount(2) has returned, verifying and unwinding are COMPLETION work. A
-// caller whose deadline passed in that instant would otherwise leave a mount
-// that was never verified and never cleaned up, because the read that would
-// identify it fails first. So the read happens, and THEN the caller is told they
-// gave up — with the identity in hand.
+// TestVerifyReadsTheTableEvenOnADeadContext requires the mount table read to happen before reporting cancellation.
 func TestVerifyReadsTheTableEvenOnADeadContext(t *testing.T) {
 	table := &readerTable{id: 11, propagates: true, spelling: "shared:1"}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -256,8 +249,7 @@ func TestUnwindLeavesAMountThatIsNoLongerOurs(t *testing.T) {
 			guard:   Guard{Policy: Shared, Table: &readerTable{err: unreadable}},
 			wantErr: unreadable,
 		},
-		// The case (device, path) cannot see: a SECOND mount of the same device
-		// stacked on the same path. Unmounting by path would detach theirs.
+		// A second mount of the same device stacked on the same path.
 		"a different mount is at the target now": {
 			guard:   Guard{Policy: Shared, Table: &readerTable{id: 6}},
 			wantErr: ErrTargetTakenOver,

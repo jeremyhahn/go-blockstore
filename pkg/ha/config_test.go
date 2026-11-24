@@ -136,9 +136,7 @@ func TestConfigValidate(t *testing.T) {
 		},
 		{
 			name: "an overflowing cadence is still rejected",
-			// RenewInterval*3 wraps NEGATIVE at this magnitude, which is why
-			// the check is spelled as a division. A multiplication would let
-			// this through.
+			// RenewInterval*3 wraps negative here, which is why the check divides.
 			cfg: Config{NodeID: testNode, LeaseTTL: time.Hour,
 				RenewInterval: time.Duration(math.MaxInt64 / 2)}.withDefaults(),
 			wantErr:  true,

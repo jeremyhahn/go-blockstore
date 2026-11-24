@@ -29,14 +29,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// TestValidateSharedSecret is the check standing where an allowlist cannot.
-//
-// Every other value in a generated resource file has a shape — a volume name, a
-// hostname, an address — and is checked against one. A secret is arbitrary by
-// definition, and it goes inside a quoted string in a file drbdadm parses as
-// configuration. A secret carrying a quote and a newline would close the
-// string, end the statement, and have whatever followed read as DRBD
-// directives.
+// TestValidateSharedSecret: a secret must not be able to break out of its quoted string.
 func TestValidateSharedSecret(t *testing.T) {
 	ok := []string{
 		"s3cr3t-replication-key",
@@ -154,8 +147,7 @@ func TestFileSecretProviderReadsIntoAnEnclave(t *testing.T) {
 			p, _ := newTestProvider(t)
 			p.secrets = FileSecretProvider(path)
 
-			// The secret is observed where it lands — in the file — because
-			// there is no longer any way to obtain it as a value.
+			// The secret is observed in the file, the only place it exists as bytes.
 			var sink bytes.Buffer
 			err := p.writeSharedSecret(context.Background(), testVolume, &sink)
 			if tc.wantErr {

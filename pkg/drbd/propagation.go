@@ -35,10 +35,7 @@ import (
 // succeeds, this provider reports success, and the workload walks to the path
 // and finds the directory as it was.
 //
-// It was left out of #34 because extending a new refusal into the replication
-// provider is a behavior change that lane had not been asked for, not because
-// the question does not arise here. #40 asked it and the answer is this: the
-// guard exists here, and it is OFF unless a deployment says otherwise.
+// The guard exists here, and it is off unless a deployment says otherwise.
 //
 // # Why off by default
 //
@@ -81,33 +78,17 @@ const (
 // a guard it never turns on.
 type MountPropagationReader = mountinfo.PropagationReader
 
-// mountGuard is this provider's policy over its mount table.
-//
-// It is built at each call site rather than held as a field, so the policy the
-// guard enforces and the policy Posture reports are the same one value.
+// mountGuard is this provider's policy over its mount table, built at each call site.
 func (p *Provider) mountGuard() mountguard.Guard {
 	return mountguard.Guard{Policy: p.cfg.MountPropagation, Table: p.mountTable}
 }
 
-// verifyMountPropagation checks that the mount at target propagates, and is what
-// turns the silent failure into a refusal.
-//
-// A table that cannot answer is a refusal too, not a pass: see
-// mountguard.Guard.Verify. That is the case this provider is most likely to meet
-// — its mount table is a seam, and a caller who injected one without the
-// propagation half while asking for the guard would otherwise get a guard that
-// reports exactly what a passing one reports.
+// verifyMountPropagation checks the mount at target propagates; a table that cannot answer is a refusal.
 func (p *Provider) verifyMountPropagation(ctx context.Context, device, target string) (uint32, error) {
 	return p.mountGuard().Verify(ctx, device, target)
 }
 
-// unwindUnverifiedMount removes a mount the propagation guard refused, so a
-// Mount that returns an error does not leave a filesystem mounted.
-//
-// It runs on a context of its own and refuses a target that is no longer this
-// call's mount; see mountguard.Guard.Unwind for why both matter. The rollback
-// context is that package's, not this one's cleanupContext: what it waits on is
-// a mount-table read and umount(2), not drbdadm.
+// unwindUnverifiedMount removes a refused mount on its own context; see mountguard.Guard.Unwind.
 func (p *Provider) unwindUnverifiedMount(ctx context.Context, device, target string, id uint32, finding error) error {
 	return p.mountGuard().Unwind(ctx, device, target, id, finding, p.mounter.Unmount)
 }

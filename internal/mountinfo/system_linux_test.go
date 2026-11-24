@@ -23,19 +23,7 @@ import (
 	"testing"
 )
 
-// The Table implementation reads the running kernel, so these drive it against
-// this host's real mount table rather than a fixture. That is the point: the
-// parser tests prove the format is understood, and these prove the seam is
-// wired to it — a System that opened the wrong file passes every fixture test
-// and finds nothing here.
-//
-// What is NOT here is the block-backed round trip, which needs a device node
-// this process can stat. A container has a mount table and no /dev to speak of
-// — measured: the CI image's /dev holds null, zero, random and the standard
-// descriptors, and the overlay's backing device is not among them — so a test
-// requiring one fails on the runner while passing on a workstation. That round
-// trip lives in the local_integration suite, which builds a real logical volume
-// to check it against.
+// These read this host's live mount table; the block-backed round trip is in the local_integration suite.
 
 // TestSystemMountPointsForRefusesANonBlockPath covers the identity step. A path
 // with no device number cannot be matched against the table at all, and
@@ -67,12 +55,7 @@ func TestSystemHonoursACancelledContext(t *testing.T) {
 	}
 }
 
-// TestSystemPropagationOfReadsTheLiveTable drives the propagation lookup
-// against this host's real table. The root filesystem is always mounted, so the
-// lookup has something to find on any Linux, container included — but it is
-// asked about by DEVICE, and a container has no device node to name, so the
-// device-backed half of this belongs to the integration suite. What is checked
-// here is the refusal a wrong device produces.
+// TestSystemPropagationOfReadsTheLiveTable checks the refusal a wrong device produces against the live table.
 func TestSystemPropagationOfRefusesAPathHoldingSomethingElse(t *testing.T) {
 	// A regular file has no device number at all, so the lookup cannot even
 	// begin — the identity step refuses before the table is consulted.

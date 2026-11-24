@@ -45,11 +45,7 @@ func withOracle(o LivenessOracle) func(*Options) {
 	return func(opts *Options) { opts.LivenessOracle = o }
 }
 
-// TestOracleTurnsAnAbandonedSameBootMappingIntoAnOrphan is the case the whole
-// seam exists for, and the one the boot ID cannot see: an init container
-// attached, mounted, exited, and the HOST STAYED UP. The record names this node
-// and the boot that is still running, so every fact this provider can observe
-// on its own says "live".
+// TestOracleTurnsAnAbandonedSameBootMappingIntoAnOrphan: a mapping left on the running boot is orphaned only by the oracle.
 func TestOracleTurnsAnAbandonedSameBootMappingIntoAnOrphan(t *testing.T) {
 	oracle := &fakeOracle{state: common.LivenessReleased}
 	p, runner := mappedProvider(t, []string{unlockedBy(thisNode, thisBoot)}, withOracle(oracle))
@@ -85,14 +81,7 @@ func TestOracleKeepsALiveSameBootMappingLive(t *testing.T) {
 	assertNothingClosed(t, runner)
 }
 
-// TestAnOracleThatCannotAnswerIsNeitherOfTheTwoAnswers is the indeterminate
-// case, and it is the one worth being strict about.
-//
-// A guard that cannot see must not report what a passing guard reports. Folded
-// into "live", an oracle outage makes a fleet of abandoned mappings look
-// healthy; folded into "orphaned", it points anything acting on these verdicts
-// at volumes live workloads are using. Both are the check's own failure
-// disguised as its result.
+// TestAnOracleThatCannotAnswerIsNeitherOfTheTwoAnswers: indeterminate is neither live nor orphaned.
 func TestAnOracleThatCannotAnswerIsNeitherOfTheTwoAnswers(t *testing.T) {
 	backendDown := errors.New("the coordinator is unreachable")
 
@@ -129,10 +118,7 @@ func TestAnOracleThatCannotAnswerIsNeitherOfTheTwoAnswers(t *testing.T) {
 	}
 }
 
-// TestAnOracleThatCannotAnswerDoesNotFailTheSweep pins that the indeterminate
-// case is a FINDING and not a returned error. A sweep that aborted would report
-// nothing about the volumes it had not reached yet, and an empty report reads as
-// "no orphans" — the fail-open this guard exists to remove.
+// TestAnOracleThatCannotAnswerDoesNotFailTheSweep: indeterminate is a finding, not a returned error.
 func TestAnOracleThatCannotAnswerDoesNotFailTheSweep(t *testing.T) {
 	oracle := &fakeOracle{err: errors.New("the coordinator is unreachable")}
 	runner := newFakeRunner().
@@ -156,16 +142,7 @@ func TestAnOracleThatCannotAnswerDoesNotFailTheSweep(t *testing.T) {
 	}
 }
 
-// TestTheOracleIsNotAskedWhereTheBootIDAlreadyDecides pins the seam's
-// PLACEMENT, which is the whole of its authority.
-//
-// The oracle refines exactly one case: this node, the boot that is still
-// running. On an ended boot the verdict is already proof — a holder cannot
-// survive the reboot of the host it was running on — and routing that through a
-// call that can fail would let an oracle outage erase findings that need no
-// oracle. Another node's mapping is not this node's to reclaim however dead its
-// owner is. Both oracles here would REFUSE if asked, so a verdict that survives
-// is a verdict reached without them.
+// TestTheOracleIsNotAskedWhereTheBootIDAlreadyDecides: only this node's current-boot mappings reach the oracle.
 func TestTheOracleIsNotAskedWhereTheBootIDAlreadyDecides(t *testing.T) {
 	cases := map[string]struct {
 		tags []string
@@ -202,13 +179,7 @@ func TestTheOracleIsNotAskedWhereTheBootIDAlreadyDecides(t *testing.T) {
 	}
 }
 
-// TestWithoutAnOracleTheVerdictIsWhatItWasBefore pins the default, which is a
-// deliberate choice and not a gap left open.
-//
-// A deployment where an attachment has no owner to outlive has nothing to
-// inject, and turning its every mapping into a warning would make the report
-// unreadable for the deployments that are behaving correctly. The absence is
-// made legible through Posture instead — see TestPostureSaysWhenNothingAsks.
+// TestWithoutAnOracleTheVerdictIsWhatItWasBefore: no oracle leaves current-boot mappings live.
 func TestWithoutAnOracleTheVerdictIsWhatItWasBefore(t *testing.T) {
 	p, runner := mappedProvider(t, []string{unlockedBy(thisNode, thisBoot)})
 
@@ -238,13 +209,7 @@ func TestTheAuditLineSaysWhichVerdictIsWhich(t *testing.T) {
 	}
 }
 
-// TestPostureSaysWhenNothingAsks is where the absent oracle stops being
-// invisible.
-//
-// It is the second guard in this provider that an operator can leave off
-// without ever seeing a symptom, and the symptom when it comes is a report full
-// of "live" lines over mappings nothing has held for weeks. So the line names
-// the consequence, not merely the configuration.
+// TestPostureSaysWhenNothingAsks: the posture line names the consequence of no oracle.
 func TestPostureSaysWhenNothingAsks(t *testing.T) {
 	absent := newTestProvider(t, newFakeRunner()).Posture()
 

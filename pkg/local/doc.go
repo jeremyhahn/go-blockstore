@@ -153,8 +153,7 @@
 // guard pages, kept out of core dumps and wiped on release — and this package
 // never turns it into a []byte at all: the Manager lends the enclave to go-luks2
 // for one call, go-luks2 borrows it for the derivation, and the Manager then
-// destroys it. It does not leave the process at all: before 2026-08-29 it was
-// written to a cryptsetup child's standard input, and now there is no child. A
+// destroys it. It never leaves the process. A
 // []byte would have been unfixable: zeroing the slice a caller holds reaches
 // neither the copies the garbage collector may have made nor the pages the
 // kernel may have swapped, and the material would be in any core dump taken
@@ -243,7 +242,7 @@
 //
 // This is not an oversight that a wipe in DeleteSnapshot would close. Both ways
 // of reaching the exception store were measured on a loopback LVM harness
-// (2026-08-27, LVM 2.03.16), against the only test that counts — read the
+// (LVM 2.03.16), against the only test that counts — read the
 // physical extents back after lvremove and look for the plaintext:
 //
 //   - blkdiscard --zeroout over the visible snapshot device fails with EIO and

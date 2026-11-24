@@ -248,8 +248,7 @@ func (f *fakeRunner) withExtentSize(bytes int64) *fakeRunner {
 	return f.on("vgs", func([]string, []byte) ([]byte, error) { return []byte(out), nil })
 }
 
-// withBlkid maps a device path to the TYPE blkid reports for it. A device
-// absent from the map gets the exit status blkid uses for "no signature here".
+// withBlkid maps a device path to the TYPE blkid reports; absent devices report no signature.
 func (f *fakeRunner) withBlkid(types map[string]string) *fakeRunner {
 	f.mu.Lock()
 	f.blkidTypes = map[string]string{}
@@ -342,14 +341,7 @@ func (f *fakeRunner) withWrongKeyFor(devices ...string) *fakeRunner {
 	return f
 }
 
-// luksBinary is the name the fake records LUKS operations under.
-//
-// They are not a binary any more — go-luks2 does the work in this process — but
-// they go through the same recorder as the commands that still are, and for the
-// reason a second recorder would have destroyed: the assertions that matter are
-// about ORDER across the two. The tag is written after the format; the mapping
-// is closed before the lvremove; the container resize happens before resize2fs.
-// A test cannot check any of that against two lists.
+// luksBinary is the name the fake records LUKS operations under, in the same recorder as commands, so order is assertable.
 const luksBinary = "luks"
 
 // The fake is the provider's luksBackend as well as its CommandRunner and its
@@ -421,25 +413,12 @@ func (f *fakeRunner) Identity(ctx context.Context, path string) (string, error) 
 	return strings.TrimSpace(string(out)), nil
 }
 
-// luks answers the LUKS operations the provider issues, from the fake's own
-// state rather than from a per-test closure.
-//
-// One handler for all of them, because the provider issues several against one
-// volume and a test usually cares about more than one: a Status over an
-// encrypted volume asks whether the mapping is open AND reads its header, so a
-// fake where installing an answer for either replaced the other could not
-// describe that volume at all.
-//
-// Whether a device HAS a header is not tracked separately — it is whatever
-// blkid was told to report for the device. A container the LUKS backend reads a
-// header off but blkid calls ext4 is not a host any test should be able to
-// describe.
+// luks answers every LUKS operation from the fake's state; a header exists where blkid reports one.
 func (f *fakeRunner) luks(args []string, _ []byte) ([]byte, error) {
 	if len(args) == 0 {
 		return nil, nil
 	}
-	// The trailing argument: a mapping NAME for close, a device PATH for the
-	// header operations, and for open the name follows the device.
+	// The trailing argument: a mapping name for close, a device path for header operations.
 	target := args[len(args)-1]
 
 	switch args[0] {
@@ -452,16 +431,7 @@ func (f *fakeRunner) luks(args []string, _ []byte) ([]byte, error) {
 		return []byte(backing), nil
 
 	case "open":
-		// A successful unlock leaves a mapping behind, and a successful close
-		// takes one away. The fake tracks that rather than answering from a
-		// fixed table, because the questions worth asking of it are about what
-		// SURVIVES an operation — a rollback that must not close somebody
-		// else's mapping, a failed resize that must not lose the caller's. A
-		// fake whose mapping set never moved answered every one of those with
-		// whatever the test set up, which is to say it answered none of them.
-		//
-		// args is ["open", device, name]: the device is what the mapping ends
-		// up over, and the name is what it answers to.
+		// Track mappings opened and closed. args is ["open", device, name].
 		if len(args) >= 3 {
 			f.mu.Lock()
 			f.luksBacking[args[2]] = defaultBackingFor(args[2])
@@ -643,15 +613,7 @@ type propagationFixture struct {
 	shared   bool
 }
 
-// PropagationOf answers about THIS DEVICE at the path, and hands back the
-// kernel's identity for the mount instance.
-//
-// The fake models the identity the way the kernel does: a mount gets an id when
-// it appears, and a mount made in its place gets a different one. restack is how
-// a test says "somebody replaced what is here" — the case (device, path) cannot
-// see. Propagation is modeled as the kernel presents it, a spelling and a
-// verdict that agree, so a test cannot arrange a mount reported private and
-// propagating.
+// PropagationOf answers about this device at the path, with a mount ID that changes when the mount is replaced.
 func (f *fakeRunner) PropagationOf(ctx context.Context, device, mountPoint string) (uint32, bool, string, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, false, "", err
@@ -662,8 +624,7 @@ func (f *fakeRunner) PropagationOf(ctx context.Context, device, mountPoint strin
 		return 0, false, "", err
 	}
 
-	// What is VISIBLE at the path is what umount(2) would detach and whose
-	// propagation a reader would otherwise pick up.
+	// What is visible at the path.
 	if top, covered := f.overMounted[mountPoint]; covered && top != device {
 		return 0, false, "", &mountinfo.MountPointError{MountPoint: mountPoint, Err: mountinfo.ErrNotVisibleThere}
 	}
@@ -706,9 +667,7 @@ func (f *fakeRunner) mountIDLocked(device, target string) uint32 {
 	return f.nextMountID
 }
 
-// onUnmountTableLookup runs a function the NEXT time the mount table is asked
-// about a device at a path, which is how a test acts inside the window between
-// the guard's verdict and the rollback that follows it.
+// onUnmountTableLookup runs fn on the next device-at-path lookup.
 func (f *fakeRunner) onUnmountTableLookup(hook func()) *fakeRunner {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -716,9 +675,7 @@ func (f *fakeRunner) onUnmountTableLookup(hook func()) *fakeRunner {
 	return f
 }
 
-// restack replaces the mount at a path with another mount OF THE SAME DEVICE,
-// the way a second mount stacked on the same path does. Everything about it
-// matches except the kernel's identity for it, which is the whole point.
+// restack replaces the mount at a path with another mount of the same device and a new mount ID.
 func (f *fakeRunner) restack(device, target string) *fakeRunner {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -741,11 +698,7 @@ func (f *fakeRunner) withPropagation(target, spelling string) *fakeRunner {
 	return f
 }
 
-// Copy records a device copy instead of performing one.
-//
-// It lands in the same call log as the exec'd commands, so the tests that
-// assert on ORDER — a copy before the tail is zeroed, a wipe before the volume
-// is removed — keep working across a seam boundary the provider now has.
+// Copy records a device copy in the same call log as the commands.
 func (f *fakeRunner) Copy(_ context.Context, src, dst string) error {
 	f.mu.Lock()
 	f.copies = append(f.copies, copyCall{Source: src, Destination: dst})
@@ -875,9 +828,7 @@ type lvFixture struct {
 	Time        string
 	DataPercent string
 
-	// OriginSizeBytes overrides the image size a SNAPSHOT reports. Left zero it
-	// follows the origin's current size, which is the ordinary case; setting it
-	// expresses an origin that has been grown since the snapshot was taken.
+	// OriginSizeBytes overrides a snapshot's reported image size; zero follows the origin.
 	OriginSizeBytes int64
 
 	// Tags are the LVM tags on the volume. A fixture with none models a volume
@@ -918,12 +869,7 @@ func lvsJSON(lvs ...lvFixture) []byte {
 		LV []lvJSON `json:"lv"`
 	}{})
 	for _, lv := range lvs {
-		// lvs populates data_percent only where the kernel is tracking it: an
-		// ACTIVE snapshot. A plain volume reports empty, and so does an
-		// inactive snapshot. Emitting anything else here would let a test pass
-		// against output real LVM never produces — which is exactly how the
-		// "every snapshot reports occupancy" rule got written and then failed
-		// against a real volume group.
+		// lvs fills data_percent only for an active snapshot.
 		dataPercent := ""
 		if lv.Origin != "" && lv.Active {
 			dataPercent = lv.DataPercent
@@ -947,13 +893,7 @@ func lvsJSON(lvs ...lvFixture) []byte {
 			originSize = fmt.Sprintf("%d", lv.SizeBytes)
 		}
 
-		// lv_tags is a comma-separated list, and the EMPTY STRING for a volume
-		// with no tags — measured, including through the JSON report, where it
-		// is "" rather than absent or null. A fake that omitted the field would
-		// let a parser that mishandles the empty case pass.
-		//
-		// Tags are also not inherited by snapshots, measured, so a fixture is
-		// tagged only where it says so.
+		// lv_tags is comma-separated and "" when empty; snapshots do not inherit tags.
 		report.Report[0].LV = append(report.Report[0].LV, lvJSON{
 			Name:        lv.Name,
 			Size:        fmt.Sprintf("%d", lv.SizeBytes),

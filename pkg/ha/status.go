@@ -172,18 +172,7 @@ type Status struct {
 	UpdatedAt time.Time
 }
 
-// promoteEligibility decides whether a local replication state is safe to
-// promote, and says why when it is not.
-//
-// Exactly one connection state is eligible: uptodate. The reasoning for each
-// refusal is in the package doc's eligibility table, and the reason strings
-// here are the short form of it — they are what an operator reads in a log
-// line, so they say what is true of the volume rather than naming the constant
-// again.
-//
-// The role is deliberately not consulted. A node already Primary is handled by
-// the caller before it gets here, and a node's role says nothing about whether
-// its data is current, which is the only question this function answers.
+// promoteEligibility allows only uptodate and gives the reason otherwise; the role is not consulted.
 func promoteEligibility(s common.ReplState) (bool, string) {
 	switch s.Conn {
 	case common.ReplStateUpToDate:
@@ -203,56 +192,12 @@ func promoteEligibility(s common.ReplState) (bool, string) {
 	case common.ReplStateUnknown:
 		return false, "the replication state could not be determined"
 	default:
-		// A state this package has not been taught. Refusing an unrecognized
-		// value is the same discipline as refusing unknown: a promotion gate
-		// whose default is "allow" stops being a gate the moment the enum
-		// grows.
+		// An unrecognized state is refused.
 		return false, "unrecognized replication state"
 	}
 }
 
-// adoptEligibility decides whether a copy that ALREADY holds the primary role
-// may be announced as serving, and says why when it may not.
-//
-// It is deliberately broader than [promoteEligibility], and the asymmetry is
-// the point rather than an oversight.
-//
-// Promotion brings a copy INTO service. It is a state change, it is the moment
-// a stale side of a divergence can be made authoritative, and the controller
-// chooses it — so the gate is as narrow as it can be: uptodate only.
-//
-// Adoption changes nothing. The copy is already Primary, already possibly
-// mounted, already being written; the controller did not choose it and refusing
-// does not undo it. Applying the promotion gate here would refuse the exact
-// case high availability exists for — an established Primary whose peer just
-// died, which DRBD reports as connecting, not uptodate — and an orchestrator
-// acting on the withdrawn announcement would unmount the last surviving copy.
-//
-// So this refuses only the states that say this copy may be the WRONG one, or
-// is not current:
-//
-//	uptodate      SERVICEABLE  connected and current.
-//	sync-source   SERVICEABLE  the local copy is feeding the peer, so it is the
-//	                           more current of the two.
-//	connecting    SERVICEABLE  the peer is unreachable and this node is the
-//	                           established Primary. This is a peer failure, and
-//	                           surviving one is the entire point.
-//	standalone    refused      up, and it has STOPPED talking to its peer —
-//	                           which is what DRBD reports once a split brain is
-//	                           detected and not auto-resolved. A Primary here
-//	                           may be either side of a divergence, and which one
-//	                           to keep is an operator's decision, not a
-//	                           controller's.
-//	sync-target   refused      the local copy is being overwritten from the
-//	                           peer, so it is not the copy anyone should read.
-//	inconsistent  refused      the local copy is known not to be current.
-//	down          refused      replication is not running.
-//	unknown       refused      the state could not be determined.
-//
-// A refusal here does NOT demote. Announcing is this controller's business;
-// tearing a live device out from under a running workload is not, and it is not
-// something a controller that owns roles and not filesystems could complete
-// anyway.
+// adoptEligibility allows announcing an already-Primary copy when uptodate, sync-source or connecting; it never demotes.
 func adoptEligibility(s common.ReplState) (bool, string) {
 	switch s.Conn {
 	case common.ReplStateUpToDate:

@@ -24,15 +24,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// substitutingAt makes the fake's Mount do what mount(2) does to path
-// resolution: it puts the volume's own contents where the target is, and
-// records the mount in the table the rollback reads.
-//
-// It is the whole reason these tests can exist. Every earlier key-path test
-// asserts on a filesystem that never changes across the mount, so a check that
-// runs before mount(2) and a check that runs after it are indistinguishable to
-// them — which is precisely why three rounds of review could each correct the
-// predicate and each still leave a hole.
+// substitutingAt makes the fake Mount place the volume's contents at the target and record the mount.
 func substitutingAt(t *testing.T, runner *fakeRunner, device, target string, populate func() error) {
 	t.Helper()
 	runner.OnMount(func() {
@@ -44,24 +36,7 @@ func substitutingAt(t *testing.T, runner *fakeRunner, device, target string, pop
 	})
 }
 
-// TestAKeyPathTheMountSubstitutesIsRefusedAgainstTheMountedFilesystem is the
-// case that defeats a pre-mount prediction, and it defeats it in a way no
-// correction to the predicate reaches.
-//
-// The configured key path reaches the volume through a symlink whose
-// DESTINATION DOES NOT EXIST until the volume is mounted. resolveKeyFile
-// therefore cannot follow the link — it resolves the path against its deepest
-// existing ancestor and hands back the literal, host-side location, which is
-// outside the volume and correctly so, at that instant. Mount a filesystem
-// carrying keys/vol.key at the target and the same configured path resolves
-// into the volume and reads the volume's own bytes.
-//
-// This is not a direction of the predicate that was got backwards. The
-// pre-mount filesystem does not contain the answer, and the fallback that hides
-// it is the one a deployment placing key material after startup depends on. The
-// test asserts BOTH halves: that the pre-mount check accepts this fixture (so
-// the case really is one prediction lets through) and that the post-mount
-// observation refuses it.
+// TestAKeyPathTheMountSubstitutesIsRefusedAgainstTheMountedFilesystem: the pre-mount check accepts, the post-mount check refuses.
 func TestAKeyPathTheMountSubstitutesIsRefusedAgainstTheMountedFilesystem(t *testing.T) {
 	base := t.TempDir()
 	target := filepath.Join(base, "mnt")
@@ -118,9 +93,7 @@ func TestAKeyPathTheMountSubstitutesIsRefusedAgainstTheMountedFilesystem(t *test
 		t.Errorf("the refusal is not in the ErrInvalidArgument family: %v", err)
 	}
 
-	// The mount HAPPENED. That is the point: prediction let it through, so the
-	// only place the truth was available was after the fact. A test that
-	// asserted no mount was made would be asserting the old behavior.
+	// The mount happened; only the post-mount check could refuse it.
 	if got := runner.mountCalls(); len(got) != 1 {
 		t.Fatalf("mount calls = %v, want exactly one: the pre-mount check accepts this case", got)
 	}
@@ -144,15 +117,7 @@ func TestAKeyPathTheMountSubstitutesIsRefusedAgainstTheMountedFilesystem(t *test
 	}
 }
 
-// TestAMountThatSubstitutesAPathIntoAnotherVolumeIsRefused is why the
-// post-mount observation re-asks the CROSS-VOLUME question and not only the
-// question about the target.
-//
-// Mounting volume B substitutes a symlink that leads into volume A's mount, so
-// after the mount the configured key path resolves inside A — a volume this
-// call never touched. Neither pre-mount check can see it: before the mount the
-// symlink does not exist, so the path resolves to its literal host location and
-// is inside nothing.
+// TestAMountThatSubstitutesAPathIntoAnotherVolumeIsRefused: mounting B makes the key path resolve inside A.
 func TestAMountThatSubstitutesAPathIntoAnotherVolumeIsRefused(t *testing.T) {
 	base := t.TempDir()
 	mountOfA := filepath.Join(base, "a")
@@ -212,13 +177,7 @@ func TestAMountThatSubstitutesAPathIntoAnotherVolumeIsRefused(t *testing.T) {
 	}
 }
 
-// TestAMountThatSubstitutesNothingRelevantIsAccepted is the other direction of
-// the mutation requirement, and it is the one a guard is least forgiven for
-// getting wrong.
-//
-// The volume's contents land at the target and change no path the key is
-// reached through. The observation must accept it, leave the mount standing,
-// and unmount nothing.
+// TestAMountThatSubstitutesNothingRelevantIsAccepted: the mount stands and nothing is unmounted.
 func TestAMountThatSubstitutesNothingRelevantIsAccepted(t *testing.T) {
 	base := t.TempDir()
 	target := filepath.Join(base, "mnt")
@@ -242,8 +201,7 @@ func TestAMountThatSubstitutesNothingRelevantIsAccepted(t *testing.T) {
 		if err := os.MkdirAll(filepath.Join(target, "payload"), 0o755); err != nil {
 			return err
 		}
-		// Even a file with the key's own NAME, somewhere the key path does not
-		// reach. Containment is a question about paths, not about names.
+		// A file with the key's name where the key path does not reach.
 		return os.WriteFile(filepath.Join(target, "payload", "volume.key"), []byte("unrelated"), 0o600)
 	})
 
@@ -255,15 +213,7 @@ func TestAMountThatSubstitutesNothingRelevantIsAccepted(t *testing.T) {
 	}
 }
 
-// TestAKeyPathRefusalIsNotUnwoundOverSomebodyElsesFilesystem keeps the rollback
-// from doing damage of its own.
-//
-// umount(2) takes a path and detaches whatever is VISIBLE there. Between
-// mount(2) returning and the observation refusing, anything on the host can
-// mount over the target — and unmounting the path would then take that
-// filesystem down while the refused mount stayed underneath it. The finding is
-// still reported; so is the fact that the mount is still there, because both
-// are true and an operator needs both.
+// TestAKeyPathRefusalIsNotUnwoundOverSomebodyElsesFilesystem: an over-mounted target is not unmounted; both facts are reported.
 func TestAKeyPathRefusalIsNotUnwoundOverSomebodyElsesFilesystem(t *testing.T) {
 	base := t.TempDir()
 	target := filepath.Join(base, "mnt")
@@ -309,21 +259,7 @@ func TestAKeyPathRefusalIsNotUnwoundOverSomebodyElsesFilesystem(t *testing.T) {
 	}
 }
 
-// TestTheObservationSurvivesACallerWhoGaveUp covers the window the completion
-// context exists for.
-//
-// A caller whose deadline passes during mount(2) leaves a mount that nothing
-// has checked and nothing will clean up — and reusing their dead context makes
-// every read that would find it fail first, so the code reads as though it had
-// cleaned up. The observation and its rollback run on a detached context for
-// the same reason verifyMountPropagation's do.
-//
-// The fixture is the CROSS-VOLUME one on purpose. The target-side half of the
-// observation resolves paths and reads no mount table, so it cannot notice a
-// dead context at all; only the half that asks the kernel where this group's
-// volumes are mounted can. A version of this test built on the target-side case
-// passes whether the context is detached or not, which is a test that names a
-// behavior it does not reach.
+// TestTheObservationSurvivesACallerWhoGaveUp uses the cross-volume fixture, the half that reads the mount table.
 func TestTheObservationSurvivesACallerWhoGaveUp(t *testing.T) {
 	base := t.TempDir()
 	mountOfA := filepath.Join(base, "a")
@@ -376,20 +312,7 @@ func TestTheObservationSurvivesACallerWhoGaveUp(t *testing.T) {
 	}
 }
 
-// TestTheTargetIsAskedAboutEvenWhenTheMountTableGoesBlind is why the
-// observation asks about the TARGET and not only about where this group's
-// volumes are mounted.
-//
-// The cross-volume question is answered by resolving each of this provider's
-// devices and reading the kernel's mount table for it. A device that is not
-// there is deliberately not an error — for any volume, one of the two spellings
-// it is asked under does not exist, which is the ordinary case — so that lookup
-// CONTINUES past it. When it is the mounted volume's own node that has gone
-// between mount(2) and the observation, every lookup continues past and the
-// cross-volume question returns "nothing found" rather than a refusal.
-//
-// The target-side question does not go through the mount table at all. It
-// resolves paths, which is why it still sees the substitution here.
+// TestTheTargetIsAskedAboutEvenWhenTheMountTableGoesBlind: the target-side check resolves paths without the mount table.
 func TestTheTargetIsAskedAboutEvenWhenTheMountTableGoesBlind(t *testing.T) {
 	base := t.TempDir()
 	target := filepath.Join(base, "mnt")

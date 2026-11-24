@@ -231,9 +231,7 @@ func TestContenderRefusedByAHeldLeasePromotesNothing(t *testing.T) {
 	r.awaitPrimary(testVolume, true)
 }
 
-// A Coordinator that cannot answer is not permission to write. The controller
-// must land in exactly the same place as a lost election — promoting nothing —
-// rather than treating an unreachable arbiter as an absent one.
+// A Coordinator that cannot answer leaves the controller promoting nothing, as a lost election does.
 func TestCoordinatorUnavailableFailsStopped(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 	r := newRig(t, prov, nil)
@@ -266,7 +264,7 @@ func TestCoordinatorUnavailableFailsStopped(t *testing.T) {
 		t.Fatalf("the provider was touched at all without a lease: %v", prov.recorded())
 	}
 
-	// It recovers when the coordinator does.
+	// It recovers when the Coordinator does.
 	r.coord.setAcquireErr(nil)
 	r.clock.Advance(r.ctrl.Config().RetryInterval)
 	r.awaitPrimary(testVolume, true)
@@ -324,8 +322,7 @@ func TestProviderRefusalIsSurfacedNotWorkedAround(t *testing.T) {
 	}
 }
 
-// The guard fires when a renewal took most of the TTL to be acknowledged,
-// because the deadline is measured from when the request was ISSUED.
+// The guard fires when a renewal took most of the TTL to be acknowledged.
 func TestPromoteGuardRefusesUnderAlmostExpiredLease(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 	r := newRig(t, prov, nil)
@@ -400,10 +397,7 @@ func TestFailedRenewalDoesNotFenceAndDoesNotMoveTheDeadline(t *testing.T) {
 		issued.Add(DefaultLeaseTTL), r.status(testVolume))
 }
 
-// The controller's use of the Coordinator is part of its design: leases, and
-// nothing else. No owner key, no CAS-based second mechanism, no watch. This
-// pins that, because the cheapest way to reintroduce a stale-state bug is to
-// add a key nothing reaps.
+// The controller uses only leases: no owner key, no CAS, no watch.
 func TestControllerUsesLeasesAndNothingElse(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 	r := newRig(t, prov, nil)
@@ -660,11 +654,7 @@ func TestAFailedRePromotionWithdrawsTheAnnouncement(t *testing.T) {
 	}
 }
 
-// A leader parked on a refusal keeps that refusal across renewals. Talking to
-// the Coordinator successfully says nothing about the volume, so clearing the
-// reason there would publish a healthy status for a volume that is still
-// refused — and would do it on every cadence tick, which is exactly the churn
-// transition compares error text to avoid.
+// A leader keeps its refusal across successful renewals.
 func TestARenewalDoesNotClearAStandingRefusal(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateInconsistent, common.ReplRoleSecondary)
 	r := newRig(t, prov, nil)
@@ -703,8 +693,7 @@ func TestARenewalDoesNotClearAStandingRefusal(t *testing.T) {
 	}
 }
 
-// The renewal error itself IS cleared by a renewal succeeding — that is the one
-// thing talking to the Coordinator does resolve.
+// A successful renewal clears the renewal error.
 func TestASuccessfulRenewalClearsOnlyTheRenewalError(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateInconsistent, common.ReplRoleSecondary)
 	r := newRig(t, prov, nil)
@@ -734,10 +723,7 @@ func TestASuccessfulRenewalClearsOnlyTheRenewalError(t *testing.T) {
 	}, "the renewal error was not replaced by the standing refusal (status: %+v)", r.status(testVolume))
 }
 
-// The renewal cadence is measured against the acknowledged DEADLINE, not
-// against the moment the last call returned. An acquire that consumed most of
-// the TTL leaves far less than a full interval of lease; waiting one anyway
-// would let it expire without a single attempt to keep it.
+// Renewal is timed against the acknowledged deadline, not the last return.
 func TestRenewalIsScheduledAgainstTheDeadlineNotTheReturn(t *testing.T) {
 	prov := newFakeProvider(common.ReplStateUpToDate, common.ReplRoleSecondary)
 	r := newRig(t, prov, nil)

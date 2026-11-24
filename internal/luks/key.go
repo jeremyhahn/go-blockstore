@@ -35,9 +35,8 @@ import (
 // a fresh enclave rather than one the implementation intends to reuse. Between
 // those two points the passphrase is borrowed for exactly one operation: it
 // exists as a []byte only inside a MemoryEnclave.WithBytes callback, which hands
-// it to go-luks2 for the length of one call and nothing longer. That borrow is
-// narrower than it used to be — the bytes no longer leave the process at all,
-// where they were once written to a cryptsetup child's standard input.
+// it to go-luks2 for the length of one call and nothing longer. The bytes never
+// leave the process.
 //
 // The type is an enclave and not a []byte because a []byte cannot be taken back.
 // Go's garbage collector may copy a heap slice while it lives, and zeroing the

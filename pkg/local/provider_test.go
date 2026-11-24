@@ -127,12 +127,7 @@ func TestProvisionPlain(t *testing.T) {
 	assertLine(t, runner, "lvchange --activate n --yes vg0/data")
 }
 
-// TestProvisionDisablesAutoActivation pins the flag that makes Detach mean
-// anything. LVM autoactivation is on by default and udev reactivates a whole
-// volume group on unrelated device events, so without this a detached volume
-// silently comes back and Status starts reporting it attached. Found against
-// real LVM, where a mkfs on one volume reactivated every other volume in the
-// group within a second.
+// TestProvisionDisablesAutoActivation: otherwise udev reactivates detached volumes.
 func TestProvisionDisablesAutoActivation(t *testing.T) {
 	runner := newFakeRunner()
 	p := newTestProvider(t, runner)
@@ -335,20 +330,9 @@ func TestProvisionRollsBackWhenTheLUKSCloseFails(t *testing.T) {
 	assertLine(t, runner, "lvremove --force vg0/data")
 }
 
-// TestProvisionRejectsAStorageClass closes the last field this provider was
-// accepting and ignoring. One volume group backs every volume and there are no
-// tiers to select, so honoring a class is impossible — and returning a Volume
-// whose Spec names a class the volume is not on is the same untruth as
-// accepting an FSType on a restore.
-// TestRollbackDoesNotCloseAForeignMapping keeps the cleanup path from doing
-// what round 9 stopped every other path from doing. A rollback reaches for the
-// volume's deterministic mapping name; if a stale or hand-made mapping over
-// somebody else's device is sitting there, closing it by name would tear down a
-// mapping this provision never opened.
+// TestRollbackDoesNotCloseAForeignMapping: a rollback never closes a mapping this provision did not open.
 func TestRollbackDoesNotCloseAForeignMapping(t *testing.T) {
-	// A foreign mapping already holds the name, so the open FAILS the way
-	// go-luks2 really fails when a name is in use — and the rollback then
-	// reaches for that name.
+	// A foreign mapping holds the name, so the open fails as go-luks2 does.
 	runner := newFakeRunner()
 	runner.on(luksBinary, func(args []string, _ []byte) ([]byte, error) {
 		switch {
@@ -478,15 +462,7 @@ func TestProvisionFromSnapshotLeavesAnAttachedOriginAttached(t *testing.T) {
 	assertNoLine(t, runner, "lvchange --activate n --yes vg0/data_snap_nightly")
 }
 
-// TestEncryptedProviderReencryptsAPlaintextRestore is the path that replaced a
-// refusal. A provider configured to encrypt no longer turns away a plaintext
-// snapshot; it formats the destination and copies the image THROUGH the
-// plaintext mapping, so dm-crypt encrypts it in flight.
-//
-// The assertion that matters is the dd destination. Copying to /dev/vg0/restored
-// instead would write the plaintext straight onto the extents, which is the
-// silent downgrade the old refusal existed to prevent — and it would look
-// identical from every other angle.
+// TestEncryptedProviderReencryptsAPlaintextRestore: dd writes through the plaintext mapping, not the LV.
 func TestEncryptedProviderReencryptsAPlaintextRestore(t *testing.T) {
 	runner := newFakeRunner().withLVs(snapshotFixtures()...)
 	// The snapshot device carries a filesystem, not a LUKS container.
@@ -538,13 +514,7 @@ func TestReencryptingRestoreRemovesThePartialVolumeOnFailure(t *testing.T) {
 	assertLine(t, runner, "lvremove --force vg0/restored")
 }
 
-// TestEncryptedProviderRestoresAnEncryptedSnapshot is the byte-copy case: the
-// image is already a LUKS container, and it is copied as it stands.
-//
-// Reformatting it would be destructive rather than merely different — a fresh
-// header carries a fresh master key, and the ciphertext copied over it was
-// encrypted under the old one — so the absence of a luksFormat here is the
-// assertion, not an accident of how the fake is wired.
+// TestEncryptedProviderRestoresAnEncryptedSnapshot: copied verbatim, no luksFormat.
 func TestEncryptedProviderRestoresAnEncryptedSnapshot(t *testing.T) {
 	runner := newFakeRunner().withLVs(snapshotFixtures()...)
 	runner.withBlkid(map[string]string{"/dev/vg0/data_snap_nightly": fsTypeLUKS})
@@ -582,11 +552,7 @@ func TestEncryptedProviderRestoresAnEncryptedSnapshot(t *testing.T) {
 	assertKeyNeverOnArgv(t, runner)
 }
 
-// TestEncryptedRestoreRefusesAKeyThatWouldNotOpenIt is the check that keeps this
-// path from producing a volume nobody can read. KeyProvider is per volume, and
-// a restored volume opens with its SOURCE's passphrase, so an implementation
-// answering for the new name with a different key would hand back a volume that
-// restores cleanly and fails at its first Attach.
+// TestEncryptedRestoreRefusesAKeyThatWouldNotOpenIt: the new ID's key must open the source header.
 func TestEncryptedRestoreRefusesAKeyThatWouldNotOpenIt(t *testing.T) {
 	runner := newFakeRunner().withLVs(snapshotFixtures()...)
 	runner.withBlkid(map[string]string{"/dev/vg0/data_snap_nightly": fsTypeLUKS})
@@ -627,10 +593,7 @@ func TestEncryptedRestoreRefusesWithoutAKeyProvider(t *testing.T) {
 	assertNothingCopied(t, runner)
 }
 
-// TestEncryptedRestoreSizesFromTheSourcesOwnHeader pins the half of the sizing
-// rule that a constant cannot express. The restored volume inherits the
-// SOURCE's header, so the capacity added on top is that header's size — not the
-// 16 MiB this package formats with.
+// TestEncryptedRestoreSizesFromTheSourcesOwnHeader: the source's header size is added, not 16 MiB.
 func TestEncryptedRestoreSizesFromTheSourcesOwnHeader(t *testing.T) {
 	runner := newFakeRunner().withLVs(snapshotFixtures()...)
 	runner.withBlkid(map[string]string{"/dev/vg0/data_snap_nightly": fsTypeLUKS})
@@ -706,9 +669,7 @@ func grownOriginFixtures() []lvFixture {
 	}
 }
 
-// TestRestoreSizesFromTheSnapshotNotTheOrigin covers a volume grown after being
-// snapshotted. Sizing from the origin's CURRENT size rejects a restore that is
-// correctly sized for the image the snapshot actually presents.
+// TestRestoreSizesFromTheSnapshotNotTheOrigin: an origin grown after the snapshot.
 func TestRestoreSizesFromTheSnapshotNotTheOrigin(t *testing.T) {
 	runner := newFakeRunner().withLVs(grownOriginFixtures()...)
 	p := newTestProvider(t, runner)
@@ -727,11 +688,7 @@ func TestRestoreSizesFromTheSnapshotNotTheOrigin(t *testing.T) {
 	assertNothingZeroed(t, runner)
 }
 
-// TestRestoreZeroesFromTheImageSize is the sharper half. dd copies the bytes the
-// snapshot presents and stops, so the tail must be zeroed from THERE. Offsetting
-// by the origin's current size would start past what was copied and leave the
-// gap holding whatever the volume group's free extents held — exactly the stale
-// data the zeroing exists to remove.
+// TestRestoreZeroesFromTheImageSize: tail zeroing starts at the copied image's end.
 func TestRestoreZeroesFromTheImageSize(t *testing.T) {
 	runner := newFakeRunner().withLVs(grownOriginFixtures()...)
 	p := newTestProvider(t, runner)
@@ -1141,12 +1098,7 @@ func TestUnmountUnmounts(t *testing.T) {
 	}
 }
 
-// TestUnmountLeavesAnOverMountedTargetAlone is the hazard in unmounting by
-// path: umount(2) detaches whatever is VISIBLE at the path it is given. A
-// volume that was mounted at the target and has since been mounted over is not
-// what is visible there, so unmounting the path would take down the filesystem
-// on top — somebody else's, never this provider's to touch — and leave this
-// volume mounted underneath it regardless.
+// TestUnmountLeavesAnOverMountedTargetAlone: the visible mount at the target is not this volume.
 func TestUnmountLeavesAnOverMountedTargetAlone(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
@@ -1361,14 +1313,7 @@ func TestResizeGrowsExtOnADetachedVolume(t *testing.T) {
 	}
 }
 
-// TestResizeGrowsADetachedEncryptedFilesystem is the encrypted half of the
-// detached-resize rule. Attach only OPENS a container, it does not grow what is
-// inside one, so skipping this would leave the filesystem at its old size behind
-// a block device that says otherwise — and Resize would have reported success.
-//
-// The sequence is the assertion: activate, unlock, grow the filesystem through
-// the plaintext mapping, lock, deactivate. The volume has to end exactly as it
-// was found.
+// TestResizeGrowsADetachedEncryptedFilesystem: activate, unlock, grow, lock, deactivate.
 func TestResizeGrowsADetachedEncryptedFilesystem(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: false}).
@@ -1383,8 +1328,7 @@ func TestResizeGrowsADetachedEncryptedFilesystem(t *testing.T) {
 	}
 
 	want := []string{
-		// newSize plus the volume's LUKS header, so the PLAINTEXT mapping ends
-		// up the 2 GiB that was asked for rather than 16 MiB short of it.
+		// newSize plus the header, so the plaintext mapping is the 2 GiB asked for.
 		"lvextend --size 2164260864b vg0/data",
 		"lvchange --activate y --yes vg0/data",
 		"luks open /dev/vg0/data bs-vg0_data",
@@ -1413,14 +1357,7 @@ func TestResizeGrowsADetachedEncryptedFilesystem(t *testing.T) {
 	assertKeyNeverOnArgv(t, runner)
 }
 
-// TestDetachedEncryptedResizeDoesNotResizeTheMapping records a deliberate
-// omission. The mapping is opened AFTER the logical volume grew, and the
-// container's data segment is "dynamic", so whoever opens it sizes the mapping
-// to the device it finds — measured on cryptsetup 2.7.0, re-opening a grown
-// volume took the mapping from 50331648 to 117440512 bytes with no resize asked
-// for, and go-luks2 computes the same length the same way. Issuing a resize
-// would borrow the passphrase a second time to achieve nothing, and every
-// borrow is an exposure.
+// TestDetachedEncryptedResizeDoesNotResizeTheMapping: opening after the LV grew sizes the mapping, so no resize or second key borrow is issued.
 func TestDetachedEncryptedResizeDoesNotResizeTheMapping(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: false}).
@@ -1522,9 +1459,7 @@ func TestOfflineExtResizeChecksFirst(t *testing.T) {
 	}
 }
 
-// TestMountedExtResizeDoesNotCheck is a safety property, not a preference:
-// e2fsck against a MOUNTED filesystem corrupts it. Online resize2fs does not
-// want the check anyway, so the mount table — not a flag — decides.
+// TestMountedExtResizeDoesNotCheck: e2fsck never runs on a mounted filesystem.
 func TestMountedExtResizeDoesNotCheck(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
@@ -1585,25 +1520,7 @@ func TestResizeGrowsExt4(t *testing.T) {
 	assertLine(t, runner, "resize2fs /dev/vg0/data")
 }
 
-// TestResizeRefusesAnAttachedEncryptedVolumeWithoutTouchingTheMapping is the
-// regression test for the close-then-hope resize.
-//
-// Growing a dm-crypt mapping in place needs the device-mapper table reloaded
-// underneath the live device, which needs the container's master key.
-// go-luks2 v1.0.0-rc.2 exposes no table reload, so the only way to make the
-// mapping bigger through it is to REMOVE the mapping and unlock again — and if the
-// second half fails, the caller is left with no plaintext device at all. It is
-// not hypothetical: a KeyProvider mis-rotated since the volume was attached
-// makes the teardown succeed and the rebuild fail, which is exactly what this
-// test stages. The previous cryptsetup implementation resized the live mapping
-// and had no such failure mode, so this would be a regression introduced by the
-// migration.
-//
-// So the operation is refused instead, and refused BEFORE anything moves: no
-// lvextend, and nothing at all issued against the mapping. A caller that means
-// it detaches and resizes again, which is the path
-// TestResizeGrowsADetachedEncryptedFilesystem covers and which cannot lose a
-// mapping because there is none to lose.
+// TestResizeRefusesAnAttachedEncryptedVolumeWithoutTouchingTheMapping: refused before any lvextend or mapping change.
 func TestResizeRefusesAnAttachedEncryptedVolumeWithoutTouchingTheMapping(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
@@ -1914,10 +1831,7 @@ func TestSnapshotOwnershipIsCheckedNotAssumed(t *testing.T) {
 	})
 
 	t.Run("a doubled separator is not ours either", func(t *testing.T) {
-		// splitSnapshotID cuts at the FIRST separator, so this parses with
-		// owner "data" — but its second half holds an underscore that
-		// validateName refuses, so every method that could act on it would
-		// reject the ID that ListSnapshots handed out.
+		// splitSnapshotID cuts at the first separator; the second half fails validateName.
 		runner := newFakeRunner().withLVs(
 			lvFixture{Name: "data", SizeBytes: gib},
 			lvFixture{Name: "data" + snapSeparator + "daily" + snapSeparator + "manual", SizeBytes: gib / 5, Origin: "data"},
@@ -2088,8 +2002,7 @@ func TestDeleteRefusesAVolumeWithSnapshots(t *testing.T) {
 			if !errors.Is(err, common.ErrHasSnapshots) {
 				t.Fatalf("Delete = %v, want ErrHasSnapshots", err)
 			}
-			// The caller has to know WHICH snapshots are in the way, or the
-			// error tells it to go looking.
+			// The error names the snapshots in the way.
 			for _, want := range []string{"data_snap_nightly", "data_snap_weekly"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("error %q does not name %q", err, want)
@@ -2105,8 +2018,7 @@ func TestDeleteRefusesAVolumeWithSnapshots(t *testing.T) {
 	}
 }
 
-// TestDeleteProceedsOnceSnapshotsAreGone checks the other half: the refusal is
-// about snapshots of THIS volume, and clearing them lets the delete through.
+// TestDeleteProceedsOnceSnapshotsAreGone: clearing this volume's snapshots lets the delete through.
 func TestDeleteProceedsOnceSnapshotsAreGone(t *testing.T) {
 	runner := newFakeRunner().withLVs(
 		lvFixture{Name: "data", SizeBytes: gib},
@@ -2220,15 +2132,7 @@ func TestFailedRemovalLeavesAnAttachedVolumeAttached(t *testing.T) {
 	assertNoLine(t, runner, "lvchange --activate n --yes vg0/data")
 }
 
-// TestDeleteFailsClosedOnAnUnreadableMountTable is the hazard the mount-table
-// rework exists for. Delete acts on "nothing is mounted" by running a forced
-// lvremove, so a mount-table failure that read as "nothing is mounted" would
-// take a live filesystem's volume out from under it. Every failure mode has to
-// stop the delete instead.
-//
-// The cases are the shapes reading /proc/self/mountinfo actually fails in: the
-// file could not be opened, a record did not parse, or the device path could
-// not be identified. None of them may be mistaken for an empty table.
+// TestDeleteFailsClosedOnAnUnreadableMountTable: an open, parse or device-identity failure stops the delete.
 func TestDeleteFailsClosedOnAnUnreadableMountTable(t *testing.T) {
 	cases := map[string]error{
 		"unreadable proc file": &mountinfo.ReadError{Path: mountinfo.ProcPath, Err: os.ErrPermission},
@@ -2293,9 +2197,7 @@ func TestResizeFailsClosedOnAnUnreadableMountTable(t *testing.T) {
 	}
 }
 
-// TestMountDiscoveryIgnoresOtherVolumes checks the local filter: the provider
-// now reads the WHOLE mount table, so it has to pick out its own device rather
-// than acting on every row it finds.
+// TestMountDiscoveryIgnoresOtherVolumes: only this volume's rows of the mount table count.
 func TestMountDiscoveryIgnoresOtherVolumes(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
@@ -2385,24 +2287,18 @@ func TestStatusProgression(t *testing.T) {
 		wantState common.VolumeState
 		wantNodes int
 
-		// wantSize is USABLE capacity, which for an encrypted volume is the
-		// logical volume less its header.
+		// wantSize is usable capacity: the LV less its header for an encrypted volume.
 		wantSize int64
 	}{
 		{
-			// A detached PLAIN volume: no tag, nothing encrypted, backing and
-			// usable are the same number.
+			// A detached plain volume: backing and usable are equal.
 			name:      "available",
 			runner:    newFakeRunner().withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: false}),
 			wantState: common.VolumeStateAvailable,
 			wantSize:  gib,
 		},
 		{
-			// THE RULING: a detached ENCRYPTED volume reports usable capacity.
-			// It cannot be probed — an inactive logical volume has no device
-			// node — so the tag is what carries the fact into a state where
-			// discovery cannot run, and Status still takes no lock and
-			// activates nothing.
+			// A detached encrypted volume reports usable capacity from its tag.
 			name: "detached encryption reports usable capacity from its tag",
 			runner: newFakeRunner().withLVs(lvFixture{
 				Name: "data", SizeBytes: gib, Active: false, Tags: []string{encryptedTagFor(luksHeaderBytes)},
@@ -2439,9 +2335,7 @@ func TestStatusProgression(t *testing.T) {
 			wantSize:  gib,
 		},
 		{
-			// Locked, but ACTIVE — so it can be probed, and the header it is
-			// known to carry comes off the reported capacity even though there
-			// is no mapping to measure.
+			// Locked but active: probed, and the header is subtracted.
 			name: "locked encryption reads as available",
 			runner: newFakeRunner().
 				withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
@@ -2466,9 +2360,7 @@ func TestStatusProgression(t *testing.T) {
 			wantSize:  gib - luksHeaderBytes,
 		},
 		{
-			// A volume restored from somebody else's snapshot carries THEIR
-			// header, so the figure subtracted is read from the header rather
-			// than assumed to be this package's.
+			// A foreign header's size is read from the header.
 			name: "a foreign header is measured, not assumed",
 			runner: newFakeRunner().
 				withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
@@ -2552,18 +2444,9 @@ func TestListLVsSurfacesAnLvsFailure(t *testing.T) {
 	}
 }
 
-// --- Usable capacity -------------------------------------------------------
-//
-// VolumeSpec.SizeBytes is the capacity the CALLER CAN USE, and this provider
-// puts its LUKS header on top of it rather than taking it out of the middle.
-// These pin the arithmetic on every path that sizes a volume.
+// Usable capacity: VolumeSpec.SizeBytes excludes the LUKS header, which is added on top.
 
-// TestProvisionEncryptedSizesForUsableCapacity is the headline of the rule: an
-// encrypted volume asked for at a gibibyte gets a logical volume a header
-// LARGER, so the plaintext mapping a caller eventually mounts holds the
-// gibibyte it asked for. Sizing the logical volume at the bare request instead
-// would hand back a mapping 16 MiB short, silently, and only the data would
-// notice.
+// TestProvisionEncryptedSizesForUsableCapacity: the LV is a header larger than the request.
 func TestProvisionEncryptedSizesForUsableCapacity(t *testing.T) {
 	runner := newFakeRunner()
 	p := newTestProvider(t, runner, encrypted)
@@ -2573,8 +2456,7 @@ func TestProvisionEncryptedSizesForUsableCapacity(t *testing.T) {
 	}
 	assertLine(t, runner, "lvcreate --yes --name data --size 1090519040b --setautoactivation n vg0")
 
-	// A PLAIN volume is unchanged: usable and backing are the same thing when
-	// there is no header, and a spurious addend here would be just as wrong.
+	// A plain volume gets no addend.
 	plain := newFakeRunner()
 	pp := newTestProvider(t, plain)
 	if _, err := pp.Provision(context.Background(), common.VolumeSpec{Name: "data", SizeBytes: gib}); err != nil {
@@ -2583,10 +2465,7 @@ func TestProvisionEncryptedSizesForUsableCapacity(t *testing.T) {
 	assertLine(t, plain, "lvcreate --yes --name data --size 1073741824b --setautoactivation n vg0")
 }
 
-// TestProvisionRefusesASizeThatCannotCarryItsHeader is the overflow boundary the
-// addend introduced. A signed overflow in Go wraps rather than trapping, so
-// without the guard a size near the top of the range would reach lvcreate as a
-// NEGATIVE byte count.
+// TestProvisionRefusesASizeThatCannotCarryItsHeader: no overflow to a negative size.
 func TestProvisionRefusesASizeThatCannotCarryItsHeader(t *testing.T) {
 	for name, size := range map[string]int64{
 		"max":      math.MaxInt64,
@@ -2622,8 +2501,7 @@ func TestProvisionRefusesASizeThatCannotCarryItsHeader(t *testing.T) {
 		}
 	}
 
-	// An UNENCRYPTED provider has no header to make room for, so the same size
-	// is not near any boundary for it.
+	// An unencrypted provider is nowhere near the boundary at this size.
 	plain := newFakeRunner()
 	pp := newTestProvider(t, plain)
 	if _, err := pp.Provision(context.Background(), common.VolumeSpec{
@@ -2634,9 +2512,7 @@ func TestProvisionRefusesASizeThatCannotCarryItsHeader(t *testing.T) {
 	}
 }
 
-// TestResizeRefusesUnrepresentableEncryptedSizes is the same boundary on Resize,
-// where it is LOWER than for a plain volume by exactly the header: the backing
-// device has to hold the request plus the header and then round up.
+// TestResizeRefusesUnrepresentableEncryptedSizes: the bound is lower by the header.
 func TestResizeRefusesUnrepresentableEncryptedSizes(t *testing.T) {
 	const extent = 4 << 20
 	limit := int64(math.MaxInt64) - (extent - 1) - luksHeaderBytes
@@ -2665,8 +2541,7 @@ func TestResizeRefusesUnrepresentableEncryptedSizes(t *testing.T) {
 		t.Errorf("Resize at the limit reported a growth request as an unsupported shrink")
 	}
 
-	// That size WOULD be representable on a plain volume, which is what makes
-	// this a property of the volume rather than of the volume group.
+	// Representable on a plain volume.
 	plain := newFakeRunner().withLVs(lvFixture{Name: "data", SizeBytes: gib})
 	pp := newTestProvider(t, plain)
 	if err := pp.Resize(context.Background(), "data", limit+1); errors.Is(err, common.ErrInvalidArgument) {
@@ -2674,11 +2549,7 @@ func TestResizeRefusesUnrepresentableEncryptedSizes(t *testing.T) {
 	}
 }
 
-// TestResizeGrowsAPreRulingEncryptedVolume is the migration case. A volume
-// provisioned before SizeBytes meant usable capacity has a logical volume sized
-// at the bare request, so its mapping is a header short. Asking for the size it
-// was originally provisioned at has to GROW it into conformance rather than
-// come back as a shrink.
+// TestResizeGrowsAPreRulingEncryptedVolume: a volume sized at the bare request grows a header's worth rather than reading as a shrink.
 func TestResizeGrowsAPreRulingEncryptedVolume(t *testing.T) {
 	runner := newFakeRunner().
 		// Exactly a gibibyte of backing: what the old rule created for a
@@ -2710,8 +2581,7 @@ func TestEncryptedRestoreThresholdIsUsableCapacity(t *testing.T) {
 		return r
 	}
 
-	// The image is a gibibyte of container, so its USABLE capacity is a
-	// gibibyte less the header. Asking for exactly that is a fit.
+	// The image's usable capacity is a gibibyte less the header; asking for exactly that fits.
 	runner := encryptedSnapshot()
 	p := newTestProvider(t, runner, encrypted)
 	if _, err := p.Provision(context.Background(), common.VolumeSpec{
@@ -2739,15 +2609,7 @@ func TestEncryptedRestoreThresholdIsUsableCapacity(t *testing.T) {
 	runner.mustNotRun(t, "lvcreate")
 }
 
-// TestRestoreZeroesTheExtentRoundingSlice is the stale-data path the addend
-// opened up.
-//
-// An origin's size is a whole number of extents, so a restore into exactly the
-// image size used to produce a volume with nothing past the image — which is
-// why skipping the zeroing there was safe. A backing size is now a usable
-// capacity with a header added to it and is extent-aligned only by luck, so on
-// a volume group whose extents do not divide the header there IS a tail, and it
-// arrives holding whatever the previous tenant of those extents wrote.
+// TestRestoreZeroesTheExtentRoundingSlice: the extent-rounding tail is zeroed.
 func TestRestoreZeroesTheExtentRoundingSlice(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(snapshotFixtures()...).
@@ -2764,7 +2626,7 @@ func TestRestoreZeroesTheExtentRoundingSlice(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	// From the end of the image ON THE LOGICAL VOLUME, which is past the header.
+	// From the end of the image on the LV, past the header.
 	assertZeroed(t, runner, "/dev/vg0/restored", 1090519040)
 
 	// On a volume group whose extents DO divide the header there is no slice,
@@ -2782,11 +2644,7 @@ func TestRestoreZeroesTheExtentRoundingSlice(t *testing.T) {
 	assertNothingZeroed(t, aligned)
 }
 
-// TestReencryptingRestoreZeroesPastTheHeader checks the offset itself. The image
-// lands INSIDE the container, so the tail starts a header further along the
-// logical volume than it would on a plaintext restore — and zeroing from the
-// bare image size would leave the last header's worth of the previous tenant's
-// data in place while looking like it had done the job.
+// TestReencryptingRestoreZeroesPastTheHeader: the tail starts a header further along the LV.
 func TestReencryptingRestoreZeroesPastTheHeader(t *testing.T) {
 	runner := newFakeRunner().withLVs(snapshotFixtures()...)
 	runner.withBlkid(map[string]string{"/dev/vg0/data_snap_nightly": "ext4"})
@@ -2803,17 +2661,7 @@ func TestReencryptingRestoreZeroesPastTheHeader(t *testing.T) {
 	assertNotZeroed(t, runner, "/dev/vg0/restored", 1073741824)
 }
 
-// TestStatusSurvivesAVolumeMovingUnderIt covers the race Status invites by
-// design. It holds no lock, so between the probe that identifies a LUKS
-// container and the read of that container's header the volume can be detached
-// or deleted by somebody else — and reading the header of a device that is no
-// longer there fails.
-//
-// Before the header read existed, both races degraded quietly: blkid and the
-// mapping lookup report a vanished device as "nothing here" rather than as a
-// failure. Turning them into a hard error would make Status unreliable in
-// exactly the concurrent use it exists for, so a failed read is re-checked
-// against the volume group rather than believed on its own.
+// TestStatusSurvivesAVolumeMovingUnderIt: a failed header read is re-checked against the volume group.
 func TestStatusSurvivesAVolumeMovingUnderIt(t *testing.T) {
 	active := []lvFixture{{Name: "data", SizeBytes: gib, Active: true}}
 
@@ -2869,12 +2717,7 @@ func TestStatusSurvivesAVolumeMovingUnderIt(t *testing.T) {
 	})
 }
 
-// --- Remembering encryption ------------------------------------------------
-//
-// Encryption is DISCOVERED while a volume is active and REMEMBERED for when it
-// is not. An inactive logical volume has no device node, so a detached volume
-// cannot be probed at all, and Status holds no lock and will not activate one
-// to look. The tag is what lets a detached volume still report usable capacity.
+// Remembering encryption: discovered while active, recorded as a tag for when detached.
 
 // TestProvisionTagsAnEncryptedVolume pins where the tag is written: after
 // luksFormat, not at lvcreate. Tagging at creation would be one command fewer
@@ -2905,7 +2748,7 @@ func TestProvisionTagsAnEncryptedVolume(t *testing.T) {
 			format, tag, strings.Join(lines, "\n  "))
 	}
 
-	// A PLAIN volume is never tagged; the tag means encrypted, not "made here".
+	// A plain volume is never tagged.
 	plain := newFakeRunner()
 	pp := newTestProvider(t, plain)
 	if _, err := pp.Provision(context.Background(), common.VolumeSpec{Name: "data", SizeBytes: gib}); err != nil {
@@ -3005,7 +2848,7 @@ func TestAttachRepairsAMissingTag(t *testing.T) {
 	}
 	assertNoLine(t, tagged, "lvchange --addtag blockstore.luks-header=16777216 vg0/data")
 
-	// A PLAIN volume is never tagged by an attach.
+	// A plain volume is never tagged by an attach.
 	plain := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
 		withBlkid(map[string]string{"/dev/vg0/data": "ext4"})
@@ -3016,16 +2859,7 @@ func TestAttachRepairsAMissingTag(t *testing.T) {
 	assertNoLine(t, plain, "lvchange --addtag blockstore.luks-header=16777216 vg0/data")
 }
 
-// TestAttachSurvivesAFailedTagRepair pins the deliberate non-fatality of the
-// repair.
-//
-// The volume attaches perfectly well without a tag — it stays in the
-// untagged-legacy state Status already falls back for — and there is a real
-// configuration where only the tag write fails: a volume group whose metadata
-// is read-only still ACTIVATES volumes, because activation writes no metadata,
-// so Attach gets past its own lvchange and only the tag write is refused.
-// Mounting existing volumes from such a group is a normal recovery; failing the
-// attach to record a capacity hint would be the wrong trade.
+// TestAttachSurvivesAFailedTagRepair: an untagged volume attaches when the tag write fails, as on read-only VG metadata.
 func TestAttachSurvivesAFailedTagRepair(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
@@ -3090,16 +2924,7 @@ func TestStatusRefusesATagThatContradictsTheDisk(t *testing.T) {
 	}
 }
 
-// TestActiveStatusRefusesATagThatDisagreesWithTheHeader completes the tag's
-// authority contract. "On an active volume discovery decides" was applied only
-// to whether the volume is a container at all; it has to apply to the header
-// SIZE too, which is the part the tag actually carries.
-//
-// A tag recording 16 MiB over a container whose header is really 32 MiB returns
-// the right number while the volume is up, because the value is measured — and
-// then over-states usable capacity by 16 MiB the moment it is detached and the
-// stale tag becomes the only source. Succeeding here would be the last moment
-// anything could catch that.
+// TestActiveStatusRefusesATagThatDisagreesWithTheHeader: a wrong recorded header size is an error.
 func TestActiveStatusRefusesATagThatDisagreesWithTheHeader(t *testing.T) {
 	for name, tc := range map[string]struct {
 		tags       []string
@@ -3143,9 +2968,7 @@ func TestActiveStatusRefusesATagThatDisagreesWithTheHeader(t *testing.T) {
 	}
 }
 
-// TestActiveStatusAcceptsAnAgreeingOrAbsentTag is the other half: the check must
-// refuse a WRONG tag, not any tag. An agreeing tag and an untagged legacy volume
-// both report the measured capacity.
+// TestActiveStatusAcceptsAnAgreeingOrAbsentTag: both report the measured capacity.
 func TestActiveStatusAcceptsAnAgreeingOrAbsentTag(t *testing.T) {
 	for name, tags := range map[string][]string{
 		"tag agrees with the header": {encryptedTagFor(4 << 20)},
@@ -3170,14 +2993,7 @@ func TestActiveStatusAcceptsAnAgreeingOrAbsentTag(t *testing.T) {
 	}
 }
 
-// TestAttachRefusesToLeaveAKnownWrongTagInPlace is the other side of the
-// tolerated tag-write failure.
-//
-// Tolerating it is right for an UNTAGGED legacy volume: nothing gets worse, and
-// the volume simply stays in the documented fallback. It is NOT right when a
-// tag already exists and is known to be wrong, because the repair failing
-// leaves a lie in place that detachedSize will then treat as authoritative —
-// fail-open, and in the over-stating direction.
+// TestAttachRefusesToLeaveAKnownWrongTagInPlace: a failed repair of an existing wrong tag fails the attach.
 func TestAttachRefusesToLeaveAKnownWrongTagInPlace(t *testing.T) {
 	failTagWrites := func(r *fakeRunner) {
 		r.on("lvchange", func(args []string, _ []byte) ([]byte, error) {
@@ -3210,8 +3026,7 @@ func TestAttachRefusesToLeaveAKnownWrongTagInPlace(t *testing.T) {
 		})
 	}
 
-	// An UNTAGGED legacy volume keeps the tolerance: the attach still succeeds,
-	// because nothing is left behind that lies.
+	// An untagged legacy volume still attaches.
 	t.Run("untagged legacy is still tolerated", func(t *testing.T) {
 		runner := newFakeRunner().
 			withLVs(lvFixture{Name: "data", SizeBytes: gib, Active: true}).
@@ -3247,15 +3062,7 @@ func TestParseLVTagsHandlesTheEmptyCase(t *testing.T) {
 	}
 }
 
-// TestDetachedStatusUsesTheRecordedHeaderNotTheDefault is the bug that made the
-// tag carry a SIZE rather than a boolean.
-//
-// A volume restored verbatim from an outside snapshot carries THAT snapshot's
-// header, which need not be the 16 MiB this package formats. The restore
-// measured it in order to size the volume, so recording only "encrypted" would
-// throw away a number already in hand — and the resulting error is not small
-// and not safe: against a header LARGER than the default, Status over-states
-// usable capacity, and a caller sizing data to the answer overruns the volume.
+// TestDetachedStatusUsesTheRecordedHeaderNotTheDefault: a foreign header's recorded size is used.
 func TestDetachedStatusUsesTheRecordedHeaderNotTheDefault(t *testing.T) {
 	for name, header := range map[string]int64{
 		"smaller than the default": 4 << 20,
@@ -3368,9 +3175,7 @@ func TestStatusRefusesAnUnreadableHeaderTag(t *testing.T) {
 	}
 }
 
-// TestAttachRecordsTheMeasuredHeader pins that the repair writes a MEASURED
-// number. Attach is the only place that both holds the lock and can read the
-// real offset out of the container, so a tag it writes is never an assumption.
+// TestAttachRecordsTheMeasuredHeader: the tag holds the offset read from the container.
 func TestAttachRecordsTheMeasuredHeader(t *testing.T) {
 	// A legacy volume whose container is not the size this package formats.
 	runner := newFakeRunner().
@@ -3384,8 +3189,7 @@ func TestAttachRecordsTheMeasuredHeader(t *testing.T) {
 	}
 	assertLine(t, runner, "lvchange --addtag blockstore.luks-header=4194304 vg0/data")
 
-	// A tag that has DRIFTED from the container is corrected, and the stale one
-	// removed in the same lvchange so the volume is never carrying both.
+	// A drifted tag is replaced in the same lvchange.
 	drifted := newFakeRunner().
 		withLVs(lvFixture{
 			Name: "data", SizeBytes: gib, Active: true,
@@ -3424,20 +3228,7 @@ func TestAttachRecordsTheMeasuredHeader(t *testing.T) {
 	}
 }
 
-// TestDetachRaceThroughTheHeaderReadStillSubtractsTheHeader is the seam where
-// this PR's two halves meet, and where they disagreed.
-//
-// The path: Status finds the volume active and a LUKS container, goes to read
-// the header for an exact answer, and the header read fails because a
-// concurrent Detach took the device node away. The re-check then finds the
-// volume inactive — which is the DETACHED case, and the detached case consults
-// the tag. Returning the backing size there instead reports a gibibyte of
-// usable capacity on a volume that has a gibibyte MINUS a header, which is the
-// fail-open overfill the tag exists to prevent.
-//
-// Both detached routes — the ordinary one and this post-race re-check — must
-// give the same answer for the same volume, which is why they share one
-// function rather than agreeing by inspection.
+// TestDetachRaceThroughTheHeaderReadStillSubtractsTheHeader: the post-race detached answer matches the ordinary one.
 func TestDetachRaceThroughTheHeaderReadStillSubtractsTheHeader(t *testing.T) {
 	tagged := func(active bool) []lvFixture {
 		return []lvFixture{{
@@ -3464,7 +3255,7 @@ func TestDetachRaceThroughTheHeaderReadStillSubtractsTheHeader(t *testing.T) {
 			"usable capacity by a whole header", status.SizeBytes, gib-luksHeaderBytes)
 	}
 
-	// The SAME volume asked the ordinary way must give the SAME number.
+	// The ordinary path gives the same number.
 	plainRead := newFakeRunner().withLVs(tagged(false)...)
 	pr := newTestProvider(t, plainRead, withKey)
 	ordinary, err := pr.Status(context.Background(), "data")
@@ -3476,8 +3267,7 @@ func TestDetachRaceThroughTheHeaderReadStillSubtractsTheHeader(t *testing.T) {
 			status.SizeBytes, ordinary.SizeBytes)
 	}
 
-	// And an UNTAGGED legacy volume still gets the migration fallback on the
-	// same path — the fix must not turn the legacy answer into a subtraction.
+	// An untagged legacy volume still gets the backing size.
 	legacy := func(active bool) []lvFixture {
 		return []lvFixture{{Name: "data", SizeBytes: gib, Active: active}}
 	}
@@ -3495,13 +3285,7 @@ func TestDetachRaceThroughTheHeaderReadStillSubtractsTheHeader(t *testing.T) {
 	}
 }
 
-// TestAttachClearsAHeaderTagFromAPlainVolume closes the other direction of the
-// contradiction. Status already refuses a plain volume carrying a header tag;
-// Attach is the operation that can actually DO something about it, because it
-// holds the lock and has just probed the volume. Letting it succeed and leave
-// the tag would keep a false claim authoritative for every detached read after
-// it — "the next attach either re-records the tag or refuses" has to hold when
-// the right answer is that there should be no tag at all.
+// TestAttachClearsAHeaderTagFromAPlainVolume: Attach removes a header tag from a plain volume.
 func TestAttachClearsAHeaderTagFromAPlainVolume(t *testing.T) {
 	runner := newFakeRunner().
 		withLVs(lvFixture{
@@ -3556,18 +3340,7 @@ func TestAttachClearsAHeaderTagFromAPlainVolume(t *testing.T) {
 	}
 }
 
-// TestResizeReconcilesTheHeaderTag closes the last operation that held the lock
-// and the measured header at the same time and did nothing with them.
-//
-// Resize is CORRECT either way — it sizes from the measured offset, never from
-// the tag — so this is not about the resize being wrong. It is that a volume
-// which is only ever resized, never attached, would keep a lying tag forever,
-// and the contract says a tag can only stay wrong for as long as the volume
-// stays detached.
-//
-// The encrypted fixtures here are LOCKED containers, which is what a volume
-// being resized looks like: an unlocked one is refused before the reconciliation
-// would matter.
+// TestResizeReconcilesTheHeaderTag: Resize corrects the tag on locked containers.
 func TestResizeReconcilesTheHeaderTag(t *testing.T) {
 	t.Run("a drifted tag on an encrypted volume is re-recorded", func(t *testing.T) {
 		runner := newFakeRunner().
@@ -3625,13 +3398,7 @@ func TestResizeReconcilesTheHeaderTag(t *testing.T) {
 	})
 }
 
-// TestDetachReconcilesBeforeItLeaves is the transition that matters most.
-//
-// Detach is the moment a volume enters the state where the tag becomes the ONLY
-// source of its capacity, and it is the last moment the container is readable.
-// A wrong tag surviving a detach is therefore not a latent problem: it is
-// immediately load-bearing, on the very next Status, with no probe left to
-// contradict it.
+// TestDetachReconcilesBeforeItLeaves: the tag is reconciled before deactivation.
 func TestDetachReconcilesBeforeItLeaves(t *testing.T) {
 	t.Run("a drifted tag on an encrypted volume is re-recorded", func(t *testing.T) {
 		runner := newFakeRunner().

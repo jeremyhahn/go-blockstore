@@ -17,10 +17,8 @@
 // It is shared rather than per-provider for the reason internal/mount and
 // internal/mountinfo are: the question is about the kernel's mount table, not
 // about LVM or DRBD, and the answer has to be the same whichever provider
-// asked. It was pkg/local's alone until pkg/drbd needed it (#40), and the two
-// subtleties below are what made copying it the wrong move — both were review
-// findings on #34 rather than obvious first cuts, and a second copy is a second
-// chance to lose them:
+// asked. pkg/local and pkg/drbd share it because a second copy is a second
+// chance to lose the two subtleties below:
 //
 //   - the rollback runs on a context of its own, because the most likely reason
 //     to be rolling back is that the caller's context died;
@@ -193,11 +191,7 @@ func (g Guard) Verify(ctx context.Context, device, target string) (uint32, error
 		return 0, nil
 	}
 
-	// The seam's propagation half is optional, so a caller that injected its own
-	// mount table is not forced to implement a method for a guard it may never
-	// turn on. Having turned it on and injected a table that cannot answer is a
-	// different matter: it is refused rather than skipped, because a guard that
-	// passes when it cannot check is the thing this exists to remove.
+	// A table without propagation support is refused when the guard is on.
 	reader, ok := g.reader()
 	if !ok {
 		return 0, &preflight.CapabilityError{
@@ -208,22 +202,11 @@ func (g Guard) Verify(ctx context.Context, device, target string) (uint32, error
 		}
 	}
 
-	// The lookup runs on a context detached from the caller's, and the caller's
-	// is checked afterwards. Once mount(2) has returned, verifying and — if the
-	// verification refuses — unwinding are COMPLETION work: a caller whose
-	// deadline passed in that instant would otherwise leave a mount that was
-	// never verified and never cleaned up, because the read that would identify
-	// it fails first. So the read happens, and then the caller is told they gave
-	// up, which is the same order the providers' zeroing paths use for the same
-	// reason.
+	// Read on a detached context, then check the caller's, so a refused mount can still be unwound.
 	lookupCtx, cancel := UnwindContext(ctx)
 	defer cancel()
 
-	// Asked about THIS DEVICE at the path, not about whatever is at the path.
-	// Between mount(2) returning and this lookup, another process can mount over
-	// the target — and reading "the propagation at this path" would then read
-	// the interloper's. A SHARED thing landing on top of our private mount would
-	// make the guard pass, which is the fail-open it exists to prevent.
+	// Ask about this device at the path, so a mount landing on top cannot make the guard pass.
 	id, propagates, spelling, err := reader.PropagationOf(lookupCtx, device, target)
 	if err != nil {
 		return 0, &preflight.CapabilityError{
@@ -285,12 +268,7 @@ func (g Guard) Unwind(ctx context.Context, device, target string, id uint32, fin
 		return errors.Join(finding, ErrTableCannotReport)
 	}
 
-	// The mount is identified by the kernel's own identity for it, not by
-	// (device, path). Those are the same thing only until somebody stacks a
-	// SECOND mount of the same device on the same path, and then unmounting by
-	// path detaches theirs while the refused mount stays underneath. An id that
-	// still matches is the evidence that the mount here is the one this call
-	// made rather than a replacement made since.
+	// Identify the mount by its kernel ID, which tells this mount from a second mount of the same device at the path.
 	current, _, _, err := reader.PropagationOf(ctx, device, target)
 	if err != nil {
 		return errors.Join(finding, err)
@@ -313,13 +291,7 @@ func (g Guard) reader() (mountinfo.PropagationReader, bool) {
 	return reader, ok
 }
 
-// unwindTimeout bounds a rollback so a cleanup cannot hang forever either. It
-// covers a mount-table read and an unmount, both of which are fast when they
-// work at all.
-//
-// It is not a provider's own cleanup timeout and must not be conflated with one:
-// pkg/drbd's cleanupContext waits on drbdadm and lvremove, which are minutes;
-// this waits on a syscall.
+// unwindTimeout bounds a rollback's mount-table read and unmount.
 const unwindTimeout = 30 * time.Second
 
 // UnwindContext detaches from the caller's context for a compensating action.

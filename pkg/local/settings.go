@@ -183,11 +183,7 @@ func NewFromSettings(settings map[string]string) (*Provider, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: %s=%q is not an integer", common.ErrInvalidArgument, SettingSnapshotCoWPercent, raw)
 		}
-		// The range is checked here as well as in New because Options treats a
-		// zero SnapshotCoWPercent as "use the default", which is right for a
-		// struct literal that simply omits the field and wrong for an operator
-		// who wrote 0 and meant it. Leaving it to New would turn that 0 into
-		// 20 without a word.
+		// An explicit 0 is out of range here; in Options zero means the default.
 		if pct < 1 || pct > 100 {
 			return nil, fmt.Errorf("%w: %s=%d is outside 1-100", common.ErrInvalidArgument, SettingSnapshotCoWPercent, pct)
 		}

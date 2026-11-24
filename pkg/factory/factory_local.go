@@ -28,10 +28,7 @@ func init() {
 	RegisterProvider("local", func(settings map[string]string) (common.VolumeProvider, error) {
 		provider, err := local.NewFromSettings(settings)
 		if err != nil {
-			// Returning NewFromSettings' results directly would hand back a nil
-			// *local.Provider boxed in a non-nil common.VolumeProvider, so a
-			// caller's `if provider != nil` would be true for a construction
-			// that failed. The explicit nil keeps the interface value nil.
+			// Return an explicit nil so a failed construction is not a non-nil interface.
 			return nil, err
 		}
 		return provider, nil

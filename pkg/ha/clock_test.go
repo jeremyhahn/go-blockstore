@@ -28,13 +28,7 @@ const waitTimeout = 5 * time.Second
 // finishes promptly, long enough not to spin a core.
 const pollInterval = 200 * time.Microsecond
 
-// testClock is a manually driven [Clock].
-//
-// Nothing fires unless a test advances it. That is what makes the controller's
-// loop observable: it parks in its select waiting on After, the test can then
-// establish whatever state it wants to interleave, and only then does the
-// renewal tick happen. Wall-clock sleeps would make the same tests both slower
-// and less certain about what they proved.
+// testClock is a manually driven [Clock]; nothing fires unless a test advances it.
 type testClock struct {
 	mu      sync.Mutex
 	now     time.Time
@@ -103,12 +97,7 @@ func (c *testClock) registered() int {
 	return c.created
 }
 
-// awaitTimers blocks until at least n timers have been registered in total.
-//
-// It is the barrier that says "the controller has finished the work leading up
-// to its nth wait and is parked". Advancing before that point would fire into a
-// clock nobody is waiting on and the tick would be lost, which is the failure
-// mode that makes a timing test flaky instead of failing.
+// awaitTimers blocks until at least n timers have been registered, so an advance is never lost.
 func (c *testClock) awaitTimers(t *testing.T, n int) {
 	t.Helper()
 	deadline := time.Now().Add(waitTimeout)

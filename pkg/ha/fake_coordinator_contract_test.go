@@ -23,13 +23,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// The controller's correctness rests entirely on the Coordinator contract, so a
-// fake that answers a little differently would let the controller pass tests it
-// would fail in production. This is the fixture proving itself against
-// pkg/common/coordinator.go, rule by rule.
-//
-// It is not a test of the controller. It is the reason the controller's tests
-// are worth anything.
+// The fake Coordinator is tested here against every rule of pkg/common/coordinator.go.
 
 func TestFakeCoordinatorLeaseIsExclusiveAndFailFast(t *testing.T) {
 	ctx := context.Background()
@@ -105,10 +99,7 @@ func TestFakeCoordinatorExpiryClosesDoneAndFreesTheKey(t *testing.T) {
 	ctx := context.Background()
 	c := newFakeCoordinator()
 
-	// A REAL one-second TTL, elapsed by the wall clock. This is the one test
-	// that waits, and it exists so the deterministic expireNow hook used
-	// everywhere else is known to share the timer path's behavior rather than
-	// merely to resemble it.
+	// A real one-second TTL, to show the expireNow hook matches the timer path.
 	lease, err := c.AcquireLease(ctx, "k", time.Second)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)

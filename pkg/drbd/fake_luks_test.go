@@ -28,15 +28,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/internal/mount"
 )
 
-// luksBinary is the name the fake records LUKS operations under.
-//
-// They are not a binary — go-luks2 does the work in this process — but they go
-// through the same recorder as the commands that still are, and for the reason a
-// second recorder would have destroyed: THE ASSERTIONS THAT MATTER ARE ABOUT
-// ORDER ACROSS THE TWO. The container is opened after the promotion; it is
-// closed before the demotion; the mapping is gone before the drbdadm down. A
-// test cannot check any of that against two lists. pkg/local's fake does the
-// same thing for the same reason.
+// luksBinary is the name the fake records LUKS operations under, in the same recorder as commands, so order across both is assertable.
 const luksBinary = "luks"
 
 // fakeLUKS is the provider's luks.Backend for the unit suite: it records what
@@ -55,12 +47,7 @@ type fakeLUKS struct {
 	// "identity" — so a test can script exactly one of them into failing.
 	fail map[string]error
 
-	// deviceSize is the CURRENT size of each device path, as sysfs would
-	// report it; a test grows a device by rescripting it. mappingSize is the
-	// length each open mapping was given, captured from deviceSize at the
-	// moment Open ran and never updated afterwards — which is precisely the
-	// kernel's behavior go-luks2 inherits, and the thing the stale-mapping
-	// tests are about: the device moves, the mapping does not.
+	// deviceSize is each device's current size; mappingSize is fixed when Open ran, as the kernel does.
 	deviceSize  map[string]int64
 	mappingSize map[string]int64
 }
@@ -118,8 +105,7 @@ func (f *fakeLUKS) Open(_ context.Context, device, name string, key *enclave.Mem
 		return err
 	}
 	f.open[name] = device
-	// Sized ONCE, here, from the device as it is now: go-luks2's Unlock does
-	// the same, and nothing afterwards reloads it.
+	// Sized once from the device, as go-luks2's Unlock does.
 	f.mappingSize[name] = f.deviceSize[device] - luks.HeaderBytes
 	return nil
 }
@@ -242,10 +228,7 @@ func cryptName(volID string) string {
 // cryptPath is where that mapping appears.
 func cryptPath(volID string) string { return "/dev/mapper/" + cryptName(volID) }
 
-// assertOrder requires the recorded calls to contain each of want, in this
-// order. It is the assertion the crypt lifecycle is actually about: WHEN the
-// container is opened and closed relative to the role change, not merely that
-// it was.
+// assertOrder requires the recorded calls to contain each of want, in order.
 func assertOrder(t *testing.T, r *fakeRunner, want ...string) {
 	t.Helper()
 	got := r.commands()

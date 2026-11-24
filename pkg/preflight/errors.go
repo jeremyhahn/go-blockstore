@@ -50,8 +50,8 @@ const (
 	CausePrivilegeOrPolicy Cause = "privilege-or-policy"
 
 	// CauseLSMDenied means a Linux Security Module — AppArmor or SELinux —
-	// denied the operation. It is a THIRD independent mechanism: measured on
-	// 2026-09-01, Docker's default AppArmor profile denies mount(2) even for a
+	// denied the operation. It is a third independent mechanism: Docker's
+	// default AppArmor profile denies mount(2) even for a
 	// container granted CAP_SYS_ADMIN with the syscall permitted by seccomp.
 	CauseLSMDenied Cause = "lsm-denied"
 
@@ -64,7 +64,7 @@ const (
 	// refused to open it with EPERM — the container was allowed to see the node
 	// without being allowed to use it.
 	//
-	// Measured 2026-09-01: bind-mounting /dev/mapper/control into a container
+	// Bind-mounting /dev/mapper/control into a container
 	// without a device-cgroup allowance produces exactly this, and no capability
 	// grant changes it. It is a different fix from every other refusal here, and
 	// it is the one a hostPath in Kubernetes walks straight into.

@@ -27,18 +27,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// Setting keys accepted by New.
-//
-// They are snake_case, which is the convention across every go-blockstore
-// provider and is inherited from go-objstore (access_key_id,
-// secret_access_key, encryption_kms_path). The LVM volume group is
-// volume_group rather than the terser vg because pkg/local names the same
-// concept that way and the two must agree — a caller configuring either
-// provider should not have to remember which spelling this one wants.
-//
-// Any other key is rejected rather than ignored: a mistyped setting that
-// silently does nothing is a configuration bug that only shows up as wrong
-// behavior much later, on the node it was meant to fix.
+// Setting keys accepted by New, snake_case and shared with pkg/local; any other key is rejected.
 const (
 	SettingVolumeGroup         = "volume_group"
 	SettingConfigDir           = "config_dir"
@@ -424,12 +413,7 @@ func ParseConfig(settings map[string]string) (Config, error) {
 		}
 		cfg.LUKSKeyFile = v
 	}
-	// One file cannot be both secrets. The replication secret is SHARED WITH
-	// THE PEER so DRBD can authenticate it; the LUKS passphrase decrypts the
-	// volume. Pointing both settings at one path does not configure two
-	// controls, it gives the peer-authentication secret the additional job of
-	// protecting the data — and a rotation of either one then silently changes
-	// the other.
+	// One file cannot hold both secrets: the replication secret is shared with the peer.
 	if cfg.LUKSKeyFile != "" && cfg.LUKSKeyFile == cfg.ReplicationSecretFile {
 		return Config{}, fmt.Errorf("%w: %s and %s name the same file %q: the peer-authentication secret must not also be the volume passphrase",
 			common.ErrInvalidArgument, SettingLUKSKeyFile, SettingReplicationSecretFile, cfg.LUKSKeyFile)
@@ -445,23 +429,7 @@ func ParseConfig(settings map[string]string) (Config, error) {
 	return cfg, nil
 }
 
-// resolveNodeIDs decides which DRBD node id each half of the pair carries.
-//
-// This is the one setting a two-node deployment cannot get wrong quietly. DRBD
-// identifies a node by its id, and both copies of a resource file must agree on
-// which name holds which: if node-a's copy says a=0/b=1 while node-b's copy
-// says b=0/a=1, the two never connect. A fixed default of "local 0, peer 1"
-// would produce exactly that on a pair where both sides took the default, so
-// there is none.
-//
-// With neither id given, they are derived from the two node names by sorting
-// them: the lexicographically smaller name takes 0. Both hosts compare the same
-// pair of names and so reach the same assignment without coordinating, which
-// makes the minimal configuration correct rather than merely convenient.
-//
-// Giving one id and not the other is refused. It would mix an explicit choice
-// on one side with a derived one on the other, which is how a pair ends up
-// disagreeing after somebody "fixed" a single node.
+// resolveNodeIDs assigns DRBD node IDs; with neither given, the lexicographically smaller name takes 0, and giving only one is refused.
 func resolveNodeIDs(settings map[string]string, nodeName, peerNode string) (nodeID, peerNodeID int, err error) {
 	_, haveNode := settings[SettingNodeID]
 	_, havePeer := settings[SettingPeerNodeID]
@@ -528,10 +496,7 @@ func requiredIP(settings map[string]string, key string) (net.IP, error) {
 	return ip, nil
 }
 
-// optionalBool reads a boolean setting. Only "true" and "false" are accepted:
-// a setting that turns off peer authentication is not one to reach through a
-// permissive parser that would take "yes", "1" or "TRUE" and leave an operator
-// unsure which spellings count.
+// optionalBool reads a boolean setting; only "true" and "false" are accepted.
 func optionalBool(settings map[string]string, key string) (bool, error) {
 	raw, ok := settings[key]
 	if !ok || raw == "" {

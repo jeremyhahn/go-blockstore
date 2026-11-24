@@ -71,9 +71,7 @@ func (f *fakeRunner) scriptProvision(name string, size int64) {
 	f.scriptProvisionAt(name, backingBytes(size, false))
 }
 
-// scriptProvisionAt is the same for a backing volume created at an explicit
-// size, which a restore is: the destination is created at the SOURCE's size and
-// grown afterwards, not at the size the caller asked for.
+// scriptProvisionAt scripts a backing volume created at an explicit size, as a restore does.
 func (f *fakeRunner) scriptProvisionAt(name string, backingSize int64) {
 	f.on(binLVCreate, "--yes", "--name", name, "--size", strconv.FormatInt(backingSize, 10)+"b", testVG).returns("")
 	f.on(binDRBDAdm, "--", "--force", "create-md", name).returns("")
@@ -214,11 +212,7 @@ func TestProvisionAcceptsTwoReplicas(t *testing.T) {
 	provision(t, p, r, &common.VolumeSpec{Name: testVolume, SizeBytes: testSize, Replicas: 2})
 }
 
-// TestProvisionAcceptsTheLargestRepresentableSize is the boundary the refusals
-// in TestProvisionValidation must not overshoot: the largest usable capacity
-// whose backing still fits in an int64 has to be ATTEMPTED, not refused. Its
-// backing is created at backingBytes(maxDataBytes(0, false)), which is exactly
-// math.MaxInt64.
+// TestProvisionAcceptsTheLargestRepresentableSize: a backing of exactly math.MaxInt64 must be attempted.
 func TestProvisionAcceptsTheLargestRepresentableSize(t *testing.T) {
 	p, r := newTestProvider(t)
 	limit := maxDataBytes(0, false)
@@ -305,18 +299,7 @@ func TestProvisionRollback(t *testing.T) {
 	}
 }
 
-// TestProvisionRollbackRetainsWhatItCouldNotRemove is the other half of
-// TestProvisionRollback: that one proves a cleanup which SUCCEEDS leaves
-// nothing behind, and this one proves a cleanup which FAILS leaves everything
-// behind, deliberately.
-//
-// Removing the two files regardless of whether the teardown worked is worse
-// than keeping them. The resource file is what drbdadm needs to take a resource
-// down, so deleting it after "drbdadm down" failed removes the means of
-// cleaning up a resource that may still be live. The state record is what makes
-// the reservation visible to listMeta, so deleting it hands the minor and port
-// of that still-live resource to the next Provision. And together they are the
-// only evidence an operator has that anything survived at all.
+// TestProvisionRollbackRetainsWhatItCouldNotRemove: a failed cleanup keeps the resource file and state record.
 func TestProvisionRollbackRetainsWhatItCouldNotRemove(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -332,11 +315,7 @@ func TestProvisionRollbackRetainsWhatItCouldNotRemove(t *testing.T) {
 			breakIt: func(r *fakeRunner) {
 				r.on(binDRBDAdm, "up", testVolume).fails(1, "Failure: (127) Device minor not allocated")
 				r.on(binDRBDAdm, "down", testVolume).fails(11, "State change failed: Device is held open by someone")
-				// Scripted to SUCCEED, so that its absence from the log is the
-				// ordering refusing to run it and not a fake declining the
-				// command. This is the sequence the old code ran: a failed down
-				// followed by lvremove --force on a device the resource it
-				// could not take down may still hold open.
+				// Scripted to succeed, so its absence from the log proves the ordering refused it.
 				r.on(binLVRemove, "--force", "vg0/vol1").returns("")
 			},
 			wantNamed: []string{
@@ -458,9 +437,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 	r.reset()
 
 	snapLV := "vol1.snap.nightly"
-	// The origin of a snapshot this provider took is the BACKING volume, whose
-	// size already includes DRBD's metadata. Restoring at the volume's usable
-	// size must still be accepted.
+	// A restore at the volume's usable size must be accepted though the origin includes metadata.
 	r.scriptLVS(lvsJSON(lvEntry{
 		Name: snapLV, VG: testVG, Size: "214748364", Origin: "vol1",
 		OriginSize: strconv.FormatInt(roundUpTo(backingBytes(testSize, false), testExtentSize), 10), Time: "2026-08-26 10:00:00 -0500", Attr: "swi-a-s---",
@@ -475,8 +452,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 	}
 
 	assertCopied(t, r, "/dev/vg0/vol1.snap.nightly", "/dev/vg0/vol2")
-	// Created at the SOURCE's size, not the caller's: the copy is whole-device,
-	// and a longer destination strands the source's metadata inside it.
+	// Created at the source's size, not the caller's.
 	r.assertRan(t, fmt.Sprintf("lvcreate --yes --name vol2 --size %db vg0", originBacking()))
 
 	// The copy happens before DRBD metadata is written, so the metadata
@@ -658,14 +634,7 @@ func TestAttach(t *testing.T) {
 	r.assertNotRan(t, "primary")
 }
 
-// TestAttachConvergesWhenAlreadyUp is Detach's already-down convergence in the
-// other direction, and it is the ordinary path rather than an edge case:
-// Provision brings the resource up before it returns, so a caller following the
-// contract's Provision, Attach, Mount order finds it up.
-//
-// Repeating "drbdadm up" there may or may not be a no-op on a real node. This
-// makes that irrelevant, which is the point — the behavior has never been run
-// against hardware.
+// TestAttachConvergesWhenAlreadyUp: Attach on an up resource does not run drbdadm up again.
 func TestAttachConvergesWhenAlreadyUp(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -736,18 +705,7 @@ func TestDetach(t *testing.T) {
 	r.assertRan(t, "drbdadm down vol1")
 }
 
-// TestAttachCannotLandInsideDeletesWindow is the case that shows the rule is
-// not "serialize the methods that check something".
-//
-// Attach checks nothing about the resource's state, which is why it looked safe
-// unlocked. The check it invalidates is Delete's: Delete sees the resource is
-// not up, skips the teardown on that basis, and goes on to lvremove the backing
-// volume and unlink the state files. A "drbdadm up" anywhere in that span
-// activates a resource on storage that is about to be removed, and returns a
-// device path for a volume that no longer has a record.
-//
-// The pause is on Delete's lvs listing, which sits between its status probe and
-// its lvremove — inside the window, with the not-up observation already made.
+// TestAttachCannotLandInsideDeletesWindow pauses Delete between its status probe and lvremove.
 func TestAttachCannotLandInsideDeletesWindow(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -839,16 +797,7 @@ func TestDetachRefusesAnUnprovableRole(t *testing.T) {
 	}
 }
 
-// TestPromoteCannotLandInsideDetachsWindow is the mirror of
-// TestDemoteCannotLandInsideSnapshotsWindow, and the reason Detach holds the
-// lock: it reads the role, finds Secondary, and then takes the resource down,
-// which are two steps. A promotion between them leaves a caller that was told
-// its volume is now Primary holding a volume whose device has just been
-// removed — the precondition Detach checked stopped holding while Detach was
-// still acting on it.
-//
-// Making a volume MORE writable is no more harmless than making it less so;
-// only the method whose check it breaks differs.
+// TestPromoteCannotLandInsideDetachsWindow: a promotion cannot land between Detach's role check and teardown.
 func TestPromoteCannotLandInsideDetachsWindow(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -1073,15 +1022,7 @@ func TestUnmountConvergesWhenNotMounted(t *testing.T) {
 	assertNoUnmount(t, m)
 }
 
-// TestUnmountFindsAMountMadeUnderAnAliasedDeviceName is the hole that comparing
-// mount SOURCES left open.
-//
-// A DRBD device has several names — /dev/drbdN and the udev symlinks under
-// /dev/drbd/by-res and /dev/drbd/by-disk — and the mount table records whichever
-// one was used to mount it. Comparing that string against the single name this
-// provider spells read a filesystem mounted through an alias as belonging to
-// somebody else, and Unmount converged on "not mounted" while the filesystem
-// stayed up. Identity is the device number, which is the same under every name.
+// TestUnmountFindsAMountMadeUnderAnAliasedDeviceName: identity is the device number under every name.
 func TestUnmountFindsAMountMadeUnderAnAliasedDeviceName(t *testing.T) {
 	p, r, m := newTestProviderWithMounter(t)
 	provision(t, p, r, defaultSpec())
@@ -1112,13 +1053,7 @@ func TestUnmountConvergesWhenTheDeviceIsGone(t *testing.T) {
 	assertNoUnmount(t, m)
 }
 
-// TestUnmountFailsClosedWhenTheMountTableItselfIsMissing is the other half of
-// the convergence above, and the reason it tests the error's TYPE.
-//
-// A missing device node and an unopenable /proc/self/mountinfo both report
-// os.ErrNotExist. The first means nothing of this volume is mounted anywhere;
-// the second means nothing is known at all, and reading it as "not mounted" is
-// exactly the fail-open this provider stopped asking findmnt to avoid.
+// TestUnmountFailsClosedWhenTheMountTableItselfIsMissing: an unreadable mount table is an error, not "not mounted".
 func TestUnmountFailsClosedWhenTheMountTableItselfIsMissing(t *testing.T) {
 	p, r, m := newTestProviderWithMounter(t)
 	provision(t, p, r, defaultSpec())
@@ -1136,10 +1071,7 @@ func TestUnmountFailsClosedWhenTheMountTableItselfIsMissing(t *testing.T) {
 	assertNoUnmount(t, m)
 }
 
-// TestUnmountLeavesAnOverMountedTargetAlone covers the target this volume is
-// mounted at and no longer visible at, because something has been mounted over
-// it. umount(2) detaches what is visible, so acting on the path would take that
-// other filesystem down and leave this volume mounted underneath it.
+// TestUnmountLeavesAnOverMountedTargetAlone: a target over-mounted by something else is not unmounted.
 func TestUnmountLeavesAnOverMountedTargetAlone(t *testing.T) {
 	p, r, m := newTestProviderWithMounter(t)
 	provision(t, p, r, defaultSpec())
@@ -1260,18 +1192,7 @@ func TestResizeRepeatFinishesTheFilesystem(t *testing.T) {
 	r.assertRan(t, "resize2fs /dev/drbd0")
 }
 
-// TestResizeRefusesASizeWhoseBackingOverflows is the regression test for #18.
-//
-// A newSize whose backing — data plus DRBD metadata, rounded up to an extent —
-// exceeds int64 makes backingBytes wrap NEGATIVE. Unguarded, resizeLocked then
-// finds entry.sizeBytes() < target false (target is negative), skips lvextend
-// and the drbdadm resize after it, grows no filesystem, and STILL writes
-// meta.SizeBytes = newSize and returns nil: silent success over a device that
-// never moved. Every later legitimate Resize is then refused as a shrink
-// against that fabricated recorded size — the volume is bricked through this
-// API. The guard turns the malformed size into ErrInvalidArgument before any of
-// that. Removing it reproduces the skipped-extend-with-recorded-size failure
-// this asserts against.
+// TestResizeRefusesASizeWhoseBackingOverflows: an overflowing backing size is ErrInvalidArgument before anything runs.
 func TestResizeRefusesASizeWhoseBackingOverflows(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -1316,10 +1237,7 @@ func TestResizeRefusesASizeWhoseBackingOverflows(t *testing.T) {
 	}
 }
 
-// TestResizeAttemptsTheLargestRepresentableSize is the boundary a naive guard
-// gets wrong from the other side: the largest size whose backing is still
-// representable must be ATTEMPTED, not refused. An off-by-one that rejected it
-// would deny a request the provider can actually serve.
+// TestResizeAttemptsTheLargestRepresentableSize: the largest size with a representable backing must be attempted.
 func TestResizeAttemptsTheLargestRepresentableSize(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -1473,9 +1391,7 @@ func TestListSnapshots(t *testing.T) {
 	if snaps[1].VolumeID != testVolume {
 		t.Errorf("VolumeID = %q, want %q", snaps[1].VolumeID, testVolume)
 	}
-	// SizeBytes is what the snapshot OCCUPIES — a quarter of its CoW area —
-	// not the area it was allocated. Reporting the allocation would say a
-	// snapshot taken a second ago already fills a fifth of its origin.
+	// SizeBytes is what the snapshot occupies, a quarter of its CoW area.
 	if want := int64(float64(214748364) * 25.0 / 100); snaps[1].SizeBytes != want {
 		t.Errorf("SizeBytes = %d, want the occupied %d", snaps[1].SizeBytes, want)
 	}
@@ -1489,17 +1405,7 @@ func TestListSnapshots(t *testing.T) {
 	}
 }
 
-// TestListSnapshotsRefusesAnUnreadableOccupancy is the accepted half of the
-// data_percent review, at the level a caller sees.
-//
-// SizeBytes is a measurement, and a restore is sized against it. A field that
-// cannot be read is not a measurement of zero — coercing it to one, which is
-// what the parser used to do, hands back a fabricated number that looks exactly
-// like a genuinely empty snapshot.
-//
-// The inactive-empty case is deliberately NOT here: it stays 0 and is asserted
-// in TestListSnapshots, because an inactive snapshot reporting nothing is its
-// ordinary state rather than a failure. See lvEntry.usedBytes.
+// TestListSnapshotsRefusesAnUnreadableOccupancy: an unreadable occupancy is an error, not zero; see lvEntry.usedBytes.
 func TestListSnapshotsRefusesAnUnreadableOccupancy(t *testing.T) {
 	for _, pct := range []string{"lots", "-1", "120.00", "NaN"} {
 		t.Run(pct, func(t *testing.T) {
@@ -1659,15 +1565,7 @@ func TestDeleteRefusesPrimary(t *testing.T) {
 	r.assertNotRan(t, "drbdadm down")
 }
 
-// TestDeleteRefusesAnUnprovableRole is why the guard tests for "is Secondary"
-// rather than "is Primary". Everything that is neither maps to
-// ReplRoleUnknown with no error, so a guard phrased the other way lets it
-// through — and the next two steps are drbdadm down and lvremove.
-//
-// Both routes to that mapping are covered: the literal "Unknown" drbdsetup
-// reports in some states, which parses, and a role string this parser has never
-// seen, which does not. Neither is evidence that the local node is not Primary,
-// which is the only thing that makes the teardown safe.
+// TestDeleteRefusesAnUnprovableRole: a literal Unknown role and an unparsed one are both refused.
 func TestDeleteRefusesAnUnprovableRole(t *testing.T) {
 	for _, role := range []string{"Unknown", "Quorum-Pending-drbd10"} {
 		t.Run(role, func(t *testing.T) {
@@ -1731,17 +1629,7 @@ func newWipingProvider(t *testing.T) (*Provider, *fakeRunner) {
 	return p, r
 }
 
-// TestDeleteWipesTheBackingVolumeWhenConfigured covers the option's whole point
-// and, more importantly, WHERE and WHEN the wipe happens.
-//
-// The target is the backing logical volume, not /dev/drbd0. The extents handed
-// back to the volume group are the LV's, so the LV is what has to be
-// overwritten; going through the DRBD device would also replicate every zero to
-// the peer, resyncing a volume that is being destroyed.
-//
-// The ordering is the other half. DRBD holds its backing device open while the
-// resource is up, so a wipe before "drbdadm down" would fail on a busy device,
-// and one after lvremove would have nothing to address.
+// TestDeleteWipesTheBackingVolumeWhenConfigured: the wipe targets the backing LV, after drbdadm down and before lvremove.
 func TestDeleteWipesTheBackingVolumeWhenConfigured(t *testing.T) {
 	p, r := newWipingProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -1832,19 +1720,7 @@ func TestDeleteStopsWhenTheWipeFails(t *testing.T) {
 	}
 }
 
-// TestDeleteWipesAnInactiveBackingVolume is the case my first pass assumed away.
-//
-// A DRBD backing volume is active whenever the resource has been up, so it is
-// easy to conclude there is no inactive state to handle. But Delete deliberately
-// serves volumes whose resource is already DOWN, and such a volume can have no
-// device node at all: after a reboot without autoactivation, after an
-// administrator deactivates it, or from a provisioning run that failed partway.
-//
-// Without the activation, the zeroing fails on a device that is not there, the
-// wipe failure stops the delete by design, and wipe_on_delete becomes a
-// PERMANENT block on a perfectly valid deletion — the operator cannot get past
-// it without turning the option off. Fail-closed retention is meant to protect
-// data, not to strand a volume.
+// TestDeleteWipesAnInactiveBackingVolume: an inactive backing LV is activated so the wipe can run.
 func TestDeleteWipesAnInactiveBackingVolume(t *testing.T) {
 	p, r := newWipingProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -1916,14 +1792,7 @@ func TestFailedWipeRestoresAnInactiveVolume(t *testing.T) {
 	}
 }
 
-// TestFailedRemovalRestoresAnInactiveVolume is the other error path out of a
-// borrowed activation, and the one easiest to miss: the wipe SUCCEEDED here, so
-// the code that borrowed the activation has already returned happy.
-//
-// lvremove can still fail — a transient LVM error, a device briefly busy — and
-// then the volume survives with an activation left over from an operation the
-// operator watched fail. Same leftover as the failed-wipe case, reached from the
-// other side.
+// TestFailedRemovalRestoresAnInactiveVolume: a failed lvremove after a successful wipe gives back the activation.
 func TestFailedRemovalRestoresAnInactiveVolume(t *testing.T) {
 	p, r := newWipingProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -1976,19 +1845,7 @@ func TestFailedRemovalLeavesAnActiveVolumeAlone(t *testing.T) {
 	r.assertNotRan(t, "lvchange")
 }
 
-// TestBorrowedActivationIsGivenBackOnAFailedContext is the failure mode that
-// makes the two restore paths worth having at all.
-//
-// A cancellation or timeout DURING the wipe is the likeliest way to reach them —
-// the zeroing is the long step, minutes per terabyte — and the compensating
-// lvchange must not inherit the context that just died. The production runner
-// execs through exec.CommandContext, so a canceled context means the cleanup
-// process never starts, and the restore silently does not happen while the code
-// reads as though it did.
-//
-// The fake refuses any command issued on a done context, exactly as the real
-// runner would, so the deactivation appearing in the log is the detached
-// context doing its job.
+// TestBorrowedActivationIsGivenBackOnAFailedContext: the deactivation runs on a detached context after the caller's is canceled.
 func TestBorrowedActivationIsGivenBackOnAFailedContext(t *testing.T) {
 	p, r := newWipingProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -2014,19 +1871,7 @@ func TestBorrowedActivationIsGivenBackOnAFailedContext(t *testing.T) {
 	r.assertRan(t, "lvchange --activate n --yes vg0/vol1")
 }
 
-// TestWipeNeverRunsUnderASnapshot is the measured copy-on-write constraint,
-// pinned as a property rather than left to the reading order of Delete.
-//
-// Zeroing an origin that still has a snapshot is CoW's worst case: every block
-// written pushes the block it replaced into the snapshot's CoW area, so the wipe
-// duplicates the data it is destroying into extents lvremove then frees. The
-// local lane measured it on LVM 2.03.16 — a 64 MiB origin under one snapshot
-// went from 0% to 100% CoW occupancy and overflowed into an unreadable state.
-//
-// Delete's snapshot refusal is what keeps that unreachable here. This asserts
-// the refusal still comes first with wiping ON, because the two are only
-// connected by ordering, and nothing else in the file would notice if they came
-// apart.
+// TestWipeNeverRunsUnderASnapshot: the snapshot refusal comes before the wipe, which would flood the snapshot's CoW area.
 func TestWipeNeverRunsUnderASnapshot(t *testing.T) {
 	p, r := newWipingProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -2072,16 +1917,7 @@ func TestDeleteWhenResourceIsDown(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func TestStatus(t *testing.T) {
-	// The DRBD device presents the usable capacity, which under the
-	// usable-capacity contract is AT LEAST what the caller asked for: the backing
-	// volume is created at backingBytes(testSize, false), rounded up to a whole extent,
-	// and only DRBD's internal metadata is carved off the end of that. This is
-	// the "size" the status fixtures report, in KiB, and it must match the
-	// literal in the fixtures. It works out to
-	//   roundUpTo(backingBytes(testSize, false), testExtentSize) - metadataBytes(...),
-	// which for a 1 GiB volume on 4 MiB extents is 1052600 KiB — comfortably
-	// above testSize, where the pre-#11a fixtures pinned a value 4 KiB SHORT of
-	// it, a device no volume this provider sizes could ever present.
+	// The DRBD device's usable size in KiB, roundUpTo(backingBytes(testSize, false), testExtentSize) - metadataBytes(...), 1052600 KiB for 1 GiB on 4 MiB extents.
 	const deviceSize = int64(1052600) * statusSizeUnit
 
 	tests := []struct {
@@ -2155,12 +1991,7 @@ func TestStatus(t *testing.T) {
 			if st.SizeBytes != tc.wantSize {
 				t.Errorf("SizeBytes = %d, want %d", st.SizeBytes, tc.wantSize)
 			}
-			// The usable-capacity contract: a measured device never presents
-			// LESS than the caller asked for. The up rows report the device
-			// (deviceSize); assert that against the provisioned size directly, so
-			// a fixture that regresses below it — as the pre-#11a ones did, a full
-			// extent short — fails right here rather than only where deviceSize is
-			// spelled out.
+			// A measured device never presents less than the provisioned size.
 			if tc.wantSize == deviceSize && st.SizeBytes < testSize {
 				t.Errorf("Status(up).SizeBytes = %d, want >= the provisioned %d", st.SizeBytes, testSize)
 			}
@@ -2182,20 +2013,7 @@ func TestStatus(t *testing.T) {
 	}
 }
 
-// TestStatusAndReplicationStateAgreeWhenTheResourceIsDown is written as one
-// assertion about AGREEMENT rather than two about the methods separately,
-// because the bug was not that either answer was unreachable — it was that the
-// two disagreed about the same volume in the same state.
-//
-// Status left Replication at its zero value, which common.VolumeStatus reserves
-// for a volume that is NOT REPLICATED. This provider has no such volumes: every
-// one it creates is a two-host DRBD resource. So the zero value there was not
-// merely uninformative, it was false, and false in the direction that matters —
-// an HA controller reading it learns that a volume which is only down has no
-// peer to fail over to.
-//
-// The value is pinned as exactly ReplStateDown rather than "not the zero value",
-// since anything else non-zero would be a different wrong answer.
+// TestStatusAndReplicationStateAgreeWhenTheResourceIsDown: both report exactly ReplStateDown.
 func TestStatusAndReplicationStateAgreeWhenTheResourceIsDown(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -2287,20 +2105,7 @@ func TestDemote(t *testing.T) {
 	r.assertNotRan(t, "--force")
 }
 
-// TestDemoteCannotLandInsideSnapshotsWindow is why Demote takes the provider
-// lock even though demoting only ever makes a volume LESS writable.
-//
-// Snapshot requires the volume to be Primary on this node and then runs
-// lvcreate, and those are two separate steps. A demotion between them leaves
-// the snapshot taken off a Secondary's backing device — written by the
-// replication stream with nothing above it ordering those writes — which is
-// exactly the state the Primary check refuses. Less-writable is not harmless
-// here; it is the direction that invalidates the checked precondition.
-//
-// The lvs listing is the step between the check and the lvcreate, so the fake
-// pauses there and the demotion is started against a snapshot that is provably
-// inside its window. Only Snapshot lists logical volumes in this test, so the
-// pause fires exactly once.
+// TestDemoteCannotLandInsideSnapshotsWindow pauses Snapshot's lvs listing, between its Primary check and lvcreate.
 func TestDemoteCannotLandInsideSnapshotsWindow(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -2576,10 +2381,7 @@ func TestProvisionRollbackSurvivesCancellation(t *testing.T) {
 	}
 }
 
-// TestRestoreSizeBoundary pins what a restore is still judged by, now that a
-// larger destination is grown into rather than refused: only a SMALLER one is a
-// shrink. A real origin LV is always a whole number of extents, so the
-// comparison is against the size lvcreate would give the destination.
+// TestRestoreSizeBoundary: only a destination smaller than the extent-rounded origin is a shrink.
 func TestRestoreSizeBoundary(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -2754,20 +2556,7 @@ func TestNonPrefixedLabelsPassThrough(t *testing.T) {
 	}
 }
 
-// TestProvisionDoesNotPublishUntilComplete checks the window between reserving
-// a volume's minor and port and the volume actually existing. The reservation
-// has to be visible to the allocator, but a concurrent reader must not see a
-// volume whose backing device and resource file have not been created — it
-// would report a volume that is not there, or run DRBD commands against a
-// device that does not exist.
-//
-// Only the lock-free readers are probed from inside the hook, which runs on
-// Provision's own goroutine while it holds the lock. Attach is not one of them:
-// it mutates, so it takes that lock, and a concurrent caller therefore waits for
-// the provision instead of seeing the reservation at all — checked below on a
-// goroutine, since calling it here would deadlock on a mutex that is not
-// reentrant. Waiting is the stronger property; ErrNotFound was only ever the
-// best answer available to a caller allowed to look mid-flight.
+// TestProvisionDoesNotPublishUntilComplete: lock-free readers see no volume mid-provision, and Attach waits for it.
 func TestProvisionDoesNotPublishUntilComplete(t *testing.T) {
 	p, r := newTestProvider(t)
 	r.scriptProvision(testVolume, testSize)
@@ -2893,11 +2682,7 @@ func TestProvisionAfterCrashedAttempt(t *testing.T) {
 	provision(t, p, r, defaultSpec())
 }
 
-// TestMountDoesNotFormatAPartitionedDevice is the reason the probe asks blkid
-// for everything rather than filtering to the filesystem type. A device holding
-// a partition table and no filesystem reports only PTTYPE, so a TYPE-filtered
-// probe exits successfully with empty output — indistinguishable from an empty
-// device, and enough to mkfs over somebody's partitioned volume.
+// TestMountDoesNotFormatAPartitionedDevice: a device with only PTTYPE is not empty.
 func TestMountDoesNotFormatAPartitionedDevice(t *testing.T) {
 	p, r, m := newTestProviderWithMounter(t)
 	provision(t, p, r, defaultSpec())
@@ -3050,9 +2835,7 @@ func TestResizeGrowsTheFilesystem(t *testing.T) {
 			wantRan: "xfs_growfs " + testMountPoint,
 		},
 		{
-			// ext4 grows offline too, once resize2fs's demand for a check is
-			// satisfied. The check runs ONLY because the device is unmounted —
-			// e2fsck against a mounted filesystem would corrupt it.
+			// ext4 grows offline after e2fsck, which runs only because the device is unmounted.
 			name: "unmounted ext4 on a primary", fsType: "ext4", mounted: "",
 			script: func(r *fakeRunner) {
 				r.scriptStatus(primaryStatus(testVolume, 0))
@@ -3255,20 +3038,7 @@ func TestMountLeavesTheRecordAloneWhenItDoesNotFormat(t *testing.T) {
 	}
 }
 
-// TestSnapshotAndDeleteAreSerialized exercises the mutating snapshot operations
-// against each other under the race detector.
-//
-// Every one of them is a resolve-then-act pair, and each pair is somebody
-// else's window: Delete refuses a volume that still has snapshots, then removes
-// it, and a Snapshot landing between those two steps creates something the
-// removal destroys; Provision validates a restore source, then copies it, and a
-// DeleteSnapshot landing between those destroys a source already accepted.
-//
-// What this test actually proves is the absence of unsynchronized state access,
-// which is the race detector's job — the scripted runner cannot model an LVM
-// listing that changes underneath a caller, so it cannot assert an ordering.
-// The mutex is what makes the orderings safe; this is what proves the mutex is
-// really being taken.
+// TestSnapshotAndDeleteAreSerialized runs the mutating snapshot operations concurrently under the race detector.
 func TestSnapshotAndDeleteAreSerialized(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -3305,12 +3075,7 @@ func TestSnapshotAndDeleteAreSerialized(t *testing.T) {
 	}()
 	wg.Wait()
 
-	// Either order is legitimate; what must not happen is both succeeding,
-	// which would leave a snapshot of a volume that no longer exists.
-	//
-	// Snapshot needs a Primary and this fixture is Secondary, so the snapshot
-	// arm always refuses — the point here is that the two serialize at all,
-	// which the race detector is what actually checks.
+	// Either order is fine; both succeeding is not. The snapshot arm always refuses on this Secondary.
 	if snapErr == nil && delErr == nil {
 		t.Error("a snapshot and the removal of its origin both succeeded")
 	}
@@ -3319,17 +3084,7 @@ func TestSnapshotAndDeleteAreSerialized(t *testing.T) {
 	}
 }
 
-// TestMountLookupsRunNoCommand pins where the answer comes from.
-//
-// Mount lookups used to be findmnt, whose default output prints a path's spaces
-// literally while --raw escapes them — the opposite of what it sounds like, so
-// a line-oriented parser was wrong in a way that read as correct on every path
-// without a space in it. The lookups now read /proc/self/mountinfo, where the
-// kernel does the escaping and internal/mountinfo undoes it.
-//
-// This fails if a mount lookup goes back to being a subprocess: both calls
-// below ask where something is mounted, and neither may run anything to find
-// out.
+// TestMountLookupsRunNoCommand: mount lookups read /proc/self/mountinfo and run no subprocess.
 func TestMountLookupsRunNoCommand(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -3626,10 +3381,7 @@ func TestMountRejectsABadTargetBeforeFormatting(t *testing.T) {
 	}
 }
 
-// TestRestoreInheritsTheSourceFilesystem covers what a byte-for-byte copy
-// implies: the restored volume carries the SOURCE volume's filesystem, so the
-// record has to say so. Recording the spec's would describe an ext4 image as
-// raw — or as xfs — and every later Mount and Resize would act on that.
+// TestRestoreInheritsTheSourceFilesystem: the record carries the source volume's filesystem.
 func TestRestoreInheritsTheSourceFilesystem(t *testing.T) {
 	p, r := newTestProvider(t)
 	// vol1 is ext4; the restore does not mention a filesystem at all.
@@ -3699,21 +3451,7 @@ func TestProvisionRejectsAStorageClass(t *testing.T) {
 	}
 }
 
-// TestMountRefusesASymlinkedParent covers the case a cheaper check would miss.
-//
-// The target's own final component is a real directory, so an Lstat on it says
-// nothing is wrong — the symlink is one level up, and a path that resolves
-// through one still resolves to a real directory. mount(8) would canonicalize
-// the whole path and mount wherever the link led. The pin resolves with
-// RESOLVE_NO_SYMLINKS, which makes the kernel refuse at ANY component, and the
-// pre-format guard runs that same resolution so the two cannot disagree.
-//
-// The volume here is unformatted, which is the sharp part: if the guard let
-// this path through, the mkfs would run and the volume would be formatted for
-// a mount that was never going to happen.
-//
-// No privilege is needed — the refusal happens while resolving the path,
-// before anything privileged is attempted.
+// TestMountRefusesASymlinkedParent: RESOLVE_NO_SYMLINKS refuses a symlink at any component before the format runs.
 func TestMountRefusesASymlinkedParent(t *testing.T) {
 	base := t.TempDir()
 	real := filepath.Join(base, "real")
@@ -3742,7 +3480,7 @@ func TestMountRefusesASymlinkedParent(t *testing.T) {
 	}
 
 	r.scriptStatus(primaryStatus(testVolume, 0))
-	// An UNFORMATTED device: if the guard misses, the mkfs runs.
+	// An unformatted device: if the guard misses, mkfs runs.
 	r.on(binBlkid, "-p", "-o", "export", "/dev/drbd0").fails(blkidNoSig, "")
 
 	err = p.Mount(context.Background(), testVolume, target, common.MountOptions{})
@@ -3816,15 +3554,7 @@ func TestMountAndUnmountDoNotExec(t *testing.T) {
 	assertUnmounted(t, m, testMountPoint)
 }
 
-// TestConcurrentFirstMountsFormatOnce is the reason probing, formatting and
-// recording are one critical section. Separately each is harmless; together and
-// unsynchronized they let two callers both find an empty device and both run
-// mkfs on it — with different filesystems, if they asked for different ones.
-//
-// The fake follows the device: once mkfs has run, blkid starts reporting a
-// filesystem, the way a real device would. So a second caller that took the
-// lock after the first sees a formatted device and skips; one that raced past
-// the probe would format again, and the count catches it.
+// TestConcurrentFirstMountsFormatOnce: concurrent first mounts run mkfs once.
 func TestConcurrentFirstMountsFormatOnce(t *testing.T) {
 	p, r, _ := newTestProviderWithMounter(t)
 	provision(t, p, r, defaultSpec())
@@ -3868,21 +3598,7 @@ func TestConcurrentFirstMountsFormatOnce(t *testing.T) {
 	}
 }
 
-// TestMountCannotActOnAMinorThatWasRecycledUnderIt is why Mount is serialized
-// with its lookup inside the lock, and why "it fails closed" was the wrong
-// reason to leave it out.
-//
-// Mount used to read the record, then check the role, then probe and format
-// /dev/drbd<minor>. The old argument for leaving that unlocked was that a
-// demotion in the window makes the device open fail, since DRBD refuses every
-// open of a Secondary. That is true and it only defends the volume staying the
-// same volume. Minors are reusable: Delete frees the record, the next Provision
-// takes the number — pinned here, which is exactly what a caller may do — and
-// the stale call is now pointed at a different volume's device. The replacement
-// is happily Primary, so the role check passes, the probe reads it as empty and
-// the mkfs destroys it.
-//
-// The pause is on the role check, which sits between the lookup and the probe.
+// TestMountCannotActOnAMinorThatWasRecycledUnderIt pauses Mount at its role check while the minor is recycled.
 func TestMountCannotActOnAMinorThatWasRecycledUnderIt(t *testing.T) {
 	p, r, m := newTestProviderWithMounter(t)
 	provision(t, p, r, defaultSpec())
@@ -3987,14 +3703,7 @@ func TestMountCannotActOnAMinorThatWasRecycledUnderIt(t *testing.T) {
 	assertMounted(t, m, dev, testMountPoint, "ext4", 0, "")
 }
 
-// TestUnmountCannotActOnAMinorThatWasRecycledUnderIt is the symmetric hole, and
-// the reason the device comparison in Unmount does not close it on its own.
-//
-// That comparison asks whether the device mounted at the target is the one this
-// volume's record names — and it compares the MINOR, which is the thing being
-// recycled. A stale record whose number a new volume has taken matches that new
-// volume's device exactly, so the check passes and the unmount takes a
-// filesystem out from under whoever is using it.
+// TestUnmountCannotActOnAMinorThatWasRecycledUnderIt: a recycled minor must not unmount another volume.
 func TestUnmountCannotActOnAMinorThatWasRecycledUnderIt(t *testing.T) {
 	p, r, m := newTestProviderWithMounter(t)
 	provision(t, p, r, defaultSpec())
@@ -4048,14 +3757,7 @@ func TestUnmountCannotActOnAMinorThatWasRecycledUnderIt(t *testing.T) {
 	assertUnmounted(t, m, testMountPoint)
 }
 
-// TestMountReconcilesAFormattedDeviceWithAStaleRecord covers the state a
-// half-finished first mount leaves: mkfs succeeded and the record write did
-// not, so the volume is formatted while its record still says raw.
-//
-// Without reconciliation that volume stays mis-described forever — the retry
-// finds a non-empty device and returns, so the record is never corrected, and
-// every later Mount has no filesystem to use while every later Resize grows
-// nothing. The fix is that the probe already knows what is down there.
+// TestMountReconcilesAFormattedDeviceWithAStaleRecord: a formatted device whose record says raw is reconciled.
 func TestMountReconcilesAFormattedDeviceWithAStaleRecord(t *testing.T) {
 	p, r, _ := newTestProviderWithMounter(t)
 	// Provisioned raw: the record says no filesystem.
@@ -4116,14 +3818,7 @@ func TestMountDoesNotReconcileAnUnsupportedFilesystem(t *testing.T) {
 	}
 }
 
-// TestMountUsesTheFilesystemActuallyOnTheDevice is the other half of
-// reconciliation. Correcting the record and then mounting with the type the
-// caller walked in holding fixes the bookkeeping and fails the mount for the
-// same reason the record was wrong.
-//
-// The sharp case is a retry after a first mount that formatted and then failed
-// to record: the device is xfs, the record still says ext4, and mounting as
-// ext4 fails on a filesystem that is right there.
+// TestMountUsesTheFilesystemActuallyOnTheDevice: mount with the type on the device, not the stale record's.
 func TestMountUsesTheFilesystemActuallyOnTheDevice(t *testing.T) {
 	p, r, m := newTestProviderWithMounter(t)
 	// Recorded as ext4.
@@ -4178,14 +3873,7 @@ func TestMountUsesTheCallersTypeForAnUnsupportedFilesystem(t *testing.T) {
 	}
 }
 
-// TestDeleteReportsSnapshotsBeforeTheRole covers the case neither single-
-// condition test reached: a Primary that also has snapshots, where both
-// conditions block and only one of them can be reported.
-//
-// Snapshots win. Demoting does not make a snapshot go away, so a caller told
-// "demote first" would demote, retry, and only then discover it has restore
-// points to decide about — the larger decision, found second. The condition
-// that holds regardless of role is the more useful one to hear.
+// TestDeleteReportsSnapshotsBeforeTheRole: a Primary with snapshots reports ErrHasSnapshots.
 func TestDeleteReportsSnapshotsBeforeTheRole(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -4218,15 +3906,7 @@ func TestDeleteReportsSnapshotsBeforeTheRole(t *testing.T) {
 	}
 }
 
-// TestResizeRefusesADetachedResource covers a failure that used to leave the
-// volume worse than it found it.
-//
-// drbdadm resize only works on a running resource, and the backing volume is
-// where DRBD keeps its internal metadata — at the END of the device. Extending
-// the LV under a resource that is down moves that end away from the metadata
-// with no resize available to follow it: the call failed with the lower device
-// already changed, the record still saying the old size, and a resource that
-// would not come up because its metadata was no longer where it belonged.
+// TestResizeRefusesADetachedResource: extending the LV under a down resource would strand DRBD's metadata.
 func TestResizeRefusesADetachedResource(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, defaultSpec())
@@ -4240,8 +3920,7 @@ func TestResizeRefusesADetachedResource(t *testing.T) {
 		t.Fatalf("Resize of a resource that is not up = %v, want ErrNotAttached", err)
 	}
 
-	// Refused BEFORE anything moved. This is the whole point: the backing
-	// device is untouched, so nothing needs recovering.
+	// Refused before anything moved.
 	r.assertNotRan(t, "lvextend")
 	r.assertNotRan(t, "drbdadm resize")
 
@@ -4254,20 +3933,7 @@ func TestResizeRefusesADetachedResource(t *testing.T) {
 	}
 }
 
-// TestRestoreIntoALargerVolume is the case the contract permits and this
-// provider used to refuse.
-//
-// VolumeSpec.SizeBytes may exceed the snapshot's, and it is reached by
-// composing two things that already work rather than by copying into a longer
-// device: the backing volume is created at the SOURCE's size, because a
-// whole-device copy into a longer one strands the source's metadata partway
-// through what the new volume presents as data, and the volume is then GROWN
-// through the same sequence Resize runs — which relocates the metadata to the
-// new end, that being what drbdadm resize is for.
-//
-// The lvextend and drbdadm resize assertions are the mutation check: delete the
-// grow step and this fails, rather than passing on a volume quietly still the
-// source's size.
+// TestRestoreIntoALargerVolume: the copy goes at the source's size, then lvextend and drbdadm resize grow it.
 func TestRestoreIntoALargerVolume(t *testing.T) {
 	p, r := newTestProvider(t)
 	provision(t, p, r, &common.VolumeSpec{Name: testVolume, SizeBytes: testSize, Replicas: 2})

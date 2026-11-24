@@ -71,7 +71,7 @@ const (
 	// device-mapper privilege and nothing else can create logical volumes all
 	// day and fail the moment it brings a DRBD resource up.
 	//
-	// Measured 2026-09-02, ETHTOOL_GWOL on lo, which the kernel gates on this
+	// Measured with ETHTOOL_GWOL on lo, which the kernel gates on this
 	// capability and which reads rather than writes:
 	//
 	//	container, root, no --cap-add     EPERM       (CapEff …a80425fb)
@@ -194,11 +194,7 @@ func (c *Checker) Check(ctx context.Context, capabilities ...Capability) error {
 	return errors.Join(failures...)
 }
 
-// run invokes one probe and guarantees the result is classified.
-//
-// A nil probe is a registration mistake and is reported rather than treated as
-// a capability that passed — the same reason the factory panics on a nil
-// creator, arrived at one layer later where panicking would be wrong.
+// run invokes one probe and classifies the result; a nil probe is reported as a failure.
 func (c *Checker) run(ctx context.Context, capability Capability, probe Probe) error {
 	if probe == nil {
 		return &CapabilityError{
@@ -217,11 +213,7 @@ func (c *Checker) run(ctx context.Context, capability Capability, probe Probe) e
 	var typed *CapabilityError
 	if errors.As(err, &typed) {
 		if typed == nil {
-			// A probe returned a nil *CapabilityError boxed in a non-nil error
-			// — the interface trap. Whatever it meant, it is not evidence that
-			// the capability is available, and rendering it would panic. It is
-			// reported as indeterminate for the same reason every other
-			// unanswerable probe is.
+			// A nil *CapabilityError in a non-nil error is reported as indeterminate.
 			return &CapabilityError{
 				Capability: capability,
 				Cause:      CauseIndeterminate,

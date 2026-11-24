@@ -47,25 +47,7 @@ const (
 	DefaultReleaseAttempts = 3
 )
 
-// minRenewDelay is the floor on the wait between renewal attempts.
-//
-// It exists for one window. The controller's tracked deadline is deliberately
-// conservative — computed from the CONFIGURED TTL, which the Coordinator rounds
-// up — so it can pass while the backend's actual lease is still alive. That
-// daylight is under a second and appears only when LeaseTTL is not a whole
-// number of them, but inside it the remaining lease reads as negative, Done has
-// not closed, and an unfloored wait would retry as fast as the scheduler
-// allows: CPU burned and a log filled, for the rest of the second, exactly
-// while the Coordinator is already in trouble.
-//
-// It is not a tuning knob, which is why it is not in Config. It is small enough
-// that a renewal which could still save the lease gets many attempts inside
-// that window, and large enough that "many" is not "as many as possible".
-//
-// It floors, it does not extend: a wait is still capped at the lease actually
-// remaining, so the floor can never push an attempt past a deadline that was
-// still live. Stopping a spin is worth twenty milliseconds of CPU; it is not
-// worth forfeiting leadership.
+// minRenewDelay floors the wait between renewal attempts so a conservative deadline cannot cause a spin; a wait never extends past a live deadline.
 const minRenewDelay = 20 * time.Millisecond
 
 // Clock is the controller's view of time. It exists so the renewal cadence and
@@ -228,9 +210,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("%w: LeaseTTL %s is below the Coordinator's one-second lease granularity",
 			common.ErrInvalidArgument, c.LeaseTTL)
 	}
-	// Spelled as a division rather than RenewInterval*3 > LeaseTTL: the
-	// multiplication overflows int64 for an absurd interval and wraps
-	// NEGATIVE, which would pass the check it exists to fail.
+	// A division, because RenewInterval*3 can overflow.
 	if c.RenewInterval > c.LeaseTTL/3 {
 		return fmt.Errorf("%w: RenewInterval %s leaves no room to retry before LeaseTTL %s: need RenewInterval*3 <= LeaseTTL",
 			common.ErrInvalidArgument, c.RenewInterval, c.LeaseTTL)

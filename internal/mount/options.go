@@ -48,17 +48,7 @@ type Option struct {
 	Data bool
 }
 
-// flagTable is the exact set of mount options that may be applied.
-//
-// Matching is on the whole token, which is what makes the allowlist hold: the
-// data options are joined with commas into one string, so a token containing a
-// comma would smuggle in options nobody vetted. "noatime,exec" is not on this
-// list and is rejected rather than split, and so is anything beginning with a
-// hyphen.
-//
-// nofail is deliberately absent. It directs mount(8) and fstab, means nothing to
-// mount(2), and would reach a filesystem as an unrecognized data option — so it
-// is refused with the rest rather than accepted and quietly dropped.
+// flagTable is the exact set of mount options that may be applied, matched on the whole token; nofail is not one.
 var flagTable = map[string]Option{
 	// Generic options the kernel applies.
 	"ro":          {Flag: msRDONLY},

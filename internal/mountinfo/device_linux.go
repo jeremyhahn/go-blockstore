@@ -36,10 +36,7 @@ func DeviceNumber(path string) (uint32, uint32, error) {
 	if st.Mode&unix.S_IFMT != unix.S_IFBLK {
 		return 0, 0, &DeviceError{Path: path, Err: ErrNotBlockDevice}
 	}
-	// The conversions are not redundant everywhere they are compiled: Stat_t's
-	// Rdev is uint64 on 64-bit Linux and uint32 on 32-bit, while unix.Major and
-	// unix.Minor take uint64 on both. Linting only ever sees the 64-bit build,
-	// where they look unnecessary; removing them breaks GOARCH=386 and arm.
+	// The conversions are needed on 32-bit Linux, where Rdev is uint32.
 	//nolint:unconvert // required on 32-bit Linux, where Rdev is uint32
 	return unix.Major(uint64(st.Rdev)), unix.Minor(uint64(st.Rdev)), nil
 }

@@ -25,17 +25,7 @@ import (
 	"github.com/jeremyhahn/go-blockstore/pkg/common"
 )
 
-// nameRe is the allowlist for volume and snapshot names.
-//
-// The intersection of three namespaces has to hold: a DRBD resource name, an
-// LVM logical-volume name, and a path component under the state directory.
-// Lowercase alphanumerics, underscore and hyphen satisfy all three. A leading
-// alphanumeric keeps a name from being read as an option by any of the tools,
-// and the 48-byte cap leaves room for the ".snap.<name>" suffix inside LVM's
-// 127-byte limit.
-//
-// The dot is deliberately excluded even though LVM permits it: it is what makes
-// "<volume>.snap.<name>" an unambiguous decomposition back into its two halves.
+// nameRe allows lowercase alphanumerics, underscore and hyphen, leading alphanumeric, at most 48 bytes; no dot, so "<volume>.snap.<name>" splits unambiguously.
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,47}$`)
 
 // digitsRe matches a name made entirely of digits.
@@ -53,19 +43,7 @@ var reservedNames = map[string]struct{}{
 	"all": {},
 }
 
-// LVM's own reserved names, which matter because a volume's name IS its logical
-// volume's name and is handed straight to lvcreate.
-//
-// Measured against LVM 2.03.16 rather than taken from documentation: lvcreate
-// answers "Names starting \"snapshot\" are reserved" for the prefixes and
-// "Names including \"_tmeta\" are reserved" for the substrings, and refuses.
-// Catching them here turns an obscure failure partway through provisioning —
-// after a state record, after allocation, into the rollback path — into a clear
-// refusal at the API boundary.
-//
-// The SUBSTRING list matters more here than it does in pkg/local, whose names
-// cannot contain an underscore at all. This provider's do, so "vol_tmeta" is a
-// name a caller can reach and LVM will not take.
+// LVM's reserved name prefixes and substrings, which lvcreate refuses.
 var reservedLVMPrefixes = []string{"snapshot", "pvmove"}
 
 var reservedLVMSubstrings = []string{
@@ -140,20 +118,7 @@ func validateFSType(fsType string) error {
 	return nil
 }
 
-// allowedMountFlags are the mount options a caller may put in
-// MountOptions.Flags. Everything reaching mount(8) comes from this set, so a
-// caller cannot smuggle in an option that changes what is mounted or from
-// where.
-//
-// "ro" and "rw" are absent by design: read-only is MountOptions.ReadOnly, and
-// accepting both spellings would let a caller set ReadOnly and then contradict
-// it in Flags, with the winner decided by argument order.
-//
-// This is a SUBSET of internal/mount's table, which is the classification every
-// provider shares. A provider may accept less than that table and never more:
-// an option outside it has no classification, and applying one unclassified is
-// how a security option like nosuid gets passed as data and quietly not
-// applied. Everything here is checked against Lookup below for exactly that.
+// allowedMountFlags are the MountOptions.Flags a caller may set, a subset of internal/mount's table; ro and rw go through ReadOnly.
 var allowedMountFlags = map[string]struct{}{
 	"acl":               {},
 	"async":             {},
@@ -176,11 +141,7 @@ var allowedMountFlags = map[string]struct{}{
 	"nolazytime":        {},
 	"noquota":           {},
 
-	// XFS refuses to mount a filesystem whose UUID matches one already mounted.
-	// A restore is a byte-for-byte copy, so a restored XFS volume carries its
-	// source's UUID exactly — and mounting the copy beside the original, which
-	// is most of the reason to restore one, needs this. Without it the API
-	// supports XFS and supports restores and cannot combine them.
+	// nouuid lets a restored XFS volume mount beside its source.
 	"nouuid":       {},
 	"nosuid":       {},
 	"nouser_xattr": {},
@@ -200,10 +161,7 @@ func validateMountFlags(flags []string) error {
 	return nil
 }
 
-// mountFlagsAreClassified reports the first flag this provider allows that the
-// shared table does not classify. Such a flag would reach mount(2) as neither a
-// kernel bit nor a data option — silently dropped rather than applied — so the
-// test that calls this is the one keeping the two lists in step.
+// mountFlagsAreClassified reports the first allowed flag the shared table does not classify.
 func mountFlagsAreClassified() (string, bool) {
 	for f := range allowedMountFlags {
 		if _, ok := mount.Lookup(f); !ok {
@@ -213,26 +171,7 @@ func mountFlagsAreClassified() (string, bool) {
 	return "", true
 }
 
-// validateMountTarget checks a mount point path.
-//
-// It must be absolute and already in cleaned form, so the string handed to
-// mount(8) is the path the caller named and not one that resolves elsewhere
-// through "..".
-//
-// It must also carry no control character and no leading or trailing
-// whitespace on any component. A space INSIDE a component is fine — mount
-// points with spaces in them are legal and this provider passes every path as
-// its own argv element, so nothing has to quote or escape one — but whitespace
-// at an edge is the shape that goes wrong quietly. A target that differs from
-// the caller's by a trailing space is a different path to the kernel and the
-// same path to a human reading a log, and anything that trims it turns
-// "mounted somewhere else" into "not mounted" and a teardown into a silent
-// no-op. A newline is worse: it makes one path look like two in every
-// line-oriented tool an operator will reach for.
-//
-// This provider reads findmnt as JSON (see mountTarget) precisely so that
-// parsing never depends on how a path is spelled. The check here is the other
-// half: what reaches the tools is a path with no room for that ambiguity.
+// validateMountTarget requires an absolute, clean path with no control characters and no whitespace at a component edge.
 func validateMountTarget(target string) error {
 	if target == "" {
 		return fmt.Errorf("%w: mount target is empty", common.ErrInvalidArgument)

@@ -236,12 +236,7 @@ func parseLine(text string) (Entry, error) {
 	if sep < 0 {
 		return Entry{}, errNoSeparator
 	}
-	// After the separator: filesystem type, mount source, super options — three
-	// fields, so the last of them is at sep+3 and the record needs sep+4 in
-	// total. Counting to sep+3 accepted a record with the super options missing,
-	// which is a table this parser cannot vouch for; a mount table that is not
-	// the format it claims to be must be refused rather than half-read, because
-	// what a caller does with a partial answer is destroy a volume.
+	// After the separator: filesystem type, source and super options; a record missing any is refused.
 	if len(fields) < sep+4 {
 		return Entry{}, errTruncatedAfterSeparator
 	}
@@ -254,12 +249,7 @@ func parseLine(text string) (Entry, error) {
 	if err != nil {
 		return Entry{}, errMalformedMountID
 	}
-	// The parent id is refused rather than defaulted, for the reason the super
-	// options are: a record whose tree edge could not be read is a record whose
-	// visibility cannot be decided, and a zero substituted here would make it
-	// look like a record with no parent — the one shape that is treated as the
-	// top of the table and therefore always reachable. Failing open on a field
-	// the format guarantees is how a wrong answer gets a confident one.
+	// An unreadable parent ID is refused, never defaulted to zero.
 	parentID, err := strconv.ParseUint(fields[1], 10, 32)
 	if err != nil {
 		return Entry{}, errMalformedParentID
@@ -278,14 +268,7 @@ func parseLine(text string) (Entry, error) {
 	}, nil
 }
 
-// parsePropagation reads the optional fields.
-//
-// They are a variable-length list of tags, which is why the separator has to be
-// found rather than counted to, and an unrecognized tag is IGNORED rather than
-// rejected: the kernel is free to add one, and a parser that refused a record
-// over a tag it did not know would fail closed on a mount table that is
-// perfectly valid. The fields this reads are fixed by the format and the ones
-// it does not recognize say nothing about propagation.
+// parsePropagation reads the optional fields, ignoring unknown tags.
 func parsePropagation(optional []string) Propagation {
 	var p Propagation
 	for _, field := range optional {
@@ -310,11 +293,7 @@ func parsePropagation(optional []string) Propagation {
 // errors in this package are free of one.
 func utoa(n uint32) string { return strconv.FormatUint(uint64(n), 10) }
 
-// parseDeviceNumber reads the "major:minor" field.
-//
-// The numbers are DECIMAL here, which is worth stating because the obvious way
-// to obtain the same pair for comparison — stat's %t:%T — prints them in hex.
-// Reading one as the other silently matches the wrong device.
+// parseDeviceNumber reads the "major:minor" field, which is decimal (stat's %t:%T is hex).
 func parseDeviceNumber(field string) (uint32, uint32, error) {
 	majorText, minorText, found := strings.Cut(field, ":")
 	if !found {
@@ -332,15 +311,7 @@ func parseDeviceNumber(field string) (uint32, uint32, error) {
 	return uint32(major), uint32(minor), nil
 }
 
-// unescape undoes the octal escaping the kernel applies to the path-like
-// fields.
-//
-// The kernel escapes exactly four characters — space, tab, newline and
-// backslash — as three-digit octal, because the format is whitespace-separated
-// and a raw space would end the field early. Leaving them escaped is not a
-// cosmetic problem: a caller comparing a mount point against the path it asked
-// for gets no match for "/mnt/my data", and concludes the volume is not
-// mounted.
+// unescape undoes the kernel's three-digit octal escaping of space, tab, newline and backslash.
 func unescape(field string) string {
 	if !strings.Contains(field, `\`) {
 		return field
@@ -382,14 +353,7 @@ func MountPointsFor(entries []Entry, major, minor uint32) []string {
 // kernel-produced table contains and which therefore identifies nothing.
 const ambiguousID = -1
 
-// indexByID maps each mount id to its record.
-//
-// An id that appears twice is recorded as ambiguous rather than resolved to
-// either claimant. A tree edge into an ambiguous id is followed nowhere, which
-// makes the record look parentless and so REACHABLE — the fail-open direction,
-// chosen because the cost of the two errors is not symmetric: a mount wrongly
-// called hidden is a volume Delete refuses with no way past it, while a mount
-// wrongly called reachable is the behavior callers already have today.
+// indexByID maps each mount ID to its record; a duplicated ID is ambiguous and treated as parentless.
 func indexByID(entries []Entry) map[uint32]int {
 	byID := make(map[uint32]int, len(entries))
 	for i, e := range entries {
@@ -402,21 +366,7 @@ func indexByID(entries []Entry) map[uint32]int {
 	return byID
 }
 
-// parentOf returns the index of a record's parent, and whether there is one to
-// follow.
-//
-// Three shapes are not edges, and all three end the chain the same way — as the
-// top of what this table describes, which leaves the record reachable:
-//
-//   - A parent id naming NO record. Every mount namespace's root has it; the
-//     file shows one namespace and its root hangs off a mount outside it.
-//   - A parent id claimed by more than one record, which identifies nothing.
-//   - A record that is its OWN parent. Not a shape a kernel writes, but Parse
-//     is fed text; it is also what an Entry built in code rather than parsed
-//     looks like, since a zero-valued Entry has ID and ParentID both zero.
-//     Following that edge would make such a record its own ancestor, and
-//     covering its own mount point, so a table assembled by a caller would
-//     report every one of its mounts hidden.
+// parentOf returns a record's parent index; a missing, ambiguous or self parent ends the chain.
 func parentOf(entries []Entry, byID map[uint32]int, i int) (int, bool) {
 	p, ok := byID[entries[i].ParentID]
 	if !ok || p == ambiguousID || p == i {
@@ -425,44 +375,7 @@ func parentOf(entries []Entry, byID map[uint32]int, i int) (int, bool) {
 	return p, true
 }
 
-// topAtOwnMountPoint marks, for each record, whether it is the mount that a
-// walk arriving at its mount point lands on — assuming the walk gets there at
-// all, which is the separate question reachableAt answers.
-//
-// Two rules, in this order.
-//
-// The TREE rule: a record is covered when another record is its CHILD mounted
-// at its own mount point. That is what the kernel writes when a directory that
-// already has a mount on it is mounted over — path lookup follows into the
-// mount that is there, so the new mount's parent is the mount it covers and its
-// mount point renders as the same string. Measured, mounting tmpfs over an
-// existing tmpfs at /tmp/bs33/x gives "624 562 ... /tmp/bs33/x" followed by
-// "625 624 ... /tmp/bs33/x": parent 624, same path. This rule states the
-// covering relation the kernel itself recorded, so it neither invents one nor
-// misses one.
-//
-// The ORDER rule, applied only to records the tree rule left standing: among
-// records naming one mount point, the last in the table wins. This is the rule
-// this function used to apply alone. It is kept because a table can be built in
-// code rather than parsed — an Entry with no ids has no tree to consult — and
-// because two records on one path with no edge between them would otherwise
-// both be called visible, which is the dangerous direction: it would hand
-// umount(2) a path where this device is not on top.
-//
-// The order rule is second rather than first because file order is not mount
-// order. mount --move re-parents a mount and leaves its record where it was:
-// moving the first-created of two mounts on top of the second produces
-// "624 625 ... /y" BEFORE "625 562 ... /y", where the record listed first is
-// the one on top. Reading order alone there names the wrong filesystem, in both
-// directions at once.
-//
-// The order rule cannot then wrongly hide the survivor of an ancestor
-// overmount. Two records can share a mount point with no edge between them —
-// one under a mount that was covered, the other under the mount that covered it
-// — and there the earlier record is always the covered one: the later mount
-// exists only because the cover was already in place, and a mount made at that
-// path after the cover lands INSIDE the covering filesystem and takes it for a
-// parent. Measured on a live kernel; the table is compositeOvermountTable.
+// topAtOwnMountPoint marks records on top at their mount point: a child mounted at the same point covers its parent; otherwise the last record wins.
 func topAtOwnMountPoint(entries []Entry, byID map[uint32]int) []bool {
 	top := make([]bool, len(entries))
 	for i := range top {
@@ -498,20 +411,7 @@ const (
 	isHidden
 )
 
-// stackBase climbs from a record to the BOTTOM of the stack sharing its mount
-// point, and is the distinction between "an ancestor" and "an ancestor in the
-// way".
-//
-// Mounting over a mount point that already has a mount on it makes the new
-// mount a CHILD of the one it covers, at the same mount point — measured, not
-// assumed. So the covering mount's own parent is a mount that is, correctly,
-// not top at its mount point. A walk to that path does not traverse the covered
-// mount and then the covering one; it arrives at the path once and lands on the
-// top of the stack. Treating the stack below as ancestors to check would hide
-// every mount that is on top of anything, which is the opposite of the truth.
-//
-// The climb is bounded by the size of the table because a cycle cannot come
-// from a kernel but can come from text.
+// stackBase climbs to the bottom of the stack sharing a record's mount point, bounded by the table size.
 func stackBase(entries []Entry, byID map[uint32]int, i int) int {
 	for steps := 0; steps <= len(entries); steps++ {
 		p, ok := parentOf(entries, byID, i)
@@ -523,30 +423,7 @@ func stackBase(entries []Entry, byID map[uint32]int, i int) int {
 	return i
 }
 
-// reachableAt marks, for each record, whether its mount point PATH resolves to
-// it — which is the question umount(2) turns on, since it detaches whatever the
-// path it is handed resolves to.
-//
-// A record is reachable when it is top at its own mount point AND the mount its
-// stack hangs off is itself reachable, applied all the way up. The chain of
-// parents is exactly the set of mounts a walk down the path crosses, which is
-// why it is the right chain and a path-prefix scan is not: the kernel renders
-// each mount point as a full path from the process root by walking that same
-// chain, so a parent's mount point is always a prefix of its child's — but the
-// converse does not hold, and prefix matching flags unrelated mounts.
-//
-// This is what catches the case a comparison of mount points cannot: a volume
-// at /mnt/base/vol with another filesystem later mounted at /mnt/base. No
-// second record names /mnt/base/vol, so nothing about that path has changed —
-// but /mnt/base now has a child mounted at /mnt/base, so the volume's parent is
-// not top at its own mount point, and the volume is not reachable.
-//
-// A chain ends at a record with no parent in the table, which is normal: the
-// file describes one mount namespace and its root mount hangs off a mount
-// outside it. A chain that loops — impossible from a kernel, reachable from
-// hand-written text — ends there too, and is treated as reachable rather than
-// left to recurse: refusing to unmount a volume over a malformed table would
-// leave an operator with no way forward.
+// reachableAt marks records whose mount point path resolves to them: top at their point with every stack above reachable; a loop counts as reachable.
 func reachableAt(entries []Entry, byID map[uint32]int, top []bool) []bool {
 	state := make([]uint8, len(entries))
 	chain := make([]int, 0, len(entries))

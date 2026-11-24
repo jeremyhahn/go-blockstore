@@ -13,21 +13,7 @@
 
 //go:build drbd && drbd_integration
 
-// This file exercises the provider against a real DRBD 9 pair. It is selected
-// by build tag rather than skipped at runtime, so an ordinary "go test -tags
-// drbd" never compiles it and cannot accidentally run destructive operations
-// against a node's storage:
-//
-//	go test -tags 'drbd drbd_integration' ./pkg/drbd/ -run Integration -v
-//
-// Both tags are needed. pkg/drbd's implementation files carry //go:build drbd,
-// so building with drbd_integration alone would compile an empty package and
-// this file would have nothing to test.
-//
-// It must run as root on a node with drbd-utils, the DRBD 9 kernel module and
-// LVM, whose peer is reachable on the replication address and running the same
-// resource configuration. It creates, formats, snapshots and destroys volumes
-// in the configured volume group.
+// Real DRBD 9 pair suite, destructive, root only: go test -tags 'drbd drbd_integration' ./pkg/drbd/ -run Integration -v
 
 package drbd
 
@@ -97,9 +83,7 @@ func integrationConfig(t *testing.T) map[string]string {
 			t.Fatalf("setting %q is required: set the matching GO_BLOCKSTORE_DRBD_* variable", required)
 		}
 	}
-	// Peer authentication is required unless acknowledged, and BOTH nodes need
-	// the same secret for a resource — which is a property of the pair this
-	// harness cannot check from one side.
+	// Both nodes need the same peer secret, which this harness cannot check from one side.
 	if settings[SettingReplicationSecretFile] == "" {
 		t.Fatalf("%s is required: set %s to a file holding the shared secret, the SAME secret on both nodes",
 			SettingReplicationSecretFile, envSecretFile)
@@ -342,16 +326,7 @@ func waitFor(t *testing.T, ctx context.Context, p *Provider, volID string, want 
 		volID, want, timeout, last, strings.TrimSpace(string(last.Peer)))
 }
 
-// TestIntegrationGeneratedConfigParses is the check no unit test can make: that
-// what this package writes is something drbdadm actually accepts.
-//
-// The rendering tests assert on shape — balanced braces, one resource block, a
-// secret that stayed inside its quotes — which catches injection but not a
-// keyword this DRBD version spells differently or does not have. Only the
-// parser settles that, and only where drbdadm is installed.
-//
-// sh-nop asks drbdadm to parse the configuration and do nothing, which needs no
-// kernel module and changes nothing.
+// TestIntegrationGeneratedConfigParses checks drbdadm accepts the generated config (sh-nop parses and changes nothing).
 func TestIntegrationGeneratedConfigParses(t *testing.T) {
 	p := newIntegrationProvider(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

@@ -37,12 +37,7 @@ const (
 	msNOSYMFOLLOW = 0
 )
 
-// errNoMounter reports that safe mounting is unavailable here.
-//
-// Pinning a target needs openat2, which is Linux-only, and the whole provider is
-// Linux-only in practice — it drives LVM and device-mapper. The package still
-// COMPILES elsewhere, and refusing here is what keeps that from quietly becoming
-// an unpinned mount somewhere it cannot be done safely.
+// errNoMounter reports that safe mounting needs openat2, which is Linux-only.
 var errNoMounter = errors.New("go-blockstore/mount: mounting requires Linux, where a target can be pinned against symlink substitution")
 
 // Check reports whether a target can be pinned. It cannot be, here.

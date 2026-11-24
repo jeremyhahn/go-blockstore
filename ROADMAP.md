@@ -12,7 +12,6 @@ Consumed through go-quicbaas, not called directly by applications.
 ## Current milestone
 
 [Release candidate (M10)](../../milestone/10), target kind RC.
-Projected 2026-10-15.
 
 ## Now
 
@@ -27,7 +26,7 @@ Projected 2026-10-15.
 
 ## Later
 
-- [#97](../../issues/97) **VolumeProvider seam for go-trusted-platform's NBD export server** — accepted (CA order 2026-10-14, owner ruling).
+- [#97](../../issues/97) **VolumeProvider seam for go-trusted-platform's NBD export server** — accepted.
   The consumer is go-trusted-platform `pkg/bootstrap/nbd`, through the go-quicbaas SDK, which re-exports it (go-quicbaas SPEC row `orchestration-volumes`); never a direct import.
   The interface is go-blockstore's. It offers:
   - **create**: a volume per device identity at a configured size, on first attach;
